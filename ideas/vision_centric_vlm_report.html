@@ -1,0 +1,578 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Vision-Centric VLM 架构建议报告</title>
+  <style>
+    :root {
+      --bg: #f5f7fb;
+      --card: #ffffff;
+      --text: #162130;
+      --muted: #556277;
+      --accent: #0b6b57;
+      --accent-soft: #e5f4f0;
+      --border: #d6dfeb;
+      --warn: #8a5a00;
+      --good: #10643b;
+      --mono: "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      --sans: "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      color: var(--text);
+      background:
+        radial-gradient(circle at 8% 4%, #d8efe7 0%, transparent 36%),
+        radial-gradient(circle at 95% 8%, #e4ecfb 0%, transparent 32%),
+        var(--bg);
+      line-height: 1.65;
+    }
+    .wrap { width: min(1180px, 92vw); margin: 30px auto 56px; }
+    .hero, .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      box-shadow: 0 8px 28px rgba(18, 37, 63, 0.07);
+    }
+    .hero { padding: 24px 28px; }
+    .hero h1 { margin: 0 0 8px; font-size: clamp(1.45rem, 2.2vw, 2rem); }
+    .hero p { margin: 0; color: var(--muted); }
+    .stack { margin-top: 16px; }
+    .card { padding: 18px 20px; margin-bottom: 16px; }
+    .card h2 { margin: 0 0 8px; font-size: 1.16rem; }
+    .card h3 { margin: 12px 0 6px; font-size: 1.02rem; }
+    .badge {
+      display: inline-block;
+      margin-bottom: 8px;
+      padding: 2px 9px;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: var(--accent);
+      background: var(--accent-soft);
+      border: 1px solid #c4e9df;
+    }
+    .muted { color: var(--muted); }
+    .warn { color: var(--warn); }
+    .good { color: var(--good); }
+    ul { margin: 6px 0 0 18px; padding: 0; }
+    ol { margin: 6px 0 0 20px; padding: 0; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 8px;
+      font-size: 0.95rem;
+    }
+    th, td {
+      border: 1px solid var(--border);
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th { background: #f8fbff; }
+    code {
+      font-family: var(--mono);
+      font-size: 0.92em;
+      background: #f2f6fb;
+      border: 1px solid #dfe7f2;
+      border-radius: 6px;
+      padding: 1px 6px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 10px;
+    }
+    .pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      border: 1px solid var(--border);
+      background: #f8fbff;
+      margin-right: 4px;
+      margin-bottom: 4px;
+    }
+    .diagram-wrap {
+      width: 100%;
+      overflow-x: auto;
+      margin-top: 10px;
+      padding-bottom: 2px;
+    }
+    .arch-diagram {
+      display: block;
+      width: 100%;
+      min-width: 920px;
+      height: auto;
+    }
+    .diagram-caption {
+      margin: 10px 0 0;
+      color: var(--muted);
+      font-size: 0.94rem;
+    }
+    .diagram-node { fill: #ffffff; stroke: var(--border); stroke-width: 1.5; }
+    .diagram-node-vision { fill: #eef8f5; stroke: #87c7b7; }
+    .diagram-node-text { fill: #f2f6ff; stroke: #9fb7e6; }
+    .diagram-node-fusion { fill: #fff5dc; stroke: #d8a529; stroke-width: 2; }
+    .diagram-node-output { fill: #f7f2ff; stroke: #b99ee0; }
+    .diagram-label { fill: var(--text); font-family: var(--sans); font-size: 15px; font-weight: 700; }
+    .diagram-small { fill: var(--muted); font-family: var(--sans); font-size: 12px; }
+    .diagram-code { fill: #24364d; font-family: var(--mono); font-size: 12px; }
+    .diagram-arrow { stroke: #536176; stroke-width: 1.8; fill: none; marker-end: url(#arrowHead); }
+    .diagram-arrow-vision { stroke: #16836d; }
+    .diagram-arrow-text { stroke: #4267b2; }
+    .diagram-arrow-fusion { stroke: #9a6a00; stroke-width: 2.2; }
+    .diagram-freeze-box { fill: none; stroke: #5d6f89; stroke-width: 1.5; stroke-dasharray: 6 5; }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="hero">
+      <h1>Vision-Centric VLM Understanding-Style Training: 架构建议报告</h1>
+      <p>
+        面向你当前实现（1D visual tokens + LM 中间层分界 + NTP 反传给 vision encoder）的策略建议。
+        核心目标：让视觉表征更强，而不是让 LLM 接管主要能力。
+      </p>
+    </section>
+
+    <section class="stack">
+      <article class="card">
+        <span class="badge">Executive Summary</span>
+        <h2>先说结论</h2>
+        <ol>
+          <li>你现在的 split 思路是对的：把 LM 前几层当 text feature extractor、后几层当 multimodal fusion + language head，符合 vision-centric 目标。</li>
+          <li>仅靠 NTP 容易出现“语言指标变化大，KNN 变化小”的现象，这通常说明视觉表征收益被语言建模噪声掩盖。</li>
+          <li>冻结 LM 前半部分一般推荐，但不建议“一刀切长期冻结”；建议用 staged unfreeze（后层先训，前层晚些小 LR 解冻）。</li>
+          <li>LM 必须预训练加载（至少后半层 + embedding + lm head），否则训练会退化成“同时学语言和视觉”，视觉研究信号不干净。</li>
+          <li>如果你要衡量 vision encoder，本质上要引入“弱语言依赖”指标：线性探测、检索、密集预测、跨域稳健性，而不只看 ImageNet KNN。</li>
+        </ol>
+      </article>
+
+      <article class="card">
+        <span class="badge">Architecture Diagram</span>
+        <h2>当前推荐架构示意图</h2>
+        <div class="diagram-wrap" aria-label="Vision-centric VLM architecture diagram">
+          <svg class="arch-diagram" viewBox="0 0 1120 430" role="img" aria-labelledby="archTitle archDesc" xmlns="http://www.w3.org/2000/svg">
+            <title id="archTitle">Vision 和 Text 在序列维度 Concatenate 的 VLM 架构</title>
+            <desc id="archDesc">图像经过 vision encoder 和 projector 得到视觉 token，文本经过 embedding 和 LM 前层得到文本 hidden states，二者在中间 Concatenate 后输入 LM 后层完成多模态融合与 NTP。</desc>
+            <defs>
+              <marker id="arrowHead" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="#536176" />
+              </marker>
+            </defs>
+
+            <text x="36" y="36" class="diagram-label">Two-stream feature extraction, then sequence-level fusion</text>
+            <text x="36" y="58" class="diagram-small">LM 前层只处理 text；vision token 经过 projector 对齐到 LM hidden size；黄色节点就是 vision/text 的 Concatenate 位置。</text>
+
+            <rect x="34" y="90" width="118" height="74" rx="10" class="diagram-node diagram-node-vision" />
+            <text x="93" y="120" text-anchor="middle" class="diagram-label">Image</text>
+            <text x="93" y="143" text-anchor="middle" class="diagram-small">pixels / patches</text>
+
+            <rect x="200" y="90" width="150" height="74" rx="10" class="diagram-node diagram-node-vision" />
+            <text x="275" y="118" text-anchor="middle" class="diagram-label">Vision Encoder</text>
+            <text x="275" y="140" text-anchor="middle" class="diagram-small">train / high LR</text>
+
+            <rect x="398" y="90" width="142" height="74" rx="10" class="diagram-node diagram-node-vision" />
+            <text x="469" y="118" text-anchor="middle" class="diagram-label">Visual Tokens</text>
+            <text x="469" y="140" text-anchor="middle" class="diagram-code">K x d_v</text>
+
+            <rect x="588" y="90" width="142" height="74" rx="10" class="diagram-node diagram-node-vision" />
+            <text x="659" y="118" text-anchor="middle" class="diagram-label">Projector</text>
+            <text x="659" y="140" text-anchor="middle" class="diagram-code">d_v -> d_lm</text>
+
+            <rect x="184" y="226" width="372" height="118" rx="14" class="diagram-freeze-box" />
+            <text x="370" y="243" text-anchor="middle" class="diagram-small">LM 前层区域：可选 Freeze / 小 LR</text>
+
+            <rect x="34" y="248" width="118" height="74" rx="10" class="diagram-node diagram-node-text" />
+            <text x="93" y="278" text-anchor="middle" class="diagram-label">Text</text>
+            <text x="93" y="301" text-anchor="middle" class="diagram-small">prompt tokens</text>
+
+            <rect x="200" y="248" width="150" height="74" rx="10" class="diagram-node diagram-node-text" />
+            <text x="275" y="276" text-anchor="middle" class="diagram-label">Token Embed</text>
+            <text x="275" y="298" text-anchor="middle" class="diagram-code">T x d_lm</text>
+
+            <rect x="398" y="248" width="142" height="74" rx="10" class="diagram-node diagram-node-text" />
+            <text x="469" y="275" text-anchor="middle" class="diagram-label">LM 前层</text>
+            <text x="469" y="298" text-anchor="middle" class="diagram-code">0..txt_layer-1</text>
+
+            <rect x="588" y="248" width="142" height="74" rx="10" class="diagram-node diagram-node-text" />
+            <text x="659" y="275" text-anchor="middle" class="diagram-label">Text Features</text>
+            <text x="659" y="298" text-anchor="middle" class="diagram-code">T x d_lm</text>
+
+            <rect x="788" y="158" width="172" height="110" rx="12" class="diagram-node diagram-node-fusion" />
+            <text x="874" y="190" text-anchor="middle" class="diagram-label">Concatenate</text>
+            <text x="874" y="214" text-anchor="middle" class="diagram-code">[V_tokens ; T_hidden]</text>
+            <text x="874" y="237" text-anchor="middle" class="diagram-code">dim = sequence</text>
+            <text x="874" y="257" text-anchor="middle" class="diagram-small">(K + T) x d_lm</text>
+
+            <rect x="1000" y="158" width="86" height="110" rx="12" class="diagram-node diagram-node-output" />
+            <text x="1043" y="195" text-anchor="middle" class="diagram-label">LM 后层</text>
+            <text x="1043" y="219" text-anchor="middle" class="diagram-small">fusion</text>
+            <text x="1043" y="241" text-anchor="middle" class="diagram-small">+ lm head</text>
+
+            <line x1="152" y1="127" x2="198" y2="127" class="diagram-arrow diagram-arrow-vision" />
+            <line x1="350" y1="127" x2="396" y2="127" class="diagram-arrow diagram-arrow-vision" />
+            <line x1="540" y1="127" x2="586" y2="127" class="diagram-arrow diagram-arrow-vision" />
+            <path d="M 730 127 C 770 127, 770 185, 787 198" class="diagram-arrow diagram-arrow-vision" />
+
+            <line x1="152" y1="285" x2="198" y2="285" class="diagram-arrow diagram-arrow-text" />
+            <line x1="350" y1="285" x2="396" y2="285" class="diagram-arrow diagram-arrow-text" />
+            <line x1="540" y1="285" x2="586" y2="285" class="diagram-arrow diagram-arrow-text" />
+            <path d="M 730 285 C 770 285, 770 242, 787 228" class="diagram-arrow diagram-arrow-text" />
+
+            <line x1="960" y1="213" x2="998" y2="213" class="diagram-arrow diagram-arrow-fusion" />
+
+            <text x="825" y="368" text-anchor="middle" class="diagram-small">NTP / contrastive / recon losses 主要反传到 vision + projector，LM 后层低 LR 适配</text>
+          </svg>
+        </div>
+        <p class="diagram-caption">
+          关键点：不要把视觉 token 送进 LM 前层；先让 LM 前层抽取 <code>text_hidden</code>，再与投影后的 <code>vision_tokens</code> 在序列长度维拼接，拼接后的序列交给 LM 后层做 multimodal fusion。
+        </p>
+      </article>
+
+      <article class="card">
+        <span class="badge">Current Design Reading</span>
+        <h2>你当前代码设计的优点与风险</h2>
+        <h3>优点</h3>
+        <ul>
+          <li><code>txt_feature_layer</code> 把文本早层和后层切开，结构上已经接近 dual-encoder + late fusion 的可解释形态。</li>
+          <li>可选 <code>freeze_lm</code> 与部分层冻结（embedding + layer_0..N-1）已经具备做清晰消融的能力。</li>
+          <li>1D learnable visual token + cross-attn 压缩，有利于统一上下游输入长度、提高吞吐。</li>
+        </ul>
+        <h3>风险</h3>
+        <ul>
+          <li>NTP 单目标会鼓励“最省力路径”：LM 后层靠语言先验完成 token 预测，视觉分支只需提供弱增益。</li>
+          <li>冻结后文本任务下降而 KNN 不变，是典型信号：融合层适配变弱，但视觉 backbone 判别能力没有显著改变。</li>
+          <li>固定长度 K 个视觉 token 可能成为瓶颈：高细节 OCR/grounding 任务容易被压缩损失拖累。</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <span class="badge">Q1</span>
+        <h2>关键超参数：哪些最该盯</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>组别</th>
+              <th>最关键参数</th>
+              <th>建议范围 / 策略</th>
+              <th>观测信号</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>分层边界</td>
+              <td><code>txt_feature_layer</code></td>
+              <td>先扫 <code>{6, 9, 12, 15}</code>（以 18 层 LM 为例）</td>
+              <td>文本任务和视觉指标的 Pareto 前沿</td>
+            </tr>
+            <tr>
+              <td>冻结策略</td>
+              <td><code>freeze_lm</code> + 冻结层数</td>
+              <td>前半冻结通常比全冻稳；后半层必须可训练</td>
+              <td>loss 收敛速度、VQA/RefCOCOg 退化程度</td>
+            </tr>
+            <tr>
+              <td>视觉压缩</td>
+              <td><code>num_learnable_tokens (K)</code></td>
+              <td>扫 <code>{64,128,256,384}</code></td>
+              <td>KNN、检索、OCR/grounding 的灵敏度差异</td>
+            </tr>
+            <tr>
+              <td>视觉容量</td>
+              <td>encoder depth / width / feature_dim</td>
+              <td>优先加深 Stage2 cross-attn，再加宽</td>
+              <td>同 FLOPs 下收益是否高于增大 LM</td>
+            </tr>
+            <tr>
+              <td>loss 配比</td>
+              <td><code>vlm/text_only/cfg/recon</code> weights</td>
+              <td>vision-centric 建议先弱化 text-only/cfg</td>
+              <td>图像相关指标是否提升且语言不崩</td>
+            </tr>
+            <tr>
+              <td>优化器与 LR</td>
+              <td>vision LR vs LM LR（分组）</td>
+              <td>vision LR 通常可设为 LM 的 2-5 倍</td>
+              <td>是否减少“LM 主导”现象</td>
+            </tr>
+            <tr>
+              <td>token dropout</td>
+              <td><code>und_use_mask</code> / <code>enc_cross_attn_split</code></td>
+              <td>训练期逐步增加 mask 强度（curriculum）</td>
+              <td>少 token 场景下性能曲线</td>
+            </tr>
+          </tbody>
+        </table>
+      </article>
+
+      <article class="card">
+        <span class="badge">Q2</span>
+        <h2>是否推荐 freeze 前半部分 LM</h2>
+        <p><strong>推荐，但建议“分阶段”而不是永久冻结。</strong></p>
+        <div class="grid">
+          <div>
+            <h3>阶段 A（稳定对齐）</h3>
+            <ul>
+              <li>冻结 embedding + 前 N 层（N 可取 1/2~2/3 总层数）</li>
+              <li>训练 vision encoder + projector + LM 后层</li>
+              <li>目标：先建立视觉到语言空间的稳定接口</li>
+            </ul>
+          </div>
+          <div>
+            <h3>阶段 B（温和解冻）</h3>
+            <ul>
+              <li>解冻前层中的最后 2-4 层</li>
+              <li>给这些层较小 LR（后层的 0.1-0.3 倍）</li>
+              <li>目标：修复冻结导致的语义错配和生成劣化</li>
+            </ul>
+          </div>
+          <div>
+            <h3>阶段 C（可选）</h3>
+            <ul>
+              <li>若文本指标仍显著掉，再逐步解冻更早层</li>
+              <li>或仅上 LoRA/adapter，而非全参解冻</li>
+              <li>目标：最小化 LM 漂移同时补偿性能</li>
+            </ul>
+          </div>
+        </div>
+        <p class="warn">
+          你观察到的现象（freeze 后 VQA/文本输出变差，KNN 接近不变）并不意外，通常不代表视觉更差，而是 multimodal 读出头可塑性不足。
+        </p>
+      </article>
+
+      <article class="card">
+        <span class="badge">Q3</span>
+        <h2>LM 是否必须全部加载 pretrained</h2>
+        <h3>建议</h3>
+        <ul>
+          <li><strong>建议全部加载预训练权重。</strong> 即使部分层后续冻结，也先加载。</li>
+          <li>不建议把 LM 某些层随机初始化再训，这会把大量训练预算浪费在语言重建。</li>
+          <li>如果你非常强调 vision-centric，可减少 LM 参数更新量，而不是减少 LM 预训练初始化覆盖率。</li>
+        </ul>
+        <h3>更激进但稳妥的变体</h3>
+        <ul>
+          <li>LM 全预训练 + 大部分冻结 + 小型 adapter/LoRA 仅放在 fusion 相关层。</li>
+          <li>语言侧做蒸馏约束（保持 text-only perplexity 不漂移），让训练信号更多压到视觉侧。</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <span class="badge">Q4</span>
+        <h2>如何“只衡量” vision encoder 能力</h2>
+        <p>ImageNet KNN 很有用，但不够。建议至少补齐下面四组：</p>
+        <table>
+          <thead>
+            <tr>
+              <th>维度</th>
+              <th>建议指标</th>
+              <th>语言依赖</th>
+              <th>价值</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>全局语义</td>
+              <td>ImageNet / iNat / Places 的 linear probe</td>
+              <td>低</td>
+              <td>比 KNN 更稳定，能看可线性分离性</td>
+            </tr>
+            <tr>
+              <td>检索对齐</td>
+              <td>COCO/Flickr R@1/5/10（冻结文本编码器）</td>
+              <td>中</td>
+              <td>衡量图文匹配质量而非生成技巧</td>
+            </tr>
+            <tr>
+              <td>密集感知</td>
+              <td>VOC/COCO 线性分割头、RefCOCOg IoU</td>
+              <td>低~中</td>
+              <td>检验空间结构是否保留</td>
+            </tr>
+            <tr>
+              <td>鲁棒性</td>
+              <td>ImageNet-C / ObjectNet / VTAB transfer</td>
+              <td>低</td>
+              <td>检测是否过拟合数据分布</td>
+            </tr>
+          </tbody>
+        </table>
+        <h3>针对你当前现象的解释</h3>
+        <ul>
+          <li>KNN 接近不变：视觉表征主干未明显受损。</li>
+          <li>VQA/文本变差：LM 后层融合和生成适配受限，属于“读出层问题”多于“视觉骨干问题”。</li>
+          <li>建议加一个“冻结 LM 的 image-to-text retrieval”指标，能更直接看视觉贡献。</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <span class="badge">Q5</span>
+        <h2>架构改进建议（按优先级）</h2>
+        <h3>P0: 保持框架不大改、最快见效</h3>
+        <ul>
+          <li>分组 LR：<code>vision/projector</code> 高 LR，<code>LM 后层</code> 低 LR，<code>LM 前层</code> 冻结或超低 LR。</li>
+          <li>加 token-budget curriculum：先大 K（易学），逐步增加 mask/drop，逼迫 token 效率。</li>
+          <li>在 NTP 外加轻量对比损失（image-text symmetric contrastive），权重小但持续存在。</li>
+        </ul>
+
+        <h3>P1: 中等改动</h3>
+        <ul>
+          <li>把单次 concat 改为“多层注入”：在 LM 后几层重复 small cross-attn 或 FiLM/gated adapter。</li>
+          <li>对视觉 token 做层次化：global tokens + local tokens，分别服务语义与定位。</li>
+          <li>在 projector 前后加 residual gating，控制“视觉信息注入强度”。</li>
+        </ul>
+
+        <h3>P2: 更激进方向</h3>
+        <ul>
+          <li>双塔训练头（CLIP-style）与生成头共存：共享 vision encoder，联合优化检索与生成。</li>
+          <li>MoE visual tokens 或动态 token pruning，让模型按样本复杂度分配视觉预算。</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <span class="badge">MAE Integration</span>
+        <h2>能否自然引入 MAE pretraining</h2>
+        <p><strong>可以，而且不“投敌”。</strong> 关键是把 MAE 作为视觉表征正则，而不是终点目标。</p>
+        <ul>
+          <li>方案 1：两阶段。先短期 MAE 预热 vision encoder，再切到 understanding-style 多模态训练。</li>
+          <li>方案 2：联合训练。保留小权重 <code>recon_loss_weight</code>，但随训练衰减到接近 0。</li>
+          <li>方案 3：只对早层施加重建（patch-level），后层主要受语义损失驱动。</li>
+        </ul>
+        <p class="muted">
+          原则：重建任务用于“保结构与低层纹理”，主任务仍由视觉语义与图文对齐决定。
+        </p>
+      </article>
+
+      <article class="card">
+        <span class="badge">CoCa Lessons</span>
+        <h2>来自 CoCa 的可迁移 Recipe（已对齐你当前设计）</h2>
+        <h3>结构层面</h3>
+        <ul>
+          <li>CoCa 将 decoder 一分为二：前半层做 text-only（unimodal），后半层做 image-text 融合（multimodal）。</li>
+          <li>这和你的 <code>txt_feature_layer</code> 思路一致；他们的结论也是“前后分治”比纯早融合或纯晚融合更平衡。</li>
+          <li>CoCa 小规模消融显示 <code>n_uni:n_multi</code> 取约 1:1 是稳定点，你可优先扫 1/3、1/2、2/3 三档。</li>
+        </ul>
+
+        <h3>损失与权重</h3>
+        <ul>
+          <li>CoCa 核心是联合目标：<code>L = λ_cap * L_cap + λ_con * L_con</code>，不是只靠 NTP。</li>
+          <li>他们的 ablation 倾向 <code>λ_cap:λ_con = 2:1</code> 优于 1:1/1:2。</li>
+          <li>迁移到你这里：建议保持 VLM/NTP 为主，但持续保留小权重对比损失，避免视觉表征被语言先验“吞掉”。</li>
+        </ul>
+
+        <h3>视觉 token 与 pooler</h3>
+        <ul>
+          <li>CoCa 用长视觉序列服务生成分支（等价于“保细粒度视觉信息”），而对比分支用更紧凑的全局 embedding。</li>
+          <li>对你而言：保留较大的 K（如 256）更利于 OCR/grounding；过早压缩 K 往往只会让文本任务先掉。</li>
+          <li>如果做对比头，优先用简单 text head（单 CLS / 单 query）减少对比与生成目标冲突。</li>
+        </ul>
+
+        <h3>训练配方（可参考的数值锚点）</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>项目</th>
+              <th>CoCa 论文设置</th>
+              <th>对你的启示</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>预训练数据</td>
+              <td>annotated + alt-text 单阶段同训</td>
+              <td>混合数据一次训完可行，不必多阶段拼接</td>
+            </tr>
+            <tr>
+              <td>batch size</td>
+              <td>65,536</td>
+              <td>大 batch 有利于对比损失稳定；小 batch 需调温度/负样本策略</td>
+            </tr>
+            <tr>
+              <td>loss 权重</td>
+              <td><code>λ_cap=2.0, λ_con=1.0</code></td>
+              <td>生成目标可适当更重，兼顾细粒度语义</td>
+            </tr>
+            <tr>
+              <td>contrastive 温度</td>
+              <td>trainable, init 0.07</td>
+              <td>建议你的 contrastive 分支也用可学习温度</td>
+            </tr>
+            <tr>
+              <td>优化器</td>
+              <td>Adafactor, wd=0.01, warmup 2%</td>
+              <td>若继续 Muon/Adam，可对齐 warmup 比例与 wd 量级做消融</td>
+            </tr>
+          </tbody>
+        </table>
+      </article>
+
+      <article class="card">
+        <span class="badge">Ablation Plan</span>
+        <h2>建议实验矩阵（两周内可执行）</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>实验组</th>
+              <th>改动</th>
+              <th>目标问题</th>
+              <th>通过标准</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>A1</td>
+              <td><code>txt_feature_layer</code> sweep: 6/9/12/15</td>
+              <td>最佳 text/vision 分界点</td>
+              <td>视觉指标提升且文本退化可控</td>
+            </tr>
+            <tr>
+              <td>A2</td>
+              <td>freeze 前层 vs 全冻 vs 不冻</td>
+              <td>冻结策略是否过强</td>
+              <td>找到 Pareto 最优冻结比例</td>
+            </tr>
+            <tr>
+              <td>A3</td>
+              <td>K sweep: 64/128/256/384</td>
+              <td>token bottleneck 是否限制视觉</td>
+              <td>OCR/grounding 指标随 K 正相关</td>
+            </tr>
+            <tr>
+              <td>A4</td>
+              <td>+ 小权重 contrastive loss</td>
+              <td>NTP 是否过度语言化</td>
+              <td>检索与 KNN 同升</td>
+            </tr>
+            <tr>
+              <td>A5</td>
+              <td>staged unfreeze（后层->前层）</td>
+              <td>freeze 造成输出退化</td>
+              <td>文本恢复同时不压制视觉</td>
+            </tr>
+          </tbody>
+        </table>
+      </article>
+
+      <article class="card">
+        <span class="badge">Practical Defaults</span>
+        <h2>一个可直接开跑的默认配方</h2>
+        <div>
+          <span class="pill">LM: 全量加载 pretrained</span>
+          <span class="pill">txt_feature_layer: 9 或 12</span>
+          <span class="pill">阶段A冻结前层</span>
+          <span class="pill">vision LR = LM 后层 LR 的 3x</span>
+          <span class="pill">K = 256 起步</span>
+          <span class="pill">小权重 contrastive + NTP</span>
+          <span class="pill">recon_loss 前高后低衰减</span>
+        </div>
+        <ul>
+          <li>若你首要目标是视觉表征提升，优先看：linear probe / retrieval / refcocog，而不是先盯 VQA 生成分数。</li>
+          <li>当这些视觉指标稳定提升后，再做少量 LM 解冻去回收文本输出性能。</li>
+        </ul>
+      </article>
+    </section>
+  </main>
+</body>
+</html>

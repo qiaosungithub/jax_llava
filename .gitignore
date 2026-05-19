@@ -1,0 +1,8 @@
+debug/
+*.pyc
+tmp/
+
+.vscode
+.ka
+__pycache__
+*.log

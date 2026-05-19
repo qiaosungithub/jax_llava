@@ -1,0 +1,805 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Four-Trunk VLM: Prompt, Pixel Patches, Registers 的第二次看图设计</title>
+<style>
+  :root {
+    --fg: #171717;
+    --muted: #5b5b5b;
+    --bg: #fdfdfc;
+    --paper: #ffffff;
+    --rule: #d9d9d9;
+    --code-bg: #f4f1ec;
+    --note-bg: #fdf6e3;
+    --idea-bg: #eef7f5;
+    --warn-bg: #fff1ec;
+    --accent: #8a3324;
+    --accent2: #1a4f72;
+    --image1: #7cb342;
+    --image2: #2e7d32;
+    --prompt: #4a90e2;
+    --register: #7e57c2;
+    --answer: #ff8a65;
+  }
+
+  html { font-size: 16px; }
+  body {
+    max-width: 1020px;
+    margin: 3rem auto;
+    padding: 0 1.25rem 4rem;
+    font-family: "Charter", "Iowan Old Style", Georgia, "Times New Roman", serif;
+    color: var(--fg);
+    background: var(--bg);
+    line-height: 1.66;
+  }
+
+  h1, h2, h3, h4 {
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.28;
+    color: var(--fg);
+  }
+  h1 {
+    font-size: 2rem;
+    margin: 0 0 0.4rem;
+    border-bottom: 2px solid var(--fg);
+    padding-bottom: 0.55rem;
+  }
+  h2 {
+    font-size: 1.35rem;
+    margin-top: 2.35rem;
+    color: var(--accent);
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: 0.3rem;
+  }
+  h3 {
+    font-size: 1.08rem;
+    margin-top: 1.45rem;
+    color: var(--accent2);
+  }
+  h4 {
+    font-size: 0.98rem;
+    margin: 1rem 0 0.2rem;
+    color: #242424;
+  }
+  p { margin: 0.62rem 0; }
+  ul, ol { padding-left: 1.4rem; }
+  li { margin: 0.35rem 0; }
+  a { color: var(--accent2); text-decoration-thickness: 1px; }
+  code {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    background: var(--code-bg);
+    padding: 0.1em 0.35em;
+    border-radius: 3px;
+    font-size: 0.88em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 0.9rem 1rem;
+    border-radius: 5px;
+    overflow-x: auto;
+    font-size: 0.86rem;
+    line-height: 1.52;
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1rem 0;
+    font-size: 0.92rem;
+    font-variant-numeric: tabular-nums;
+  }
+  th, td {
+    border: 1px solid var(--rule);
+    padding: 0.55rem 0.7rem;
+    text-align: left;
+    vertical-align: top;
+  }
+  th {
+    background: var(--code-bg);
+    font-weight: 650;
+  }
+  svg {
+    max-width: 100%;
+    height: auto;
+    background: #fafaf7;
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    padding: 0.75rem;
+  }
+
+  .meta {
+    color: var(--muted);
+    font-size: 0.92rem;
+    margin-bottom: 1.1rem;
+  }
+  .box {
+    border-left: 4px solid var(--accent2);
+    border-radius: 0 5px 5px 0;
+    background: var(--idea-bg);
+    padding: 0.85rem 1.05rem;
+    margin: 0.95rem 0 1.2rem;
+  }
+  .proposal {
+    border-left-color: #b58900;
+    background: var(--note-bg);
+  }
+  .risk {
+    border-left-color: var(--accent);
+    background: var(--warn-bg);
+  }
+  .arch {
+    background: var(--paper);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    padding: 1rem 1.1rem;
+    margin: 1.15rem 0;
+  }
+  .arch h3 { margin-top: 0; }
+  .tag-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.45rem;
+    margin: 0.5rem 0 0.75rem;
+  }
+  .tag {
+    display: inline-block;
+    border: 1px solid var(--rule);
+    border-radius: 999px;
+    background: #fafafa;
+    padding: 0.12rem 0.55rem;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    font-size: 0.78rem;
+    color: #333;
+  }
+  .legend {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(120px, 1fr));
+    gap: 0.55rem;
+    margin: 0.75rem 0 1rem;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    font-size: 0.84rem;
+  }
+  .swatch {
+    width: 22px;
+    height: 16px;
+    border-radius: 3px;
+    border: 1px solid rgba(0,0,0,0.18);
+    flex: 0 0 auto;
+  }
+  .pipeline {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 0.7rem;
+    margin: 1rem 0;
+  }
+  .stage {
+    min-height: 126px;
+    border-radius: 7px;
+    padding: 0.75rem;
+    color: #fff;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.25);
+  }
+  .stage strong {
+    display: block;
+    font-size: 0.93rem;
+    margin-bottom: 0.35rem;
+  }
+  .stage span {
+    display: block;
+    font-size: 0.78rem;
+    opacity: 0.96;
+    margin-top: 0.2rem;
+  }
+  .small {
+    color: var(--muted);
+    font-size: 0.9rem;
+  }
+  .caption {
+    color: var(--muted);
+    font-size: 0.9rem;
+    text-align: center;
+    margin: 0.45rem 0 1rem;
+  }
+  .score {
+    white-space: nowrap;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.85rem;
+  }
+  @media (max-width: 800px) {
+    .pipeline { grid-template-columns: 1fr; }
+    .legend { grid-template-columns: 1fr 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<h1>Four-Trunk VLM: Prompt, Pixel Patches, Registers 的第二次看图设计</h1>
+<p class="meta">这份 report 重新整理 5 个 Trunk-3 架构，重点吸收两个新约束：第一次粗看特征和第二次 fine patch embedding 在 channel 维度融合；第二次最终仍输出长度受控的 1D register features。</p>
+
+<div class="box">
+  <strong>核心结论。</strong>
+  这次我会把 Trunk 3 的问题抽象成三类 token 如何交互：
+  <code>image patches</code> 提供高低层视觉证据，
+  <code>prompt tokens</code> 提供“要找什么”的语义，
+  <code>register tokens</code> 决定最终 1D feature 的长度和槽位。
+  最重要的设计点不是“有没有 cross-attention”，而是 prompt 如何先形成 word-to-patch 的定位信号，再让 registers 从这些被定位和上下文化后的 patches 中抽取 compact features。
+</div>
+
+<h2>1. 新的公共前处理: 粗看 + 细看 + Channel Concatenation</h2>
+
+<p>你提到的 channel concat 很关键，因为它把原来的三 stream 问题先压成一个更干净的 image stream。对于 512 x 512 图像，一个自然设定是：</p>
+
+<ul>
+  <li><strong>第一次看图:</strong> patch size 32，得到 16 x 16 = 256 个 coarse tokens。它们负责全局语义和对象级上下文。</li>
+  <li><strong>第二次看图:</strong> patch size 16，得到 32 x 32 = 1024 个 fine tokens。它们负责文字、小物体、局部纹理、颜色和空间细节。</li>
+  <li><strong>对齐方式:</strong> 把 16 x 16 coarse grid 每个 cell repeat 到 2 x 2，对齐成 32 x 32，再和 fine patch embedding 在 channel 维度 concatenate。</li>
+</ul>
+
+<pre><code># image size = 512, p_coarse = 32, p_fine = 16
+coarse_grid = Trunk1CoarseEncoder(image)       # [B, 16, 16, Dc]
+fine_grid   = FinePatchEmbed(image)            # [B, 32, 32, Df]
+
+coarse_up   = repeat_2x2(coarse_grid)          # [B, 32, 32, Dc]
+image_grid0 = concat([fine_grid, coarse_up], dim=-1)
+image_tokens0 = Linear(image_grid0)            # [B, 1024, D]
+
+# Trunk 3 only needs to solve:
+# image_tokens0 + prompt_tokens + K registers -> K prompt-aware visual tokens</code></pre>
+
+<p>如果第一次 encoder 输出不是 spatial grid，而是现有 PrefixMAE 的 abstract 1D tokens，也仍然可以做类似对齐：用 coarse patch stream 的中间输出做 spatial source；或者让 fine tokens cross-attend abstract tokens 得到一个 broadcast memory。前者更简单，建议把第一次 encoder 的 coarse patch tokens 暴露出来。</p>
+
+<div class="legend">
+  <div class="legend-item"><span class="swatch" style="background: var(--image1);"></span>coarse image memory</div>
+  <div class="legend-item"><span class="swatch" style="background: var(--image2);"></span>fine image patches</div>
+  <div class="legend-item"><span class="swatch" style="background: var(--prompt);"></span>prompt tokens</div>
+  <div class="legend-item"><span class="swatch" style="background: var(--register);"></span>register tokens</div>
+  <div class="legend-item"><span class="swatch" style="background: var(--answer);"></span>answer tokens</div>
+</div>
+
+<div class="pipeline">
+  <div class="stage" style="background: var(--image1);">
+    <strong>First Pass, Coarse</strong>
+    <span>512 image, patch 32</span>
+    <span>16 x 16 = 256 tokens</span>
+    <span>global objects, layout, scene</span>
+  </div>
+  <div class="stage" style="background: var(--image2);">
+    <strong>Second Pass, Fine</strong>
+    <span>512 image, patch 16</span>
+    <span>32 x 32 = 1024 tokens</span>
+    <span>text, small details, local evidence</span>
+  </div>
+  <div class="stage" style="background: var(--register);">
+    <strong>Trunk 3 Output</strong>
+    <span>K registers, e.g. 128 to 512</span>
+    <span>compact 1D sequence</span>
+    <span>fed to frozen LLM as img_features_2</span>
+  </div>
+</div>
+
+<h2>2. 三类 token 的角色</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>Token type</th>
+      <th>输入规模</th>
+      <th>应该做什么</th>
+      <th>不应该做什么</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>image_tokens</code></td>
+      <td>1024 fine grid tokens</td>
+      <td>通过 self-attention 或 local/window attention 看周围 patches，建立空间上下文</td>
+      <td>不能只被动作为 K/V，否则 patch 之间无法交换证据</td>
+    </tr>
+    <tr>
+      <td><code>prompt_tokens</code></td>
+      <td>通常 5 到 128 tokens</td>
+      <td>形成 word-to-patch relevance，比如“cat”对应图里的猫 patches</td>
+      <td>不能只做一个 pooled vector，否则会丢掉词级定位能力</td>
+    </tr>
+    <tr>
+      <td><code>register_tokens</code></td>
+      <td>K 小于 1024，建议 128/256/512</td>
+      <td>作为最终 1D bottleneck，从 prompt-relevant image tokens 中抽取答案需要的 visual features</td>
+      <td>不能完全替代 image self-attention，否则只是无上下文 pooling</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>3. 五种架构设计</h2>
+
+<div class="arch">
+  <h3>方案 1: Fused-Patch + Prompt-Biased Register Perceiver</h3>
+  <div class="tag-row">
+    <span class="tag">最推荐 first implementation</span>
+    <span class="tag">two streams: image + tokens</span>
+    <span class="tag">explicit word-patch bias</span>
+    <span class="tag">K registers output</span>
+  </div>
+
+  <p><strong>直觉。</strong> 先把 coarse high-level feature 和 fine low-level patch embedding 拼成一个 image stream；再让 prompt 生成一张 word-to-patch relevance map；最后 registers 带着 prompt bias 去读取 image stream。它直接实现你想要的效果：prompt 里的“cat”应该在 attention 上激活图像里猫对应的 patches。</p>
+
+<pre><code>I = image_tokens0                                  # [B, 1024, D]
+P = prompt_features                                # [B, Lp, D]
+R = learned_registers                              # [B, K, D]
+
+for block in Trunk3:
+    # 1. image patches see other image patches
+    I = I + ImageSelfAttn(LN(I))                    # local/global/window attention
+    I = I + ImageFFN(LN(I))
+
+    # 2. prompt reads image and builds word-to-patch map
+    P = P + CrossAttn(LN(P), KV=I)                  # attention A_prompt_patch: [Lp, 1024]
+    P = P + TextFFN(LN(P))
+
+    # 3. registers read prompt, then read image with prompt-derived bias
+    R = R + CrossAttn(LN(R), KV=P)
+    bias = make_patch_bias(R, P, A_prompt_patch)    # [K, 1024]
+    R = R + CrossAttn(LN(R), KV=I, attn_bias=bias)
+    R = R + RegisterFFN(LN(R))
+
+img_features_2 = R                                 # [B, K, D]</code></pre>
+
+  <p><strong>关键机制。</strong> <code>A_prompt_patch</code> 是词到 patch 的显式注意力图。registers 不是盲目 attend 所有 patches，而是使用 prompt-derived attention bias。比如某个 register 先 attend 到 prompt token “cat”，它随后读取 image patches 时，attention logits 会被“cat -> image patches”的热图增强。</p>
+
+  <p><strong>为什么比普通 Q-Former 更好。</strong> 普通 Q-Former 只有 <code>R -> image</code>；这里有 <code>P -> image</code> 先定位，再由 <code>R -> image</code> 抽取。这让 prompt 里的词真正参与决定哪些 patches 被压缩进 1D features。</p>
+
+  <p><strong>实现建议。</strong> 第一版可以让 <code>ImageSelfAttn</code> 使用 window attention + 每隔几层 global attention，避免 1024 token full attention 过贵。<code>K</code> 从 256 开始，和当前 PrefixMAE 的 <code>num_learnable_tokens</code> 对齐。</p>
+</div>
+
+<div class="arch">
+  <h3>方案 2: SAM-R, SAM-style Two-Way Decoder with Registers</h3>
+  <div class="tag-row">
+    <span class="tag">SAM-inspired</span>
+    <span class="tag">prompt-image two-way</span>
+    <span class="tag">image self-attn added</span>
+    <span class="tag">interpretable</span>
+  </div>
+
+  <p><strong>直觉。</strong> SAM 的 mask decoder 不是单向 cross-attention，而是 two-way transformer：tokens 读 image，image 也反向读 tokens。我们把 SAM 的 mask tokens 换成 VLM registers，把 sparse prompt embeddings 换成文本 prompt tokens，把 mask output 换成 <code>img_features_2</code>。</p>
+
+<pre><code>I = fused_image_tokens                              # [B, 1024, D]
+T = concat([registers, prompt_tokens], axis=1)      # [B, K + Lp, D]
+
+for block in SAM_R_Block:
+    # token side: registers and prompt exchange information
+    T = T + TokenSelfAttn(LN(T))
+
+    # token -> image: prompt/registers look into patches
+    T = T + CrossAttn(LN(T), KV=I)
+    T = T + TokenFFN(LN(T))
+
+    # image side must also be contextualized
+    I = I + ImageSelfAttn(LN(I))                    # local/window or full
+    I = I + ImageFFN(LN(I))
+
+    # image -> token: patches are updated by prompt/register information
+    I = I + CrossAttn(LN(I), KV=T)
+
+img_features_2 = T[:, :K, :]                        # register slice only</code></pre>
+
+  <p><strong>为什么符合你的疑问。</strong> 这个结构里 image patches 至少经过 self-attention，而且 prompt/registers 和 image patches 是双向更新。prompt 不只是读取图像，图像 token 自身也被 prompt 语义改写。因此如果 prompt 里有“cat”，猫附近 patches 会在 image stream 中变得更适合后续 registers 提取。</p>
+
+  <p><strong>和 SAM 的映射。</strong> SAM 的 <code>mask_tokens</code> 类似这里的 registers；SAM 的 sparse prompt tokens 类似 text prompt tokens；SAM 的 image embedding 类似 fused image tokens。不同点是我们最终保留 registers 作为 VLM 的 1D visual tokens，而不是生成 mask。</p>
+
+  <p><strong>可视化收益。</strong> 可以额外拿 prompt-to-image attention 和 register-to-image attention 画 heatmap，检查“cat/color/text”等词是否真的落在正确区域。</p>
+</div>
+
+<div class="arch">
+  <h3>方案 3: Prompt-AdaLN Fine ViT with Registers</h3>
+  <div class="tag-row">
+    <span class="tag">vision-native</span>
+    <span class="tag">AdaLN / FiLM conditioning</span>
+    <span class="tag">registers in self-attn</span>
+    <span class="tag">clean second encoder</span>
+  </div>
+
+  <p><strong>直觉。</strong> 你提到 AdaLN conditioning 很对，因为它是一种更“vision”的 prompt 注入方式。不要每层都让 prompt cross-attend image，而是让 prompt 生成每层 normalization 的 scale/shift/gate，使整个 fine ViT 变成 prompt-conditioned vision encoder。</p>
+
+<pre><code>I = fused_image_tokens                              # [B, 1024, D]
+R = learned_registers                              # [B, K, D]
+P = prompt_features                                # [B, Lp, D]
+
+prompt_global = PromptPooler(P)                    # [B, D]
+
+X = concat([R, I], axis=1)                          # [B, K + 1024, D]
+for layer in PromptAdaLNViT:
+    gamma, beta, gate = AdaLNParams(prompt_global, layer_id)
+
+    X_norm = LN(X) * (1 + gamma) + beta
+    X = X + gate.attn * SelfAttn(X_norm)             # registers and patches interact
+
+    X_norm = LN(X) * (1 + gamma.ffn) + beta.ffn
+    X = X + gate.ffn * FFN(X_norm)
+
+    if layer_id % m == 0:
+        # optional word-level refresh for interpretability
+        R = X[:, :K, :]
+        R = R + CrossAttn(LN(R), KV=P)
+        X = concat([R, X[:, K:, :]], axis=1)
+
+img_features_2 = X[:, :K, :]</code></pre>
+
+  <p><strong>本质区别。</strong> 方案 1 和 2 都是显式 cross-attention 系统；方案 3 是 prompt-conditioned vision transformer。它更像 DiT/modern diffusion transformer 的 conditioning：prompt 改变每层视觉计算的动态，而不是只作为外部 memory 被读取。</p>
+
+  <p><strong>优点。</strong> 架构直觉很强：第二次看图就是一个真正的 prompt-conditioned fine vision encoder。image patches 通过 self-attention 自然看其他 patches；registers 作为 prefix tokens 在同一个 self-attention 中逐层吸收视觉信息。</p>
+
+  <p><strong>风险。</strong> 只用 pooled prompt 会弱化词级定位。因此建议每隔 <code>m</code> 层给 registers 做一次 <code>R -> prompt_tokens</code> cross-attention，或者把 noun/color/OCR tokens 单独保留下来。</p>
+</div>
+
+<div class="arch">
+  <h3>方案 4: Explicit Word-Patch Router + Register Pooler</h3>
+  <div class="tag-row">
+    <span class="tag">most explicit localization</span>
+    <span class="tag">word-to-patch maps</span>
+    <span class="tag">router then pool</span>
+    <span class="tag">good diagnostic value</span>
+  </div>
+
+  <p><strong>直觉。</strong> 把“prompt 里的猫 attend 到图像里的猫”做成架构里的显式中间变量，而不是希望 transformer 自己学出来。先计算每个 prompt token 到每个 image patch 的 affinity，然后用这些 heatmaps 指导 registers 做 pooling。</p>
+
+<pre><code>I = ImageContextualizer(fused_image_tokens)         # [B, 1024, D], has self-attn
+P = PromptContextualizer(prompt_features)           # [B, Lp, D]
+
+# word-to-patch routing table
+A = softmax((P Wq) @ (I Wk).T / sqrt(d), dim=patch) # [B, Lp, 1024]
+
+# create one or more registers per important prompt token
+S = TokenSelector(P)                                # select nouns/colors/OCR words or soft gates
+R0 = RegisterInit(P, S)                             # [B, K, D]
+
+for block in RouterPooler:
+    token_mix = softmax((R0 Wr) @ (P Wp).T)          # [B, K, Lp]
+    patch_bias = token_mix @ log(A + eps)            # [B, K, 1024]
+    R0 = R0 + CrossAttn(LN(R0), KV=I, attn_bias=patch_bias)
+    R0 = R0 + RegisterSelfAttn(LN(R0))
+    R0 = R0 + FFN(LN(R0))
+
+img_features_2 = R0</code></pre>
+
+  <p><strong>为什么它本质不同。</strong> 这里把 localization 和 representation 拆开。先产生可解释的 word-patch maps，再用 maps 约束 register pooling。它不像方案 1 那样把 routing 当成 cross-attention 的副产品，而是把 routing table 当成一等公民。</p>
+
+  <p><strong>训练辅助。</strong> 可以加轻量正则：heatmap entropy 不要过高，多个关键词的 heatmap 不要完全重合；如果有 OCR/grounding 数据，可以直接监督部分 word-patch maps。</p>
+
+  <p><strong>风险。</strong> 显式 router 可能过早离散化，导致训练不稳。第一版建议 soft routing，不做 hard top-k。</p>
+</div>
+
+<div class="arch">
+  <h3>方案 5: Hierarchical Coarse-to-Fine Register Encoder</h3>
+  <div class="tag-row">
+    <span class="tag">coarse-to-fine</span>
+    <span class="tag">efficient long sequence</span>
+    <span class="tag">soft glimpses</span>
+    <span class="tag">OCR and small objects</span>
+  </div>
+
+  <p><strong>直觉。</strong> 第一次 coarse pass 不只是 high-level feature source，也可以作为第二次 fine pass 的索引结构。prompt 先在 16 x 16 coarse grid 上找大概区域，再只对相关 coarse cells 下的 fine patches 做更重的 attention。</p>
+
+<pre><code>C = coarse_grid                                     # [B, 256, Dc]
+F = fine_patch_grid                                 # [B, 1024, Df]
+P = prompt_features
+
+# coarse routing: which 32x32 cells are worth expanding?
+C_ctx = CoarseSelfAttn(C)
+P_ctx = P + CrossAttn(P, KV=C_ctx)
+coarse_score = Router(P_ctx, C_ctx)                 # [B, Lp, 256]
+
+# soft expand from each coarse cell to its 2x2 fine patches
+selected_fine = SoftGatherFinePatches(F, coarse_score)
+
+# local registers per region, then global registers
+R_local = LocalRegisterPooler(selected_fine, P_ctx)
+R_global = GlobalRegisterMixer(R_local, P_ctx)
+
+img_features_2 = R_global                           # [B, K, D]</code></pre>
+
+  <p><strong>为什么重要。</strong> 当第二次 patch size 很小，image sequence 很长时，full attention 不一定划算。这个方案把“粗看一眼”变成计算策略：先粗定位，再细读取。对于文字、小物体、图表局部区域，它可能比对 1024 tokens 做均匀 attention 更高效。</p>
+
+  <p><strong>soft 版本。</strong> 不要一开始就 hard crop。先做 soft gather 或 coarse-cell weighted fine pooling，等模型稳定后再尝试 top-k cells / ROIAlign。</p>
+
+  <p><strong>风险。</strong> 如果 coarse router 错过区域，fine encoder 没法补救。可以保留少量 global registers 读取全图 fine tokens，作为 fallback。</p>
+</div>
+
+<h2>4. 五个方案横向比较</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>方案</th>
+      <th>Image patch self-attn</th>
+      <th>Prompt 如何定位 patches</th>
+      <th>Register 如何输出 1D features</th>
+      <th>复杂度</th>
+      <th>第一版推荐度</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>1. Prompt-biased Register Perceiver</td>
+      <td>有，image stream 先 self-attn</td>
+      <td><code>P -> I</code> attention 形成 bias</td>
+      <td><code>R -> P</code> 后带 bias 读取 <code>I</code></td>
+      <td><span class="score">medium</span></td>
+      <td>最高</td>
+    </tr>
+    <tr>
+      <td>2. SAM-R Two-Way Decoder</td>
+      <td>有，建议加 window/global self-attn</td>
+      <td>tokens 和 image 双向 cross-attn</td>
+      <td>取 token sequence 中 register slice</td>
+      <td><span class="score">medium-high</span></td>
+      <td>高</td>
+    </tr>
+    <tr>
+      <td>3. Prompt-AdaLN Fine ViT</td>
+      <td>强，主要就是 self-attn vision encoder</td>
+      <td>prompt 通过 AdaLN 改变视觉计算，辅以稀疏 cross-attn</td>
+      <td>registers 作为 prefix tokens 在 self-attn 中吸收信息</td>
+      <td><span class="score">medium-high</span></td>
+      <td>中高</td>
+    </tr>
+    <tr>
+      <td>4. Word-Patch Router</td>
+      <td>有，先 contextualize image</td>
+      <td>显式 <code>[prompt token, patch]</code> routing table</td>
+      <td>register pooling 被 routing table 约束</td>
+      <td><span class="score">medium</span></td>
+      <td>中，适合 diagnostic</td>
+    </tr>
+    <tr>
+      <td>5. Hierarchical Coarse-to-Fine</td>
+      <td>局部有，重 attention 只给相关区域</td>
+      <td>prompt 先在 coarse grid 上定位</td>
+      <td>local registers -> global registers</td>
+      <td><span class="score">medium to high</span></td>
+      <td>中，适合长序列</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>5. 推荐实验路线</h2>
+
+<div class="box proposal">
+  <strong>最建议先做方案 1。</strong>
+  它吸收了你的 channel-concat 想法，又明确解决三者 attention 问题：image patches 先 self-attend；prompt 先生成 word-patch relevance；registers 再用 prompt-derived bias 压缩成 1D features。它比 SAM-R 更简单，比 AdaLN 更容易解释词级 attention，比 hierarchical 方案变量更少。
+</div>
+
+<ol>
+  <li><strong>先做公共前处理:</strong> coarse patch size 32，fine patch size 16，把 coarse feature repeat/interpolate 到 fine grid 后 channel concat。</li>
+  <li><strong>实现方案 1:</strong> <code>ImageSelfAttn -> PromptCrossAttnToImage -> RegisterCrossAttnToPrompt -> RegisterCrossAttnToImageWithBias</code>。</li>
+  <li><strong>保留 ablations:</strong> 去掉 prompt bias；去掉 image self-attn；去掉 coarse feature concat；把 <code>K</code> 从 128/256/512 sweep。</li>
+  <li><strong>第二个实现做 SAM-R:</strong> 如果方案 1 有收益，SAM-R 是最自然的 stronger version，因为它让 image patches 也反向吸收 prompt/register 信息。</li>
+  <li><strong>AdaLN 作为第三个方向:</strong> 如果想验证“更 vision-native 的 prompt conditioning”，方案 3 是很好的替代路径。</li>
+</ol>
+
+<h2>6. 关键 ablation</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>Ablation</th>
+      <th>要回答的问题</th>
+      <th>预期现象</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>fine_patch_only</code> vs <code>fine_patch + coarse_up</code></td>
+      <td>第一次粗看 feature 是否真的帮助第二次细看</td>
+      <td>如果 concat 赢，说明 high-level object context 对 fine patch reading 有价值</td>
+    </tr>
+    <tr>
+      <td>no image self-attn vs image self-attn</td>
+      <td>image patches 是否需要先互相看</td>
+      <td>如果 self-attn 赢，说明局部证据需要上下文化，而不是只做 register pooling</td>
+    </tr>
+    <tr>
+      <td>no prompt bias vs prompt-biased register attention</td>
+      <td>prompt 是否真的控制了 registers 读取哪些 patches</td>
+      <td>如果 bias 赢，说明 word-to-patch routing 对 VQA/细粒度任务有帮助</td>
+    </tr>
+    <tr>
+      <td>raw prompt embeddings vs lower-LLM prompt features</td>
+      <td>Trunk 2 是否应该是一个真正的 prompt encoder</td>
+      <td>如果 lower-LLM features 赢，说明 frozen LLM 的中间语义能指导视觉重读</td>
+    </tr>
+    <tr>
+      <td><code>K=128/256/512</code></td>
+      <td>第二次输出 1D feature 需要多长</td>
+      <td>OCR/图表可能需要更长，普通 caption/VQA 可能 128/256 足够</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>7. SAM 架构说明和如何迁移到 VLM</h2>
+
+<p>你提到我之前的第三个设计不够清楚。这里单独解释 SAM 的相关部分。SAM 高层有三块：image encoder、prompt encoder、mask decoder。真正对我们有用的是 mask decoder 里的 two-way transformer。</p>
+
+<div class="box">
+  <strong>SAM 的关键结构。</strong>
+  Image encoder 先把图像变成 dense image embedding。Prompt encoder 把点、框、mask 等 prompt 变成 sparse prompt embeddings 和 dense prompt embeddings。Mask decoder 把 <code>iou token + mask tokens + sparse prompt tokens</code> 当作 token sequence，把 image embedding 加上 dense prompt embedding 当作 image sequence，然后用 two-way transformer 交互。最后 mask tokens 通过 hypernetwork 作用到 upscaled image embedding 上生成 masks。
+</div>
+
+<div style="text-align:center; margin: 1rem 0;">
+<svg width="940" height="460" viewBox="0 0 940 460" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#555"/>
+    </marker>
+  </defs>
+
+  <text x="470" y="26" text-anchor="middle" font-family="-apple-system, sans-serif" font-size="16" font-weight="650" fill="#171717">SAM Mask Decoder, adapted intuition for VLM Trunk 3</text>
+
+  <g transform="translate(30,60)">
+    <rect x="0" y="0" width="230" height="70" rx="7" fill="#2e7d32" opacity="0.88"/>
+    <text x="115" y="25" text-anchor="middle" font-size="13" font-weight="650" fill="white">Dense Image Embedding</text>
+    <text x="115" y="45" text-anchor="middle" font-size="11" fill="white">SAM: image encoder output</text>
+    <text x="115" y="60" text-anchor="middle" font-size="10" fill="white">Our VLM: fused fine patches</text>
+  </g>
+
+  <g transform="translate(340,60)">
+    <rect x="0" y="0" width="260" height="70" rx="7" fill="#4a90e2" opacity="0.88"/>
+    <text x="130" y="25" text-anchor="middle" font-size="13" font-weight="650" fill="white">Sparse Prompt Tokens</text>
+    <text x="130" y="45" text-anchor="middle" font-size="11" fill="white">SAM: points / boxes / text prompt</text>
+    <text x="130" y="60" text-anchor="middle" font-size="10" fill="white">Our VLM: question tokens</text>
+  </g>
+
+  <g transform="translate(680,60)">
+    <rect x="0" y="0" width="220" height="70" rx="7" fill="#7e57c2" opacity="0.88"/>
+    <text x="110" y="25" text-anchor="middle" font-size="13" font-weight="650" fill="white">Output Tokens</text>
+    <text x="110" y="45" text-anchor="middle" font-size="11" fill="white">SAM: IoU + mask tokens</text>
+    <text x="110" y="60" text-anchor="middle" font-size="10" fill="white">Our VLM: registers</text>
+  </g>
+
+  <line x1="145" y1="132" x2="145" y2="175" stroke="#555" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="470" y1="132" x2="470" y2="175" stroke="#555" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="790" y1="132" x2="790" y2="175" stroke="#555" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <g transform="translate(145,190)">
+    <rect x="0" y="0" width="650" height="190" rx="8" fill="#fff" stroke="#d9d9d9" stroke-width="1.5"/>
+    <text x="325" y="25" text-anchor="middle" font-size="14" font-weight="650" fill="#171717">Two-Way Transformer Block</text>
+
+    <g transform="translate(30,55)">
+      <rect x="0" y="0" width="170" height="45" rx="6" fill="#7e57c2" opacity="0.13" stroke="#7e57c2"/>
+      <text x="85" y="19" text-anchor="middle" font-size="11" font-weight="650" fill="#333">1. Token Self-Attn</text>
+      <text x="85" y="34" text-anchor="middle" font-size="10" fill="#555">prompt + output tokens</text>
+    </g>
+
+    <g transform="translate(235,55)">
+      <rect x="0" y="0" width="180" height="45" rx="6" fill="#4a90e2" opacity="0.13" stroke="#4a90e2"/>
+      <text x="90" y="19" text-anchor="middle" font-size="11" font-weight="650" fill="#333">2. Token -> Image</text>
+      <text x="90" y="34" text-anchor="middle" font-size="10" fill="#555">tokens read patches</text>
+    </g>
+
+    <g transform="translate(450,55)">
+      <rect x="0" y="0" width="170" height="45" rx="6" fill="#7e57c2" opacity="0.13" stroke="#7e57c2"/>
+      <text x="85" y="19" text-anchor="middle" font-size="11" font-weight="650" fill="#333">3. Token MLP</text>
+      <text x="85" y="34" text-anchor="middle" font-size="10" fill="#555">update token states</text>
+    </g>
+
+    <g transform="translate(140,125)">
+      <rect x="0" y="0" width="180" height="45" rx="6" fill="#2e7d32" opacity="0.13" stroke="#2e7d32"/>
+      <text x="90" y="19" text-anchor="middle" font-size="11" font-weight="650" fill="#333">4. Image -> Token</text>
+      <text x="90" y="34" text-anchor="middle" font-size="10" fill="#555">patches read tokens</text>
+    </g>
+
+    <g transform="translate(355,125)">
+      <rect x="0" y="0" width="180" height="45" rx="6" fill="#2e7d32" opacity="0.13" stroke="#2e7d32"/>
+      <text x="90" y="19" text-anchor="middle" font-size="11" font-weight="650" fill="#333">VLM addition</text>
+      <text x="90" y="34" text-anchor="middle" font-size="10" fill="#555">image self-attn blocks</text>
+    </g>
+
+    <line x1="200" y1="77" x2="232" y2="77" stroke="#555" stroke-width="1.8" marker-end="url(#arrow)"/>
+    <line x1="415" y1="77" x2="447" y2="77" stroke="#555" stroke-width="1.8" marker-end="url(#arrow)"/>
+    <line x1="320" y1="147" x2="352" y2="147" stroke="#555" stroke-width="1.8" marker-end="url(#arrow)"/>
+  </g>
+
+  <line x1="470" y1="382" x2="470" y2="420" stroke="#555" stroke-width="2" marker-end="url(#arrow)"/>
+  <g transform="translate(310,425)">
+    <rect x="0" y="0" width="320" height="30" rx="6" fill="#7e57c2" opacity="0.88"/>
+    <text x="160" y="20" text-anchor="middle" font-size="12" font-weight="650" fill="white">Our output: register slice -> img_features_2</text>
+  </g>
+</svg>
+</div>
+<p class="caption">图示: SAM 的 two-way decoder 可直接迁移为 VLM 的 prompt-image-register refiner。区别是 SAM 产出 mask，我们产出 1D visual registers。</p>
+
+<h3>SAM block 的精确顺序</h3>
+
+<p>根据 SAM 官方实现，<code>TwoWayAttentionBlock</code> 每层做四件事：token self-attention；tokens cross-attend image；token MLP；image cross-attend tokens。<code>TwoWayTransformer</code> 最后还会再做一次 token-to-image attention。官方 mask decoder 还会把 <code>iou_token + mask_tokens</code> 和 sparse prompts 拼成 token sequence，再把 dense prompt embedding 加到 image embedding 上。</p>
+
+<pre><code># SAM-like block, simplified
+queries = prompt_and_output_tokens
+keys    = image_embedding
+
+queries = SelfAttn(queries)
+queries = CrossAttn(q=queries, k=image, v=image)
+queries = MLP(queries)
+image   = CrossAttn(q=image, k=queries, v=queries)
+
+# final token-to-image attention after all blocks
+queries = CrossAttn(q=queries, k=image, v=image)</code></pre>
+
+<h3>迁移到这里时需要改的地方</h3>
+
+<ul>
+  <li><strong>Output tokens:</strong> SAM 的 mask tokens 换成 VLM registers，数量就是 <code>K</code>，决定 <code>img_features_2</code> 长度。</li>
+  <li><strong>Sparse prompts:</strong> SAM 的点/框 prompt 换成 text prompt tokens，最好用 lower-LLM prompt features。</li>
+  <li><strong>Image embedding:</strong> SAM 的 dense image embedding 换成 <code>concat(fine_patch_embed, coarse_up)</code> 后的 fused image tokens。</li>
+  <li><strong>Mask head:</strong> 不需要生成 mask，但可以保留一个 optional heatmap head，作为解释模型第二次看哪里。</li>
+  <li><strong>Image self-attn:</strong> 原始 SAM decoder 对 image token 的 self-attention 很轻；我们这里更需要 image patches 看到其他 patches，所以应显式加入 image self-attn 或 window self-attn。</li>
+</ul>
+
+<h2>8. 和现有代码的落地接口</h2>
+
+<p>当前 <a href="../models/siglip_enc_dec.py">models/siglip_enc_dec.py</a> 里的 <code>ImageEncoder</code> 已经有 patch embedding、patch self-attn、cross-attn 到 learnable tokens。为了支持这份 report 的设计，建议新增三个接口：</p>
+
+<ol>
+  <li><code>encode_coarse(image, patch_size=32, return_grid=True)</code>: 返回 16 x 16 coarse grid，而不是只返回 abstract tokens。</li>
+  <li><code>fine_patch_embed(image, patch_size=16)</code>: 返回 32 x 32 fine patch embedding。</li>
+  <li><code>encode_prompt_aware_image(coarse_grid, fine_grid, prompt_features, K)</code>: 实现上面五个方案之一，返回 <code>img_features_2: [B, K, D_lm]</code>。</li>
+</ol>
+
+<p>在 <a href="../models/paligemma_enc_dec.py">models/paligemma_enc_dec.py</a> 中，LLM 输入可以保持四 trunk 顺序：</p>
+
+<pre><code>seq = concat([
+    img_features_1,      # first coarse / problem-blind image feature
+    prompt_features,     # prompt trunk
+    img_features_2,      # prompt-aware second image registers
+    answer_features,     # teacher-forced answer trunk
+], axis=1)
+
+mask = build_4trunk_mask(len_img1, len_prompt, len_img2, len_answer)</code></pre>
+
+<h2>9. Final recommendation</h2>
+
+<div class="box proposal">
+  <strong>我会把方案 1 作为主线，方案 2 作为 stronger SAM-style 版本。</strong>
+  方案 1 最干净地回答你现在的问题：prompt、image patches、registers 三者如何 attention。它的 block 结构也最容易 ablate。方案 2 则把 SAM 的 two-way intuition 引入进来，可以作为“更强但更重”的第二版。
+</div>
+
+<p>具体第一版可以这样定义：</p>
+
+<pre><code>Trunk 1:
+  image 512, patch 32 -> coarse_grid [16,16,Dc]
+  optional Q-Former1 -> img_features_1 [K1,Dlm]
+
+Trunk 2:
+  prompt ids -> lower frozen LLM -> prompt_features [Lp,Dlm]
+
+Trunk 3:
+  fine patch embed, patch 16 -> fine_grid [32,32,Df]
+  coarse_up = repeat_2x2(coarse_grid)
+  I0 = Linear(concat([fine_grid, coarse_up], channel))
+  I = ImageSelfAttn(I0)
+  P = PromptCrossAttn(P, I)               # word-to-patch map
+  R = RegisterCrossAttn(R, P)
+  R = RegisterCrossAttn(R, I, prompt_bias)
+  img_features_2 = R                      # K2 <= 1024
+
+Trunk 4:
+  frozen LLM over [img1 | prompt | img2 | answer]</code></pre>
+
+<h2>10. References</h2>
+
+<ul>
+  <li><a href="https://arxiv.org/abs/2304.02643">Segment Anything, arXiv:2304.02643</a>: SAM paper, promptable segmentation model with image encoder, prompt encoder, and mask decoder.</li>
+  <li><a href="https://github.com/facebookresearch/segment-anything">facebookresearch/segment-anything</a>: official implementation.</li>
+  <li><a href="https://raw.githubusercontent.com/facebookresearch/segment-anything/main/segment_anything/modeling/transformer.py">SAM TwoWayTransformer source</a>: confirms the token self-attn, token-to-image cross-attn, MLP, and image-to-token cross-attn order.</li>
+  <li><a href="https://raw.githubusercontent.com/facebookresearch/segment-anything/main/segment_anything/modeling/mask_decoder.py">SAM MaskDecoder source</a>: shows output tokens, sparse prompt tokens, dense prompt embedding, transformer, and dynamic mask prediction head.</li>
+  <li><a href="../models/siglip_enc_dec.py">Current PrefixMAE image encoder</a>: local implementation to extend for coarse/fine patch features.</li>
+  <li><a href="../models/paligemma_enc_dec.py">Current PaliGemmaEncDec</a>: local frozen-LLM VLM path where 4-trunk sequence and mask can be added.</li>
+</ul>
+
+</body>
+</html>

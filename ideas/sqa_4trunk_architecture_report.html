@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Four-Trunk VLM: 第二次看图的 5 种架构设计</title>
+<style>
+  :root {
+    --fg: #171717;
+    --muted: #5a5a5a;
+    --bg: #fdfdfc;
+    --paper: #ffffff;
+    --rule: #d9d9d9;
+    --code-bg: #f4f1ec;
+    --note-bg: #fdf6e3;
+    --idea-bg: #eef7f5;
+    --warn-bg: #fff2ee;
+    --accent: #8a3324;
+    --accent2: #1a4f72;
+    --image1: #7cb342;
+    --text: #4a90e2;
+    --image2: #2e7d32;
+    --answer: #ff8a65;
+    --trained: #d63c2f;
+    --frozen: #9e9e9e;
+  }
+
+  html { font-size: 16px; }
+  body {
+    max-width: 980px;
+    margin: 3rem auto;
+    padding: 0 1.25rem 4rem;
+    font-family: "Charter", "Iowan Old Style", Georgia, "Times New Roman", serif;
+    color: var(--fg);
+    background: var(--bg);
+    line-height: 1.65;
+  }
+
+  h1, h2, h3, h4 {
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.28;
+    color: var(--fg);
+  }
+  h1 {
+    font-size: 2rem;
+    margin: 0 0 0.4rem;
+    border-bottom: 2px solid var(--fg);
+    padding-bottom: 0.55rem;
+  }
+  h2 {
+    font-size: 1.35rem;
+    margin-top: 2.35rem;
+    color: var(--accent);
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: 0.3rem;
+  }
+  h3 {
+    font-size: 1.08rem;
+    margin-top: 1.5rem;
+    color: var(--accent2);
+  }
+  h4 {
+    font-size: 0.98rem;
+    margin: 1rem 0 0.2rem;
+    color: #222;
+  }
+
+  p { margin: 0.62rem 0; }
+  ul, ol { padding-left: 1.4rem; }
+  li { margin: 0.35rem 0; }
+  a { color: var(--accent2); text-decoration-thickness: 1px; }
+  code {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    background: var(--code-bg);
+    padding: 0.1em 0.35em;
+    border-radius: 3px;
+    font-size: 0.88em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 0.9rem 1rem;
+    border-radius: 5px;
+    overflow-x: auto;
+    font-size: 0.88rem;
+    line-height: 1.52;
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1rem 0;
+    font-size: 0.92rem;
+    font-variant-numeric: tabular-nums;
+  }
+  th, td {
+    border: 1px solid var(--rule);
+    padding: 0.55rem 0.7rem;
+    text-align: left;
+    vertical-align: top;
+  }
+  th {
+    background: var(--code-bg);
+    font-weight: 650;
+  }
+
+  .meta {
+    color: var(--muted);
+    font-size: 0.92rem;
+    margin-bottom: 1.1rem;
+  }
+  .box {
+    border-left: 4px solid var(--accent2);
+    border-radius: 0 5px 5px 0;
+    background: var(--idea-bg);
+    padding: 0.85rem 1.05rem;
+    margin: 0.95rem 0 1.2rem;
+  }
+  .proposal {
+    border-left-color: #b58900;
+    background: var(--note-bg);
+  }
+  .risk {
+    border-left-color: var(--accent);
+    background: var(--warn-bg);
+  }
+  .small {
+    color: var(--muted);
+    font-size: 0.9rem;
+  }
+  .tag-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.45rem;
+    margin: 0.55rem 0 0.7rem;
+  }
+  .tag {
+    display: inline-block;
+    border: 1px solid var(--rule);
+    border-radius: 999px;
+    background: #fafafa;
+    padding: 0.12rem 0.55rem;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    font-size: 0.78rem;
+    color: #333;
+  }
+  .legend {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(130px, 1fr));
+    gap: 0.55rem;
+    margin: 0.7rem 0 1rem;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    font-size: 0.84rem;
+  }
+  .swatch {
+    width: 22px;
+    height: 16px;
+    border-radius: 3px;
+    border: 1px solid rgba(0,0,0,0.18);
+    flex: 0 0 auto;
+  }
+  .pipeline {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 0.65rem;
+    margin: 1rem 0;
+  }
+  .stage {
+    min-height: 118px;
+    border-radius: 7px;
+    padding: 0.75rem;
+    color: #fff;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.25);
+  }
+  .stage strong {
+    display: block;
+    font-size: 0.93rem;
+    margin-bottom: 0.35rem;
+  }
+  .stage span {
+    display: block;
+    font-size: 0.78rem;
+    opacity: 0.96;
+    margin-top: 0.2rem;
+  }
+  .arch {
+    background: var(--paper);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    padding: 1rem 1.1rem;
+    margin: 1.15rem 0;
+  }
+  .arch h3 { margin-top: 0; }
+  .score {
+    white-space: nowrap;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.85rem;
+  }
+  @media (max-width: 760px) {
+    .pipeline { grid-template-columns: 1fr; }
+    .legend { grid-template-columns: 1fr 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<h1>Four-Trunk VLM: 第二次看图的 5 种架构设计</h1>
+<p class="meta">面向当前 PaliGemma-baseline 代码的架构 brainstorm report。核心问题：Trunk 3 应该怎样同时利用 prompt、第一次图像特征和原始 pixel/patch 信息。</p>
+
+<div class="box">
+  <strong>结论先行。</strong>
+  我不建议把第二次看图只做成 <code>prompt query -> img_features_1</code>。这样虽然接近 DETR 的 query/object-slot 思路，但会被第一次 1D 压缩的信息瓶颈限制。更有研究价值的 Trunk 3 应该至少同时看到两类视觉信号：
+  <code>img_features_1</code> 作为第一次抽象语义记忆，<code>patch_tokens / pixels</code> 作为可重读的低层或空间细节。
+</div>
+
+<h2>1. 现有代码约束</h2>
+
+<p>当前实现不是普通 SigLIP prepend，而是一个适合做 4-trunk 的 PrefixMAE-style encoder-decoder：</p>
+
+<ul>
+  <li><a href="../models/siglip_enc_dec.py">models/siglip_enc_dec.py</a> 中的 <code>ImageEncoder</code> 结构是：patch embedding -> patch self-attention -> learnable 1D tokens cross-attend patch tokens -> token self-attention -> <code>K</code> 个 abstract tokens。</li>
+  <li><a href="../models/paligemma_enc_dec.py">models/paligemma_enc_dec.py</a> 中的 <code>PaliGemmaEncDec</code> 把 image tokens project 到 LLM hidden size，然后 prepend 到 text embeddings，frozen LLM 负责 next-token loss。</li>
+  <li>代码已经有 <code>txt_feature_layer</code> 这个方向：可以先让文本通过低层 LLM 得到更丰富的 <code>prompt_features</code>，再和图像特征组合。</li>
+  <li>现有 <code>CrossAttentionBlock</code> 已经足够实现多数 Trunk-3 refiner；最大缺口是让 image encoder 暴露中间 <code>patch_tokens</code>。</li>
+</ul>
+
+<div class="legend">
+  <div class="legend-item"><span class="swatch" style="background: var(--image1);"></span>Trunk 1: problem-blind image</div>
+  <div class="legend-item"><span class="swatch" style="background: var(--text);"></span>Trunk 2: prompt</div>
+  <div class="legend-item"><span class="swatch" style="background: var(--image2);"></span>Trunk 3: prompt-aware image</div>
+  <div class="legend-item"><span class="swatch" style="background: var(--answer);"></span>Trunk 4: answer</div>
+</div>
+
+<div class="pipeline">
+  <div class="stage" style="background: var(--image1);">
+    <strong>Trunk 1</strong>
+    <span>Image first pass</span>
+    <span><code>pixels -> patch_tokens -> img_features_1</code></span>
+    <span>problem-blind, trainable vision path</span>
+  </div>
+  <div class="stage" style="background: var(--text);">
+    <strong>Trunk 2</strong>
+    <span>Prompt encoder</span>
+    <span><code>prompt_ids -> prompt_features</code></span>
+    <span>raw embeddings or lower frozen LLM layers</span>
+  </div>
+  <div class="stage" style="background: var(--image2);">
+    <strong>Trunk 3</strong>
+    <span>Image second pass</span>
+    <span><code>pixels + img1 + prompt -> img_features_2</code></span>
+    <span>the design target of this report</span>
+  </div>
+  <div class="stage" style="background: var(--answer);">
+    <strong>Trunk 4</strong>
+    <span>Answer decoder</span>
+    <span><code>[img1 | prompt | img2 | answer]</code></span>
+    <span>LM loss only on answer tokens</span>
+  </div>
+</div>
+
+<h2>2. 设计目标</h2>
+
+<p>一个好的 Trunk 3 需要满足四个条件：</p>
+
+<ol>
+  <li><strong>Prompt-aware:</strong> 输出特征必须显式依赖问题，而不是只依赖图像。</li>
+  <li><strong>Pixel-aware:</strong> 不能只在第一次压缩后的 <code>img_features_1</code> 上做检索，否则无法恢复被压缩掉的 OCR、小物体、局部属性。</li>
+  <li><strong>兼容 frozen LLM supervisor:</strong> 主要监督仍来自 answer NTP loss，LLM 尽量冻结。</li>
+  <li><strong>可做干净 ablation:</strong> 能和 3-trunk、4-trunk alpha (<code>img_features_2 = img_features_1</code>)、以及不同 pixel access 版本比较。</li>
+</ol>
+
+<h2>3. 五种本质不同的 Trunk-3 架构</h2>
+
+<div class="arch">
+  <h3>方案 1: Prompt-conditioned Pixel Q-Former / DETR-style Slots</h3>
+  <div class="tag-row">
+    <span class="tag">推荐 first implementation</span>
+    <span class="tag">DETR-style queries</span>
+    <span class="tag">uses patch tokens</span>
+    <span class="tag">moderate cost</span>
+  </div>
+
+  <p><strong>核心想法。</strong> 用一组 learnable slots 或从 <code>img_features_1</code> 初始化的 slots 作为 query。每层让 slots 同时访问 prompt、第一次图像特征和 patch-level pixel features。</p>
+
+<pre><code>Trunk 1 exposes:
+  patch_tokens      # [B, N_patch, Dv], from pixel/patch stream
+  img_features_1   # [B, K, Dlm], first abstract image memory
+
+Trunk 2 exposes:
+  prompt_features  # [B, Lp, Dlm]
+
+Trunk 3:
+  q = learned_slots or project(img_features_1)
+  for block in QFormer2:
+      q = SelfAttn(q)
+      q = CrossAttn(q, prompt_features)
+      q = CrossAttn(q, patch_tokens)
+      q = CrossAttn(q, img_features_1)
+      q = FFN(q)
+  img_features_2 = project(q)</code></pre>
+
+  <p><strong>为什么它解决问题。</strong> DETR-style cross-attention 可以让 prompt-conditioned slots 学会“该看哪些区域”。但这里不是只 attend 到 <code>img_features_1</code>，而是把 <code>patch_tokens</code> 也作为 K/V，所以第二次看图确实能重新访问 pixel-derived spatial evidence。</p>
+
+  <p><strong>当前代码落地。</strong> 最小改动是给 <code>ImageEncoder.__call__</code> 增加 <code>return_intermediates</code>，返回 Stage-1 patch self-attn 后的 <code>x</code>。然后新增一个 <code>PromptAwareQFormer</code>，复用现有 <code>CrossAttentionBlock</code> 思路。</p>
+
+  <p><strong>风险。</strong> 如果 slots 只从 learnable query 开始，早期训练可能难；可以把 query 初始化为 <code>stop_grad(img_features_1)</code> 的线性投影，或用 <code>learned_slots + prompt_pooled_gate * img_features_1</code>。</p>
+</div>
+
+<div class="arch">
+  <h3>方案 2: MMDiT-style Multi-stream Refiner</h3>
+  <div class="tag-row">
+    <span class="tag">strongest fusion</span>
+    <span class="tag">multi-stream</span>
+    <span class="tag">higher cost</span>
+    <span class="tag">full model candidate</span>
+  </div>
+
+  <p><strong>核心想法。</strong> 把三类输入当成三个 modality stream：pixel/patch stream、第一次 image feature stream、prompt stream。每层既保留 modality-specific projection，也允许 shared attention 混合。</p>
+
+<pre><code>patch_stream  = patch_tokens + patch_pos + type_pixel
+img1_stream   = img_features_1 + abstract_pos + type_img1
+prompt_stream = prompt_features + text_pos + type_prompt
+
+for block in MultiStreamRefiner:
+    patch_stream, img1_stream, prompt_stream =
+        MultiModalAttention(patch_stream, img1_stream, prompt_stream)
+
+img_features_2 = AttentionalPooler(
+    queries=learned_or_img1_queries,
+    keys_values=[patch_stream, img1_stream, prompt_stream],
+)</code></pre>
+
+  <p><strong>本质区别。</strong> 方案 1 是 slots 主动读取 context；方案 2 是 patch tokens 本身也被 prompt 改写。它更接近 MMDiT / deep fusion 的精神：prompt 不是外部 memory，而是参与 image representation 的逐层构造。</p>
+
+  <p><strong>优点。</strong> 对 OCR、空间关系、细粒度属性可能更强，因为 dense patch grid 在多层中直接吸收问题信息。</p>
+
+  <p><strong>缺点。</strong> 复杂度明显更高，尤其当 <code>N_patch</code> 很大时。实现上也会偏离当前 PrefixMAE 的简洁结构。建议等方案 1 证明 Trunk 3 有收益后再做。</p>
+</div>
+
+<div class="arch">
+  <h3>方案 3: SAM-style Two-way Prompt-Image Refiner</h3>
+  <div class="tag-row">
+    <span class="tag">two-way attention</span>
+    <span class="tag">dense image map</span>
+    <span class="tag">interpretable masks</span>
+    <span class="tag">good for localization</span>
+  </div>
+
+  <p><strong>核心想法。</strong> 参考 SAM 的 promptable decoder：prompt tokens attend image tokens，image tokens 也反向 attend prompt tokens。最后从被 prompt 改写过的 dense image map 中 pool 出 <code>img_features_2</code>。</p>
+
+<pre><code>dense_img = patch_tokens reshaped as 2D grid
+prompt_q  = prompt_features or prompt_summary_tokens
+
+for block in TwoWayRefiner:
+    prompt_q  = SelfAttn(prompt_q)
+    prompt_q  = CrossAttn(prompt_q, dense_img)
+    dense_img = CrossAttn(dense_img, prompt_q)
+    prompt_q, dense_img = FFN(...)
+
+optional:
+  region_mask = MaskHead(dense_img, prompt_q)
+
+img_features_2 = AttentionalPooler(queries, dense_img + prompt_q)</code></pre>
+
+  <p><strong>为什么不同。</strong> 它不是把 prompt 当成普通 K/V，也不是把所有 modality 合成一个大 transformer，而是有明确的双向交互结构。prompt token 负责提出需求，dense image token 负责被需求改写。</p>
+
+  <p><strong>额外收益。</strong> 可以输出 attention map 或 soft region mask，作为 debug artifact：看模型第二次到底在看哪里。对 RefCOCO、TextVQA、小物体属性类任务很有诊断价值。</p>
+
+  <p><strong>风险。</strong> 如果最终任务只需要全局语义，two-way dense refiner 可能比 Q-Former 更贵但收益不明显。最好和 localization/OCR-heavy eval 一起看。</p>
+</div>
+
+<div class="arch">
+  <h3>方案 4: Prompt-adapted Second ViT / Second PrefixMAE</h3>
+  <div class="tag-row">
+    <span class="tag">true second visual pass</span>
+    <span class="tag">unshared or partially shared weights</span>
+    <span class="tag">highest semantic clarity</span>
+    <span class="tag">expensive</span>
+  </div>
+
+  <p><strong>核心想法。</strong> 第二次看图不是在第一次特征上做 refiner，而是重新跑一个视觉 encoder。这个 encoder 可以与第一次共享 patch embedding / lower blocks，也可以完全独立。prompt 通过 cross-attention、AdaLN/FiLM、或 prefix tokens 注入。</p>
+
+<pre><code>Trunk 3 second encoder:
+  x = PatchEmbed2(pixels)
+  memory = [project(img_features_1), prompt_features]
+
+  for layer in SecondViT:
+      x = SelfAttn2D(x)
+      x = CrossAttn(x, memory)        # every N layers or every layer
+      x = AdaLN(x, prompt_summary)    # optional
+      x = FFN(x)
+
+  img_features_2 = QFormer_or_pooler(x)</code></pre>
+
+  <p><strong>适用场景。</strong> 如果研究问题是“第二次看图的 weights 是否应该不 share”，这是最直接的实验。它可以回答：prompt-aware visual computation 是否需要从 pixel encoder 的早期层就开始发生。</p>
+
+  <p><strong>参数共享建议。</strong> 可以从三档做 ablation：只共享 patch embed；共享前半 ViT；完全不共享。完全不共享最纯粹，但数据量要求最大。</p>
+
+  <p><strong>风险。</strong> 训练成本高，且可能把收益混在“更多参数/更多 compute”里。需要和同等参数量的 deeper single-pass baseline 比较。</p>
+</div>
+
+<div class="arch">
+  <h3>方案 5: Active High-res Glimpse / Crop Re-encoder</h3>
+  <div class="tag-row">
+    <span class="tag">active perception</span>
+    <span class="tag">pixel crop access</span>
+    <span class="tag">OCR and small objects</span>
+    <span class="tag">routing risk</span>
+  </div>
+
+  <p><strong>核心想法。</strong> 第一次看图负责产生全局理解；prompt + <code>img_features_1</code> 预测若干 region/glimpse；第二次从原图裁剪这些区域，用小 encoder 或共享 encoder 高分辨率重看。</p>
+
+<pre><code>region_queries = DETRDecoderQueries(prompt_features, img_features_1)
+boxes_or_masks = RegionHead(region_queries)
+
+glimpses = ROIAlign_or_crop_resize(pixels, boxes_or_masks)
+glimpse_tokens = SmallVisionEncoder(glimpses)
+
+img_features_2 = aggregate(
+    region_queries,
+    glimpse_tokens,
+    prompt_features,
+)</code></pre>
+
+  <p><strong>为什么值得考虑。</strong> 很多 VQA 错误不是因为全图语义不够，而是因为需要重看局部：牌子上的字、表格单元、小物体颜色、远处计数。这个方案把 Trunk 3 变成一个主动视觉系统。</p>
+
+  <p><strong>训练策略。</strong> 第一版可以不用 hard crop，先做 differentiable soft attention over patch grid；稳定后再接 ROIAlign/crop。也可以用 auxiliary reconstruction/OCR/localization loss 稳定 region selection。</p>
+
+  <p><strong>风险。</strong> 如果 region selector 早期学坏，后面的 crop encoder 没有梯度信号。需要 warmup：先允许全图 patch attention，再逐渐收紧到 top-k regions。</p>
+</div>
+
+<h2>4. 横向比较</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>方案</th>
+      <th>是否直接访问 pixels/patch</th>
+      <th>是否显式使用 img_features_1</th>
+      <th>Prompt 融合方式</th>
+      <th>实现成本</th>
+      <th>最适合验证的问题</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>1. Pixel Q-Former</td>
+      <td>是，访问 <code>patch_tokens</code></td>
+      <td>是，作为 memory 或 query init</td>
+      <td>slots cross-attend prompt</td>
+      <td><span class="score">medium</span></td>
+      <td>第二次抽象视觉 token 是否需要 prompt-aware pixel reread</td>
+    </tr>
+    <tr>
+      <td>2. MMDiT multi-stream</td>
+      <td>是，patch stream 全程参与</td>
+      <td>是，独立 img1 stream</td>
+      <td>多 stream 逐层混合</td>
+      <td><span class="score">high</span></td>
+      <td>prompt 是否应该改写 dense visual representation 本身</td>
+    </tr>
+    <tr>
+      <td>3. SAM two-way</td>
+      <td>是，dense image map</td>
+      <td>可选，作为 memory</td>
+      <td>prompt <-> image 双向 attention</td>
+      <td><span class="score">medium-high</span></td>
+      <td>prompt-aware localization 是否改善 VQA/OCR/RefCOCO</td>
+    </tr>
+    <tr>
+      <td>4. Second ViT/PrefixMAE</td>
+      <td>是，从 pixels 重新编码</td>
+      <td>是，作为 memory/prefix</td>
+      <td>cross-attn 或 AdaLN/FiLM</td>
+      <td><span class="score">high</span></td>
+      <td>第二次看图是否需要不共享 visual weights</td>
+    </tr>
+    <tr>
+      <td>5. Active glimpse</td>
+      <td>是，crop/ROI 级 pixel access</td>
+      <td>是，用于 region proposal</td>
+      <td>prompt guides region queries</td>
+      <td><span class="score">high-risk</span></td>
+      <td>局部重看是否解决 OCR、小物体和细粒度属性</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>5. 推荐实验顺序</h2>
+
+<div class="box proposal">
+  <strong>第一阶段：做最小可验证版本。</strong>
+  先实现方案 1，并保留两个低成本 control：
+  <code>3-trunk baseline</code>、
+  <code>4-trunk alpha: img_features_2 = img_features_1</code>、
+  <code>4-trunk Pixel Q-Former: img_features_2 = f(patch_tokens, img_features_1, prompt_features)</code>。
+</div>
+
+<ol>
+  <li><strong>Expose intermediates:</strong> 给 <code>PrefixMAE.encode</code> 增加可选返回 <code>patch_tokens</code>。优先返回 patch self-attention 后的 tokens，而不是 raw patch embedding。</li>
+  <li><strong>Add Q-Former2:</strong> 新增 <code>PromptAwareQFormer</code>，输入 <code>patch_tokens</code>、<code>img_features_1</code>、<code>prompt_features</code>，输出 <code>K2</code> 个 LM-space tokens。</li>
+  <li><strong>Build 4-trunk mask:</strong> sequence 改为 <code>[img1 | prompt | img2 | answer]</code>。前三个 trunk 内部 bidirectional，trunk 之间 block-causal，answer 内部 causal。</li>
+  <li><strong>Run ablations:</strong> 比较 no-pixel Q-Former、with-patch Q-Former、with-patch+img1 memory。这样可以直接回答“pixel access 到底有没有价值”。</li>
+  <li><strong>Only then scale:</strong> 如果方案 1 有收益，再试方案 3 或方案 2；如果收益主要在 OCR/局部任务上，再试方案 5。</li>
+</ol>
+
+<h2>6. 关键 ablation</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>Ablation</th>
+      <th>目的</th>
+      <th>预期解释</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>3-trunk</code> vs <code>4-trunk alpha</code></td>
+      <td>测试“同一图像 token 插两次”是否本身有用</td>
+      <td>如果 alpha 赢，说明 LLM 内部 attention 已经能把第二份 image tokens prompt-aware 化</td>
+    </tr>
+    <tr>
+      <td><code>QFormer2(img1, prompt)</code> vs <code>QFormer2(patch, img1, prompt)</code></td>
+      <td>测试 pixel/patch reread 是否必要</td>
+      <td>如果后者赢，说明第一次 1D 压缩确实丢掉了问题相关细节</td>
+    </tr>
+    <tr>
+      <td>raw <code>prompt_embeds</code> vs lower-LLM <code>prompt_features</code></td>
+      <td>测试 Trunk 2 是否需要真正的 prompt encoder</td>
+      <td>如果 prompt_features 赢，说明 frozen LLM 的中间表示对视觉重读有监督价值</td>
+    </tr>
+    <tr>
+      <td>share QFormer1 queries vs separate QFormer2 queries</td>
+      <td>测试两次看图是否应共享 visual slot vocabulary</td>
+      <td>shared 更稳，separate 更灵活；结果能指导参数共享设计</td>
+    </tr>
+    <tr>
+      <td>patch tokens from early layer vs late layer</td>
+      <td>测试第二次看图需要低层纹理还是高层语义</td>
+      <td>OCR/小物体可能偏 early，普通 VQA 可能偏 late</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>7. 我的优先级判断</h2>
+
+<p>如果目标是尽快产出有说服力的实验，我会按这个顺序推进：</p>
+
+<ol>
+  <li><strong>先做方案 1。</strong> 它最贴合现有 PrefixMAE，改动有限，同时正面回答 pixel access 问题。</li>
+  <li><strong>保留方案 3 作为第二个强 baseline。</strong> 如果希望在报告中讲“第二次看图更像 promptable segmentation / localization”，SAM-style two-way refiner 更容易解释和可视化。</li>
+  <li><strong>方案 4 用作上界实验。</strong> 它成本高，但能回答 unshared second visual encoder 是否必要。</li>
+  <li><strong>方案 2 和 5 暂不作为第一版。</strong> 方案 2 是 full fusion model，方案 5 是 active perception model；都很有潜力，但第一轮会让变量太多。</li>
+</ol>
+
+<div class="box risk">
+  <strong>最需要避免的坑。</strong>
+  不要只做 <code>prompt -> img_features_1</code> 的 cross-attention 后就声称“第二次看图”。那更像是在第一次视觉摘要上做 query，不是真正 reread image。除非它只是 no-pixel ablation，否则主实验应包含 <code>patch_tokens</code> 或 crop/pixel path。
+</div>
+
+<h2>8. 参考架构</h2>
+
+<ul>
+  <li><a href="https://arxiv.org/abs/2205.01917">CoCa: Contrastive Captioners are Image-Text Foundation Models</a>。相关点：split unimodal/multimodal decoder、attentional pooler、同时服务 contrastive 和 captioning loss。</li>
+  <li><a href="https://arxiv.org/abs/2005.12872">DETR: End-to-End Object Detection with Transformers</a>。相关点：object queries / slots 通过 decoder cross-attention 从 image features 中检索目标。</li>
+  <li><a href="https://arxiv.org/abs/2304.02643">Segment Anything</a> 和 <a href="https://github.com/facebookresearch/segment-anything">official repository</a>。相关点：prompt encoder、image encoder、mask decoder 中的 two-way prompt-image transformer。</li>
+  <li><a href="../models/siglip_enc_dec.py">Current PrefixMAE implementation</a>。相关点：现成 patch tokens、learnable 1D tokens、cross-attention block、MAE-style decoder。</li>
+  <li><a href="../models/paligemma_enc_dec.py">Current PaliGemmaEncDec implementation</a>。相关点：frozen LLM supervisor、image projection、text feature layer、prefix-LM mask。</li>
+</ul>
+
+</body>
+</html>

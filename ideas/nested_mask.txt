@@ -1,0 +1,13 @@
+现在这个仓库里面写的 nested mask 是这样的：
+
+mask是在encoder得到的feature上进行的，每次从某个distribution里面采一个整数$K$, 然后mask就是取前$K$个token。
+
+然后我们可以选择在 reconstruction loss / understanding loss 中使用这个mask。
+
+现在我发现三个问题：
+
+1. 首先，如果 reconstruction loss 加了 mask, 那么实际上的效果没有想象中的好。因为我想要的效果是，encoder能有adaptive budget来encode出图片，比如前面的token应该先学high-level feature. 但是如果只用reconstruction + mask, 我visualize的reconstruct结果并没这么理想，MSE loss感觉并不适合达成这一点。另一方面，reconstruction loss without mask是更加没用。感觉reconstruction loss的直觉就是让模型在encode的时候别丢掉任何细节，这样就够了。你觉得如何是好？我现在也没具体想法，所以你也先别改这里的逻辑。
+
+2. 关于understanding加mask的方式：现在第一是distribution用exp distribution (见代码实现) 并不太好，因为大概率采到一个比较少的token。我需要新找一个distribution，虽然取值只有 $2^k$, 但是 $k$ 并不是uniform取，而是更倾向于使用比较满的 $k$. 同时，我需要这个distribution有一个可调整的参数 $t$. 这个 $t$ 决定了这个distribution的token平均数，或者说对应task的难度。然后我会实现，对于不同的task使用不同的 $t$ 来调整难度。比如VQA /caption可能稍微小一点，但OCR这种任务稍微大一点。或者如果你能找到一个好的distribution的话也可以额外除了均值也加一个可调的方差。你需要帮我先propose几种这样的distribution (也不一定要是只能取 $2^k$. 任何值也都可以，只是只有 $2^k$ 可能让模型好学一点，但也不一定)。
+
+3. 关于encoder加mask的位置。在feature上直接取前若干个token有点差。我需要你帮我改成：注意到现在的encoder架构是 1: 2: 1 层，分布是 self attn -> cross attn -> self attn。你帮我改成，在正中间，也就是cross attn的一半的地方，做mask, 然后取完一部分token之后只在这些token上做剩下的cross attn和self attn。

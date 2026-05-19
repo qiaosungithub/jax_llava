@@ -1,0 +1,68 @@
+model:
+    image_encoder_str: "b16"
+    lm_backbone_str: "gemma3_270M"
+    projector_use_ln: True
+
+dataset:
+    root: "gs://kmh-gcp-us-central1/data/datacomp/small/**/*.tar"
+
+training:
+    optimizer: 'adam'
+    adam:
+        learning_rate: 0.0002
+    muon:
+        learning_rate: 0.001
+
+    log_per_step: 1
+    checkpoint_per_step: 10
+    log_vis_per_step: 1
+
+    num_steps: 500000
+    batch_size: 64
+    adam_b2: 0.95
+    # warmup_epochs: 5 # enabled in the original paper
+    # ema_val: 0.9999
+
+    sample_on_training: True
+    sample_per_step: 1
+    cider_per_step: -1
+
+    seed: 42
+
+# eval:
+#     device_batch_size: 20
+#     num_samples: 50000
+#     cache_dir: "/dev/shm"
+#     mjhq:
+#         enable: False
+#         stats_cache: "/dev/shm/mjhq_fid_stats.npz"
+#     mscoco:
+#         enable: False
+#         stats_cache: "/dev/shm/mscoco_fid_stats.npz"
+#     geneval:
+#         enable: False
+#     dpgbench:
+#         enable: False
+#     cfg_scale: 3.0
+
+# sampling:
+
+load_from: ''
+
+# sharding: hsdp # ddp, hsdp, fsdp
+
+logging:
+    use_wandb: False
+    use_tensorboard: False
+    wandb_project: 'paligemma-baseline' # change to your wandb project
+    wandb_entity: 'sqa24-massachusetts-institute-of-technology' # paste your wandb entity here
+    wandb_tags: # use your own tags
+        - hsdp
+    wandb_notes:
+
+# load_from: gs://kmh-gcp-asia-northeast1-b/qiao_zhicheng_hanhong_files/jit_wxb/launch_20251216_015624_gita1a2898_eb41ba91/logs/log1_20251216_015656_VMkmh-tpuvm-v6e-32-kangyang-2e0310_Zasia-northeast1-b_a41f9999/1
+# load_from: /kmh-nfs-ssd-us-mount/staging/siri/jit_wxb/launch_20251209_141232_git_434f3487/logs/log1_20251209_141256_VMkmh-tpuvm-v6e-64-kangyang-a81093_Zus-central1-b_c24e227a
+# load_from: /kmh-nfs-ssd-us-mount/staging/siri/jit/launch_20251102_051655_gitd454d69_b4e05bfd/logs/log18_20251102_153134_VMkmh-tpuvm-v5p-64-kangyang-166a5b_Zus-east5-a_d97bc772
+# eval_only: True
+# eval_show_sample: True
+local_debug: True

@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PaliGemma-style VLM - Consolidated Updated Summary</title>
+  <style>
+    :root {
+      --bg: #f6f8fc;
+      --card: #ffffff;
+      --text: #1f2a37;
+      --muted: #5e6b81;
+      --accent: #0f766e;
+      --accent-soft: #e7f6f3;
+      --border: #dbe3ee;
+      --good: #156a3f;
+      --warn: #915f00;
+      --mono: "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      --sans: "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      color: var(--text);
+      background:
+        radial-gradient(circle at 10% 0%, #d7efe9 0%, transparent 38%),
+        radial-gradient(circle at 100% 12%, #e2ecfb 0%, transparent 32%),
+        var(--bg);
+      line-height: 1.6;
+    }
+
+    .wrap { width: min(1140px, 92vw); margin: 32px auto 58px; }
+    .hero, .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      box-shadow: 0 8px 28px rgba(18, 35, 63, 0.07);
+    }
+
+    .hero { padding: 26px 28px; }
+    .hero h1 { margin: 0 0 6px; font-size: clamp(1.55rem, 2.2vw, 2rem); }
+    .hero p { margin: 0; color: var(--muted); }
+
+    .stack { margin-top: 16px; }
+    .card { padding: 18px 20px; margin-bottom: 16px; }
+    .card h2 { margin: 0 0 8px; font-size: 1.15rem; }
+    .card h3 { margin: 14px 0 6px; font-size: 1rem; }
+
+    .badge {
+      display: inline-block;
+      margin-bottom: 8px;
+      padding: 2px 9px;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: var(--accent);
+      background: var(--accent-soft);
+      border: 1px solid #c6ece5;
+    }
+
+    code {
+      font-family: var(--mono);
+      font-size: 0.92em;
+      background: #f1f5fa;
+      border: 1px solid #e0e7f0;
+      border-radius: 6px;
+      padding: 1px 6px;
+    }
+
+    ul { margin: 6px 0 0 18px; padding: 0; }
+    .muted { color: var(--muted); }
+    .good { color: var(--good); }
+    .warn { color: var(--warn); }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 8px;
+      font-size: 0.95rem;
+    }
+    th, td {
+      border: 1px solid var(--border);
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th { background: #f8fbff; }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="hero">
+      <h1>PaliGemma-style Visual Understanding Baseline (Updated Consolidated Summary)</h1>
+      <p>
+        This report consolidates the latest architecture/runtime changes, data expansion, evaluation upgrades,
+        and current operating conventions. It is intended as a handoff-quality update for collaborators.
+      </p>
+    </section>
+
+    <section class="stack">
+      <article class="card">
+        <span class="badge">System Snapshot</span>
+        <h2>Current Baseline Direction</h2>
+        <ul>
+          <li>Core model remains a <strong>Vision Encoder + Gemma Decoder</strong> autoregressive VLM.</li>
+          <li>Training now supports both full-parameter updates and selective LM freezing via config switch.</li>
+          <li>Prompting has moved from task-prefix tokens to natural-language prompts as the default policy.</li>
+          <li>Evaluation orchestration is now task-list driven from <code>training.online_eval_tasks</code> and <code>training.final_eval_tasks</code>.</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <span class="badge">Architecture and Optimization</span>
+        <h2>Model and Train-Step Updates</h2>
+        <h3>Encoder/Decoder Baseline</h3>
+        <ul>
+          <li>Vision side continues with MAE-B style dimensions and a learnable-token bottleneck route in <code>siglip_enc_dec</code>.</li>
+          <li>Language side remains Gemma-based (mainly <code>gemma3_270M</code> in active runs).</li>
+        </ul>
+
+        <h3>LM Freeze Path</h3>
+        <ul>
+          <li>New train-step logic supports splitting trainable vs frozen parameter trees and merging updates safely.</li>
+          <li>Gradient flow is constrained to active trainable branches while optimizer state compatibility is preserved.</li>
+          <li>Useful for ablations and stability checks during multimodal adaptation.</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <span class="badge">Data Expansion</span>
+        <h2>Pretraining Mix: New Task Families</h2>
+        <table>
+          <thead>
+            <tr><th>Task Family</th><th>What Was Added</th><th>Format / Objective</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Grounded Detection</td>
+              <td><code>genome_det</code> route from Visual Genome region/object annotations</td>
+              <td>Phrase-to-box generation with quantized <code>&lt;loc####&gt;</code> targets</td>
+            </tr>
+            <tr>
+              <td>Scene-Text Captioning</td>
+              <td><code>textcaps-train</code> and <code>textcaps-val</code> mappings and loaders</td>
+              <td>Text-aware concise caption supervision</td>
+            </tr>
+            <tr>
+              <td>Referring Grounding Eval Data</td>
+              <td>RefCOCOg val annotations + image path resolution</td>
+              <td>Expression grounding eval with IoU metrics</td>
+            </tr>
+          </tbody>
+        </table>
+      </article>
+
+      <article class="card">
+        <span class="badge">Prompting Policy</span>
+        <h2>Migration to Natural Prompts</h2>
+        <ul>
+          <li>Legacy prefixes like <code>caption en</code>, <code>answer en</code>, <code>ocr en</code>, and <code>detect en</code> are removed from active train/eval paths.</li>
+          <li>QA-style prompting now uses direct question forms (with a trailing <code>?</code> when missing) plus newline.</li>
+          <li>Grounding prompts are explicit natural instructions (for example, “Locate the region described by this phrase ...”).</li>
+          <li>Dataset-specific prompt templates remain, but all are human-readable and prefix-free.</li>
+        </ul>
+
+        <h3>Motivation</h3>
+        <ul>
+          <li>Reduce over-reliance on handcrafted task tags and align train/eval instructions with actual language use.</li>
+          <li>Enable cleaner transfer across mixed datasets without token-level task gating artifacts.</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <span class="badge">Evaluation Stack</span>
+        <h2>Task Coverage and Runtime Interface</h2>
+        <h3>Supported Eval Tasks (Current)</h3>
+        <ul>
+          <li>VQAv2, MME, TextVQA, POPE, MMBench, ImageNet KNN, and RefCOCOg.</li>
+          <li>MMBench and POPE now inherit prefix-free defaults from config and evaluator-level prompt builders.</li>
+        </ul>
+
+        <h3>Scheduling Interface</h3>
+        <ul>
+          <li>Online eval cadence uses <code>training.online_eval_per_step</code> + <code>training.online_eval_tasks</code>.</li>
+          <li>Terminal/summary eval uses <code>training.final_eval_tasks</code>.</li>
+          <li>Configs were updated to remove old per-task <code>*_per_step</code> fields and deprecated <code>eval.eval_*</code> toggles.</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <span class="badge">Data and Operations</span>
+        <h2>Infra and Reliability Improvements</h2>
+        <ul>
+          <li>Added region/zone-aware uploader tooling to minimize cross-region friction in TPU workflows.</li>
+          <li>COCO upload now uses tar shards to avoid tiny-file API overhead and shell argument-length failures.</li>
+          <li>RefCOCOg val annotations were stabilized via local SSD path usage for evaluation jobs.</li>
+          <li>Upload scripts include fallback and sanitization logic to handle brittle third-party source behavior.</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <span class="badge">Current Metrics Context</span>
+        <h2>Performance Snapshot (Approximate)</h2>
+        <p class="muted">Numbers remain run-dependent; values below are rough tracking references from recent baseline notes.</p>
+        <table>
+          <thead>
+            <tr><th>Benchmark</th><th>Approx. Current</th><th>Interpretation</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>VQAv2</td><td class="good">~65</td><td>Reasonable base-level QA competency.</td></tr>
+            <tr><td>MME</td><td class="good">~805 / 1030</td><td>Moderate multimodal reasoning and perception baseline.</td></tr>
+            <tr><td>TextVQA</td><td class="warn">~10</td><td>Still a weak area despite recent data/prompt upgrades.</td></tr>
+            <tr><td>POPE</td><td>~68</td><td>Usable zero-shot hallucination-oriented baseline.</td></tr>
+            <tr><td>ImageNet KNN</td><td>~52</td><td>Representation quality is decent but has room for improvement.</td></tr>
+          </tbody>
+        </table>
+      </article>
+
+      <article class="card">
+        <span class="badge">Open Directions</span>
+        <h2>Recommended Next Collaboration Focus</h2>
+        <ul>
+          <li>Quantify effect of natural prompts vs prefix prompts under matched checkpoints (controlled A/B eval).</li>
+          <li>Measure impact of <code>genome_det</code> and <code>textcaps</code> additions on TextVQA and RefCOCOg transfer.</li>
+          <li>Run LM-freeze ablations to identify best adaptation regime per benchmark cluster.</li>
+          <li>Standardize a small prompt-template registry for reproducibility across experiments.</li>
+        </ul>
+      </article>
+    </section>
+  </main>
+</body>
+</html>

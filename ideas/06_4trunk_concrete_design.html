@@ -1,0 +1,975 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>4-Trunk VLM — Concrete Design (LLaVA, Flamingo, and Cambrian per-block variants)</title>
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --muted: #555;
+    --bg: #fdfdfc;
+    --accent: #8a3324;
+    --accent2: #1a4f72;
+    --rule: #ddd;
+    --code-bg: #f4f1ec;
+    --note-bg: #fdf6e3;
+    --idea-bg: #f0f6f4;
+    --color-image:  #7CB342;
+    --color-image2: #2E7D32;
+    --color-text:   #4A90E2;
+    --color-response: #FF8A65;
+    --color-frozen:  #BDBDBD;
+    --color-trained: #E94B3C;
+  }
+  html { font-size: 16px; }
+  body {
+    max-width: 920px;
+    margin: 3rem auto;
+    padding: 0 1.25rem 4rem;
+    font-family: "Charter", "Iowan Old Style", Georgia, "Times New Roman", serif;
+    color: var(--fg);
+    background: var(--bg);
+    line-height: 1.6;
+  }
+  h1, h2, h3 {
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.25;
+    color: var(--fg);
+  }
+  h1 { font-size: 1.9rem; margin-top: 0; border-bottom: 2px solid var(--fg); padding-bottom: 0.5rem; }
+  h2 { font-size: 1.4rem; margin-top: 2.4rem; color: var(--accent); border-bottom: 1px solid var(--rule); padding-bottom: 0.3rem; }
+  h3 { font-size: 1.05rem; margin-top: 1.4rem; color: var(--accent2); }
+  p { margin: 0.6rem 0; }
+  code {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    background: var(--code-bg);
+    padding: 0.1em 0.35em;
+    border-radius: 3px;
+    font-size: 0.88em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 0.9rem 1.1rem;
+    border-radius: 4px;
+    overflow-x: auto;
+    font-size: 0.85rem;
+    line-height: 1.45;
+  }
+  hr { border: none; border-top: 1px solid var(--rule); margin: 2rem 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1rem 0;
+    font-size: 0.92rem;
+    font-variant-numeric: tabular-nums;
+  }
+  th, td {
+    border: 1px solid var(--rule);
+    padding: 0.5rem 0.7rem;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--code-bg); font-weight: 600; }
+  ul { padding-left: 1.4rem; }
+  li { margin: 0.3rem 0; }
+  blockquote {
+    border-left: 3px solid var(--accent);
+    margin: 1rem 0;
+    padding: 0.2rem 1rem;
+    color: var(--muted);
+    font-style: italic;
+  }
+  .meta { color: var(--muted); font-size: 0.9rem; margin-top: -0.5rem; }
+  .footnote { font-size: 0.85rem; color: var(--muted); margin-top: 0.4rem; }
+  .context {
+    background: var(--idea-bg);
+    border-left: 4px solid var(--accent2);
+    border-radius: 0 4px 4px 0;
+    padding: 0.8rem 1.1rem;
+    font-size: 0.93rem;
+    margin: 0.9rem 0 1.2rem;
+  }
+  .context strong { color: #000; }
+  .figure {
+    text-align: center;
+    margin: 1.8rem 0;
+  }
+  .figure svg {
+    max-width: 100%;
+    height: auto;
+    background: #fafaf7;
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    padding: 1rem;
+  }
+  .caption {
+    font-size: 0.9rem;
+    color: var(--muted);
+    margin: 0.5rem 0 1rem;
+    text-align: center;
+  }
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.7rem 1.5rem;
+    background: #fafaf7;
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 0.7rem 1rem;
+    margin: 0.6rem 0 1rem;
+    font-size: 0.85rem;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .legend-swatch {
+    width: 22px;
+    height: 16px;
+    border-radius: 3px;
+    border: 1px solid rgba(0,0,0,0.2);
+  }
+  strong { color: #000; }
+  .running-example {
+    background: var(--note-bg);
+    border-left: 4px solid #b58900;
+    border-radius: 0 4px 4px 0;
+    padding: 0.8rem 1.1rem;
+    margin: 0.8rem 0 1.2rem;
+  }
+  .running-example strong { color: #000; }
+</style>
+</head>
+<body>
+
+<h1>4-Trunk VLM — Concrete Design (LLaVA, Flamingo, and Cambrian per-block variants)</h1>
+<p class="meta">Generalizing the three 3-trunk variants from <a href="05_3trunk_concrete_design.html">brainstorm/05</a> to the 4-trunk setting (Image · Prompt · Image-again · Answer)</p>
+
+<div class="context">
+<strong>Context for this document.</strong> <a href="05_3trunk_concrete_design.html">Brainstorm/05</a> built three concrete variants of the 3-trunk VLM: <strong>C</strong> (LLaVA-style: vision tokens prepended once at the LLM input), <strong>A</strong> (Flamingo-style: gated cross-attention into the upper LLM layers), and <strong>B</strong> (Cambrian-style per-block: a Q-Former at every decoder layer). This document extends each of those variants to the <strong>4-trunk setting</strong>: the image is "looked at twice" — first problem-blind, then again after the question has been read. The four trunks, in order, are: (1) <strong>Vision Encoder</strong> on the image, problem-blind; (2) <strong>Prompt Encoder</strong> for the question; (3) <strong>Vision Re-encoding</strong> of the same image, now able to see the prompt; (4) <strong>Answer Decoder</strong>, autoregressive. The trunks are causally ordered: each trunk can attend to all previous trunks' outputs, but not future ones.
+</div>
+
+<div class="running-example">
+<strong>Running example used throughout.</strong>
+<ul style="margin: 0.3rem 0;">
+  <li><strong>Image:</strong> a 224×224 RGB photo of a black cat sitting on a chair (same as 3-trunk doc)</li>
+  <li><strong>Prompt:</strong> <code>"What color is the cat?"</code> → 6 tokens</li>
+  <li><strong>Target answer:</strong> <code>"The cat is black."</code> → 5 tokens</li>
+</ul>
+<p style="margin:0.3rem 0;"><strong>Intuition for the 4th trunk.</strong> Trunk 1 sees the cat-on-chair holistically and may emphasize many features (chair, lighting, background). After the question is read in Trunk 2, Trunk 3 re-encodes the same pixels but now "knows it should look at the cat's color" — its output should be more focused on cat-color-relevant features. Trunk 4 then generates the answer using both views (the broad first look + the focused second look) plus the prompt.</p>
+</div>
+
+<h3>Reference dimensions used throughout</h3>
+
+<p>Same as <a href="05_3trunk_concrete_design.html">brainstorm/05</a>, with one addition for Trunk 3:</p>
+
+<table>
+  <thead><tr><th>Symbol</th><th>Value</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td><code>L_total</code></td><td>24</td><td>Total LLM layers</td></tr>
+    <tr><td><code>L_prompt</code></td><td>18</td><td>Lower layers used as prompt encoder (frozen, A and B only)</td></tr>
+    <tr><td><code>L_decoder</code></td><td>6</td><td>Upper layers used in answer decoder (A and B)</td></tr>
+    <tr><td><code>d_llm</code></td><td>4096</td><td>LLM hidden dim</td></tr>
+    <tr><td><code>d_vis</code></td><td>768</td><td>Vision encoder hidden dim (ViT-Base)</td></tr>
+    <tr><td>N_vis</td><td>196</td><td>Visual tokens per pass (14×14 grid)</td></tr>
+    <tr><td>N_prompt</td><td>6</td><td>Prompt tokens (running example)</td></tr>
+    <tr><td>N_ans</td><td>5</td><td>Answer tokens (running example)</td></tr>
+    <tr><td><code>L_refiner</code></td><td>4</td><td><strong>NEW</strong> — Number of transformer blocks in the Trunk-3 vision refiner (mechanism β only)</td></tr>
+  </tbody>
+</table>
+
+<div class="legend">
+<div class="legend-item"><div class="legend-swatch" style="background: #7CB342;"></div>Trunk 1: Vision (problem-blind)</div>
+<div class="legend-item"><div class="legend-swatch" style="background: #4A90E2;"></div>Trunk 2: Prompt</div>
+<div class="legend-item"><div class="legend-swatch" style="background: #2E7D32;"></div>Trunk 3: Vision (prompt-aware)</div>
+<div class="legend-item"><div class="legend-swatch" style="background: #FF8A65;"></div>Trunk 4: Answer</div>
+<div class="legend-item"><div class="legend-swatch" style="background: #BDBDBD;"></div>Frozen module</div>
+<div class="legend-item"><div class="legend-swatch" style="background: #E94B3C;"></div>Trained module</div>
+</div>
+
+<hr>
+
+<h2>1. Overall 4-trunk architecture</h2>
+
+<div class="figure">
+<svg width="1000" height="430" viewBox="0 0 1000 430" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ar" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#666"/>
+    </marker>
+    <marker id="ar1" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#7CB342"/>
+    </marker>
+    <marker id="ar2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#4A90E2"/>
+    </marker>
+    <marker id="ar3" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#2E7D32"/>
+    </marker>
+    <marker id="ar4" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#8a3324"/>
+    </marker>
+  </defs>
+
+  <text x="500" y="22" text-anchor="middle" font-family="-apple-system, sans-serif" font-size="16" font-weight="600" fill="#1a1a1a">Overall 4-Trunk Architecture (running example)</text>
+
+  <!-- Inputs -->
+  <g transform="translate(20, 50)">
+    <rect x="0" y="0" width="170" height="50" rx="8" fill="#7CB342" opacity="0.15" stroke="#7CB342" stroke-width="2"/>
+    <text x="85" y="20" text-anchor="middle" font-size="11" font-weight="600">INPUT: Image</text>
+    <text x="85" y="36" text-anchor="middle" font-size="10" font-style="italic" fill="#555">[3, 224, 224]</text>
+  </g>
+  <g transform="translate(220, 50)">
+    <rect x="0" y="0" width="200" height="50" rx="8" fill="#4A90E2" opacity="0.15" stroke="#4A90E2" stroke-width="2"/>
+    <text x="100" y="20" text-anchor="middle" font-size="11" font-weight="600">INPUT: Prompt</text>
+    <text x="100" y="36" text-anchor="middle" font-size="10" font-style="italic" fill="#555">"What color is the cat?"</text>
+  </g>
+  <g transform="translate(450, 50)">
+    <rect x="0" y="0" width="170" height="50" rx="8" fill="#7CB342" opacity="0.15" stroke="#2E7D32" stroke-width="2" stroke-dasharray="4,2"/>
+    <text x="85" y="20" text-anchor="middle" font-size="11" font-weight="600">SAME Image (re-used)</text>
+    <text x="85" y="36" text-anchor="middle" font-size="10" font-style="italic" fill="#555">[3, 224, 224]   (or vis_tokens_1)</text>
+  </g>
+  <g transform="translate(770, 50)">
+    <rect x="0" y="0" width="210" height="50" rx="8" fill="#FF8A65" opacity="0.15" stroke="#FF8A65" stroke-width="2"/>
+    <text x="105" y="20" text-anchor="middle" font-size="11" font-weight="600">OUTPUT: Answer (AR)</text>
+    <text x="105" y="36" text-anchor="middle" font-size="10" font-style="italic" fill="#555">"The cat is black."</text>
+  </g>
+
+  <!-- Down arrows -->
+  <line x1="105" y1="100" x2="105" y2="125" stroke="#666" stroke-width="2" marker-end="url(#ar)"/>
+  <line x1="320" y1="100" x2="320" y2="125" stroke="#666" stroke-width="2" marker-end="url(#ar)"/>
+  <line x1="535" y1="100" x2="535" y2="125" stroke="#666" stroke-width="2" marker-end="url(#ar)"/>
+
+  <!-- Trunk modules -->
+  <g transform="translate(20, 130)">
+    <rect x="0" y="0" width="170" height="100" rx="8" fill="#7CB342" opacity="0.85" stroke="#E94B3C" stroke-width="3" stroke-dasharray="6,3"/>
+    <text x="85" y="22" text-anchor="middle" font-size="12" font-weight="600" fill="white">Trunk 1: Vision Encoder</text>
+    <text x="85" y="42" text-anchor="middle" font-size="10" fill="white">ViT-Base (TRAINED)</text>
+    <text x="85" y="60" text-anchor="middle" font-size="10" fill="white" font-style="italic">"problem-blind"</text>
+    <text x="85" y="80" text-anchor="middle" font-size="10" fill="#fff8">→ vis_tokens_1 [196, 4096]</text>
+  </g>
+  <g transform="translate(220, 130)">
+    <rect x="0" y="0" width="200" height="100" rx="8" fill="#4A90E2" opacity="0.85" stroke="#BDBDBD" stroke-width="3"/>
+    <text x="100" y="22" text-anchor="middle" font-size="12" font-weight="600" fill="white">Trunk 2: Prompt Encoder</text>
+    <text x="100" y="42" text-anchor="middle" font-size="10" fill="white">A,B: lower 18 LLM layers (FROZEN)</text>
+    <text x="100" y="58" text-anchor="middle" font-size="10" fill="white">C: just LLM token-embedding</text>
+    <text x="100" y="80" text-anchor="middle" font-size="10" fill="#fff8">→ prompt_features [6, 4096]</text>
+  </g>
+  <g transform="translate(450, 130)">
+    <rect x="0" y="0" width="170" height="100" rx="8" fill="#2E7D32" opacity="0.85" stroke="#E94B3C" stroke-width="3" stroke-dasharray="6,3"/>
+    <text x="85" y="22" text-anchor="middle" font-size="12" font-weight="600" fill="white">Trunk 3: Vision Refiner</text>
+    <text x="85" y="38" text-anchor="middle" font-size="10" fill="white">α: same as vis_tokens_1 (free)</text>
+    <text x="85" y="54" text-anchor="middle" font-size="10" fill="white">β: cross-attn to prompt (TRAINED)</text>
+    <text x="85" y="80" text-anchor="middle" font-size="10" fill="#fff8">→ vis_tokens_2 [196, 4096]</text>
+  </g>
+  <g transform="translate(660, 130)">
+    <rect x="0" y="0" width="320" height="100" rx="8" fill="#FF8A65" opacity="0.85" stroke="#E94B3C" stroke-width="3" stroke-dasharray="6,3"/>
+    <text x="160" y="22" text-anchor="middle" font-size="12" font-weight="600" fill="white">Trunk 4: Answer Decoder</text>
+    <text x="160" y="42" text-anchor="middle" font-size="11" fill="white">C: full LLM seq=[v₁|p|v₂|a]   (frozen)</text>
+    <text x="160" y="58" text-anchor="middle" font-size="11" fill="white">A: 3 cross-attn per layer (v₁ · p · v₂)</text>
+    <text x="160" y="74" text-anchor="middle" font-size="11" fill="white">B: 2 Q-Formers per layer (v₁ + v₂)</text>
+    <text x="160" y="92" text-anchor="middle" font-size="10" fill="#fff8">→ next-token logits</text>
+  </g>
+
+  <!-- Causal arrows between trunks (right-pointing) -->
+  <path d="M 190 175 L 220 175" stroke="#7CB342" stroke-width="1.8" marker-end="url(#ar1)"/>
+  <path d="M 190 195 Q 320 250 450 175" fill="none" stroke="#7CB342" stroke-width="1.8" marker-end="url(#ar1)"/>
+  <path d="M 190 215 Q 410 290 660 195" fill="none" stroke="#7CB342" stroke-width="1.8" marker-end="url(#ar1)"/>
+
+  <path d="M 420 175 L 450 175" stroke="#4A90E2" stroke-width="1.8" marker-end="url(#ar2)"/>
+  <path d="M 420 215 Q 540 290 660 195" fill="none" stroke="#4A90E2" stroke-width="1.8" marker-end="url(#ar2)"/>
+
+  <path d="M 620 195 L 660 175" stroke="#2E7D32" stroke-width="1.8" marker-end="url(#ar3)"/>
+
+  <text x="500" y="305" text-anchor="middle" font-size="11" fill="#555" font-style="italic">causal flow between trunks: each trunk can attend to all earlier trunks' outputs</text>
+
+  <!-- Loss -->
+  <line x1="820" y1="230" x2="820" y2="335" stroke="#8a3324" stroke-width="2" marker-end="url(#ar4)"/>
+  <g transform="translate(20, 335)">
+    <rect x="0" y="0" width="960" height="55" rx="8" fill="#fff" stroke="#8a3324" stroke-width="2"/>
+    <text x="480" y="22" text-anchor="middle" font-size="12" font-weight="600" fill="#8a3324">LM cross-entropy loss on Trunk-4 answer tokens only</text>
+    <text x="480" y="42" text-anchor="middle" font-size="10" fill="#555">Gradients flow back through trained modules → Trunk 3 refiner → Trunk 1 vision encoder. Trunks 2 (prompt encoder, where present) and the LLM backbone stay frozen.</text>
+  </g>
+</svg>
+</div>
+
+<p class="caption">Figure 1: Overall 4-trunk architecture. Trunks 1 and 3 both consume the image; Trunk 3 also reads Trunks 1 and 2 (i.e., it is "prompt-aware"). Trunk 4 sees everything before. The variant (C/A/B) governs how Trunk 4 (and to a lesser extent Trunk 2) is realized inside the LLM. Two mechanisms for Trunk 3: <strong>α</strong> (zero-cost — vis_tokens_2 = vis_tokens_1, prompt-awareness emerges purely from the LLM's attention pattern) or <strong>β</strong> (a small trained vision refiner with cross-attention to prompt features).</p>
+
+<hr>
+
+<h2>2. Trunk 3 — the two re-encoding mechanisms</h2>
+
+<p>Before tackling each variant, define the two ways Trunk 3 can produce <code>vis_tokens_2</code>:</p>
+
+<h3>Mechanism α — positional only (zero-cost)</h3>
+
+<p>Set <code>vis_tokens_2 = vis_tokens_1</code> at the input to the LLM. The two visual encodings are <em>identical at the encoder boundary</em>; they only diverge once they are inside the LLM, because they sit at different positions in the sequence and are subject to different attention masks (vis_1 sees nothing else; vis_2 sees vis_1 and the prompt). After one self-attention layer they have already started diverging — this is the same trick that lets a transformer LM produce different next-token predictions at different positions even though the early embeddings are the same per-token-id. <strong>Trainable params added by Trunk 3: zero.</strong> This is the natural Trunk 3 for Variant C.</p>
+
+<h3>Mechanism β — vision refiner (trained, ~30–60M params)</h3>
+
+<p>A small transformer stack — the "vision refiner" — sits on top of Trunk 1's output and produces a genuinely different feature sequence by mixing in prompt information. Architecture: <code>L_refiner = 4</code> blocks, each with self-attention over <code>vis_tokens_1</code>, cross-attention to <code>prompt_features</code> (or <code>prompt_embeds</code> in Variant C), and an FFN. Output shape: same as <code>vis_tokens_1</code>, namely <code>[196, 4096]</code>.</p>
+
+<div class="figure">
+<svg width="1000" height="320" viewBox="0 0 1000 320" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="brar" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#666"/>
+    </marker>
+  </defs>
+
+  <text x="500" y="22" text-anchor="middle" font-family="-apple-system, sans-serif" font-size="15" font-weight="600" fill="#1a1a1a">Trunk 3 — Vision Refiner (Mechanism β, TRAINED)</text>
+
+  <!-- Inputs -->
+  <g transform="translate(50, 55)">
+    <rect x="0" y="0" width="180" height="55" rx="6" fill="#7CB342" opacity="0.5" stroke="#7CB342" stroke-width="2"/>
+    <text x="90" y="22" text-anchor="middle" font-size="11" font-weight="600">vis_tokens_1</text>
+    <text x="90" y="40" text-anchor="middle" font-size="10" fill="#1a1a1a">[196, 4096]   (from Trunk 1)</text>
+  </g>
+  <g transform="translate(700, 55)">
+    <rect x="0" y="0" width="220" height="55" rx="6" fill="#4A90E2" opacity="0.5" stroke="#4A90E2" stroke-width="2"/>
+    <text x="110" y="22" text-anchor="middle" font-size="11" font-weight="600">prompt_features</text>
+    <text x="110" y="40" text-anchor="middle" font-size="10" fill="#1a1a1a">[6, 4096]   (from Trunk 2)</text>
+  </g>
+
+  <line x1="140" y1="110" x2="140" y2="135" stroke="#666" stroke-width="2" marker-end="url(#brar)"/>
+
+  <!-- Refiner stack -->
+  <g transform="translate(50, 140)">
+    <rect x="0" y="0" width="900" height="120" rx="8" fill="#2E7D32" opacity="0.85" stroke="#E94B3C" stroke-width="3" stroke-dasharray="6,3"/>
+    <text x="450" y="22" text-anchor="middle" font-size="13" font-weight="600" fill="white">Vision Refiner stack (L_refiner = 4 blocks)</text>
+    <text x="450" y="44" text-anchor="middle" font-size="11" fill="white">For each block:  Self-Attn(vis)  →  Cross-Attn(vis ← prompt_features)  →  FFN  +  residuals</text>
+    <text x="450" y="64" text-anchor="middle" font-size="11" fill="white" font-style="italic">All within d_llm = 4096; weights initialized fresh; trained end-to-end with the rest of the model</text>
+    <text x="450" y="86" text-anchor="middle" font-size="10" fill="#fff8">~10M params per block × 4 blocks ≈ 40M trainable parameters total</text>
+    <text x="450" y="104" text-anchor="middle" font-size="10" fill="#fff">Curved arrow from prompt_features into each Cross-Attn (shared K/V across blocks)</text>
+  </g>
+
+  <!-- Curved arrow from prompt features into refiner -->
+  <path d="M 810 110 Q 700 130 600 140" fill="none" stroke="#4A90E2" stroke-width="2" stroke-dasharray="4,3" marker-end="url(#brar)"/>
+
+  <line x1="500" y1="260" x2="500" y2="285" stroke="#666" stroke-width="2" marker-end="url(#brar)"/>
+
+  <!-- Output -->
+  <g transform="translate(370, 285)">
+    <rect x="0" y="0" width="260" height="32" rx="6" fill="#2E7D32" opacity="0.7" stroke="#2E7D32" stroke-width="2"/>
+    <text x="130" y="20" text-anchor="middle" font-size="12" font-weight="600" fill="white">vis_tokens_2 [196, 4096]   → Trunk 4</text>
+  </g>
+</svg>
+</div>
+
+<p class="caption">Figure 2: Trunk 3 vision refiner (Mechanism β). A 4-block transformer stack that re-mixes <code>vis_tokens_1</code> using <code>prompt_features</code> as cross-attention K/V. Output shape is identical to the input, so downstream code only needs to know "vis_tokens has shape [196, 4096]" and not which trunk it came from.</p>
+
+<h4>Pseudocode for Mechanism β</h4>
+
+<pre><code>class VisionRefiner(nn.Module):
+    """Small transformer that re-mixes vis_tokens_1 conditioned on prompt features."""
+    def __init__(self, L_refiner=4, d=4096, n_heads=32):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            VisionRefinerBlock(d=d, n_heads=n_heads) for _ in range(L_refiner)
+        ])
+
+    def forward(self, vis_tokens_1, prompt_features):
+        h = vis_tokens_1                                      # [B, 196, 4096]
+        for block in self.blocks:
+            h = block(h, prompt_features)
+        return h                                              # [B, 196, 4096]
+
+
+class VisionRefinerBlock(nn.Module):
+    def __init__(self, d, n_heads):
+        super().__init__()
+        self.self_attn  = SelfAttention(d, n_heads)
+        self.cross_attn = CrossAttention(d, kv_d=d, n_heads=n_heads)
+        self.ffn = SwiGLU(d, 4 * d)
+        self.norm1 = nn.LayerNorm(d)
+        self.norm2 = nn.LayerNorm(d)
+        self.norm3 = nn.LayerNorm(d)
+
+    def forward(self, vis, prompt):
+        vis = vis + self.self_attn(self.norm1(vis))                 # bidirectional self-attn over vis
+        vis = vis + self.cross_attn(self.norm2(vis), kv=prompt)     # vis attends to prompt
+        vis = vis + self.ffn(self.norm3(vis))
+        return vis
+</code></pre>
+
+<hr>
+
+<h2>3. Variant C 4-trunk — LLaVA-style (the simplest)</h2>
+
+<p>Pure LLaVA spirit: keep everything at the LLM input level, no cross-attention, no per-block injection. Use Mechanism α for Trunk 3. The LLM's own self-attention is what makes Trunk 3 useful — vis_tokens_2 sits after the prompt in the sequence and so attends to the prompt; vis_tokens_1 sits before the prompt and does not.</p>
+
+<div class="figure">
+<svg width="1000" height="380" viewBox="0 0 1000 380" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="cAr" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#666"/>
+    </marker>
+  </defs>
+
+  <text x="500" y="22" text-anchor="middle" font-family="-apple-system, sans-serif" font-size="15" font-weight="600" fill="#1a1a1a">Variant C 4-trunk: single sequence, MLP only (Mechanism α for Trunk 3)</text>
+
+  <!-- 4 input boxes side by side, in causal order -->
+  <g transform="translate(20, 55)">
+    <rect x="0" y="0" width="180" height="60" rx="6" fill="#7CB342" opacity="0.5" stroke="#7CB342" stroke-width="2"/>
+    <text x="90" y="22" text-anchor="middle" font-size="11" font-weight="600">vis_tokens_1 (proj)</text>
+    <text x="90" y="40" text-anchor="middle" font-size="10" fill="#1a1a1a">[196, 4096]</text>
+    <text x="90" y="55" text-anchor="middle" font-size="9" fill="#444">Trunk 1 + MLP</text>
+  </g>
+  <g transform="translate(220, 55)">
+    <rect x="0" y="0" width="180" height="60" rx="6" fill="#4A90E2" opacity="0.5" stroke="#4A90E2" stroke-width="2"/>
+    <text x="90" y="22" text-anchor="middle" font-size="11" font-weight="600">prompt_embeds</text>
+    <text x="90" y="40" text-anchor="middle" font-size="10" fill="#1a1a1a">[6, 4096]</text>
+    <text x="90" y="55" text-anchor="middle" font-size="9" fill="#444">LLM token-embed</text>
+  </g>
+  <g transform="translate(420, 55)">
+    <rect x="0" y="0" width="180" height="60" rx="6" fill="#7CB342" opacity="0.5" stroke="#2E7D32" stroke-width="2" stroke-dasharray="4,2"/>
+    <text x="90" y="22" text-anchor="middle" font-size="11" font-weight="600">vis_tokens_2 (proj)</text>
+    <text x="90" y="40" text-anchor="middle" font-size="10" fill="#1a1a1a">[196, 4096]</text>
+    <text x="90" y="55" text-anchor="middle" font-size="9" fill="#444">= vis_tokens_1 (Mech α)</text>
+  </g>
+  <g transform="translate(620, 55)">
+    <rect x="0" y="0" width="240" height="60" rx="6" fill="#FF8A65" opacity="0.5" stroke="#FF8A65" stroke-width="2"/>
+    <text x="120" y="22" text-anchor="middle" font-size="11" font-weight="600">answer_embeds (so far)</text>
+    <text x="120" y="40" text-anchor="middle" font-size="10" fill="#1a1a1a">[K, 4096]</text>
+    <text x="120" y="55" text-anchor="middle" font-size="9" fill="#444">e.g. ["The","cat","is"]</text>
+  </g>
+
+  <!-- Down arrows to concat band -->
+  <line x1="110" y1="115" x2="110" y2="155" stroke="#7CB342" stroke-width="2" marker-end="url(#cAr)"/>
+  <line x1="310" y1="115" x2="310" y2="155" stroke="#4A90E2" stroke-width="2" marker-end="url(#cAr)"/>
+  <line x1="510" y1="115" x2="510" y2="155" stroke="#2E7D32" stroke-width="2" marker-end="url(#cAr)"/>
+  <line x1="740" y1="115" x2="740" y2="155" stroke="#FF8A65" stroke-width="2" marker-end="url(#cAr)"/>
+
+  <!-- Concat band -->
+  <g transform="translate(20, 160)">
+    <rect x="0" y="0" width="840" height="55" rx="6" fill="#fff" stroke="#666" stroke-width="2" stroke-dasharray="4,3"/>
+    <text x="20" y="22" font-size="11" font-weight="600" fill="#1a1a1a">Concatenate (once, at LLM input):  [ vis_tokens_1 | prompt_embeds | vis_tokens_2 | answer_embeds ]</text>
+    <text x="20" y="40" font-size="10" fill="#555">Shape: [196 + 6 + 196 + K, 4096]   ·   Mask: each non-answer block bidirectional within itself; causal between trunks; answer fully causal</text>
+  </g>
+
+  <line x1="440" y1="215" x2="440" y2="245" stroke="#666" stroke-width="2" marker-end="url(#cAr)"/>
+
+  <!-- Mask sub-figure -->
+  <g transform="translate(620, 240)">
+    <rect x="0" y="0" width="240" height="115" rx="6" fill="#fff" stroke="#BDBDBD" stroke-width="1.5"/>
+    <text x="120" y="18" text-anchor="middle" font-size="10" font-weight="600">Attention mask sketch</text>
+    <!-- Rows = queries (top to bottom), cols = keys (left to right): blocks v1, p, v2, a -->
+    <g transform="translate(20, 25)">
+      <!-- v1 row: only sees v1 -->
+      <rect x="0"  y="0"  width="40" height="20" fill="#7CB342" opacity="0.7"/>
+      <rect x="40" y="0"  width="20" height="20" fill="#eee"/>
+      <rect x="60" y="0"  width="40" height="20" fill="#eee"/>
+      <rect x="100" y="0" width="50" height="20" fill="#eee"/>
+      <text x="160" y="14" font-size="9" fill="#555">v1 sees: v1</text>
+      <!-- p row: sees v1, p -->
+      <rect x="0"  y="20" width="40" height="20" fill="#7CB342" opacity="0.7"/>
+      <rect x="40" y="20" width="20" height="20" fill="#4A90E2" opacity="0.7"/>
+      <rect x="60" y="20" width="40" height="20" fill="#eee"/>
+      <rect x="100" y="20" width="50" height="20" fill="#eee"/>
+      <text x="160" y="34" font-size="9" fill="#555">p sees: v1,p</text>
+      <!-- v2 row: sees v1, p, v2 -->
+      <rect x="0"  y="40" width="40" height="20" fill="#7CB342" opacity="0.7"/>
+      <rect x="40" y="40" width="20" height="20" fill="#4A90E2" opacity="0.7"/>
+      <rect x="60" y="40" width="40" height="20" fill="#2E7D32" opacity="0.7"/>
+      <rect x="100" y="40" width="50" height="20" fill="#eee"/>
+      <text x="160" y="54" font-size="9" fill="#555">v2 sees: +v2</text>
+      <!-- a row: sees all (causal within a) -->
+      <rect x="0"  y="60" width="40" height="20" fill="#7CB342" opacity="0.7"/>
+      <rect x="40" y="60" width="20" height="20" fill="#4A90E2" opacity="0.7"/>
+      <rect x="60" y="60" width="40" height="20" fill="#2E7D32" opacity="0.7"/>
+      <rect x="100" y="60" width="50" height="20" fill="#FF8A65" opacity="0.7"/>
+      <text x="160" y="74" font-size="9" fill="#555">a sees: all</text>
+    </g>
+  </g>
+
+  <!-- Frozen LLM box -->
+  <g transform="translate(20, 250)">
+    <rect x="0" y="0" width="580" height="100" rx="6" fill="#FF8A65" opacity="0.85" stroke="#BDBDBD" stroke-width="3"/>
+    <text x="290" y="24" text-anchor="middle" font-size="13" font-weight="600" fill="white">Full 24-layer LLM (FROZEN)</text>
+    <text x="290" y="46" text-anchor="middle" font-size="11" fill="white">Each layer: Self-Attn (mask above) → FFN → RMSNorm + RoPE</text>
+    <text x="290" y="66" text-anchor="middle" font-size="11" fill="white">→ LM Head (FROZEN) → next answer token (e.g., "black")</text>
+    <text x="290" y="86" text-anchor="middle" font-size="10" fill="#fff8" font-style="italic">No new modules inside the LLM. Trunks 1–4 are realized purely via input concatenation + the right mask.</text>
+  </g>
+</svg>
+</div>
+
+<p class="caption">Figure 3: Variant C 4-trunk. The four trunks are concatenated into a single LLM input sequence in causal order. The attention mask (right) enforces the trunk ordering: <code>vis_tokens_1</code> attends only to itself; the prompt attends to itself and to <code>vis_tokens_1</code>; <code>vis_tokens_2</code> attends to all of <code>vis_1, p, v_2</code>; the answer is fully causal and attends to everything. Trunk 3 is "free" in this variant — same projected vis tokens as Trunk 1, just placed at a different sequence position.</p>
+
+<h4>Pseudocode for Variant C 4-trunk</h4>
+
+<pre><code>class LLaVAStyle4TrunkVLM(nn.Module):
+    def __init__(self, vit_config, llm):
+        # Trunk 1: trainable vision encoder + 2-layer MLP projection (LLaVA-1.5 style)
+        self.vit = ViT(**vit_config)
+        self.vis_proj = nn.Sequential(
+            nn.Linear(768, 4096), nn.GELU(), nn.Linear(4096, 4096),
+        )
+        # Frozen LLM (Trunks 2 + 4 collapse into the same frozen stack)
+        self.llm = llm
+        for p in self.llm.parameters():
+            p.requires_grad = False
+        # Trunk 3: NO new module (mechanism α)
+
+    def forward(self, image, prompt_tokens, answer_tokens):
+        # Trunks 1 + 3 share the same encoder pass under mechanism α
+        v = self.vis_proj(self.vit(image))             # [B, 196, 4096]
+        p = self.llm.embed(prompt_tokens)              # [B, N_prompt, 4096]
+        a = self.llm.embed(answer_tokens)              # [B, N_ans,    4096]
+
+        # Concat in causal trunk order: [v1 | p | v2 | a],  v2 := v
+        seq = torch.cat([v, p, v, a], dim=1)
+        N1, Np, N2, Na = 196, p.shape[1], 196, a.shape[1]
+        mask = build_4trunk_mask(N1, Np, N2, Na)
+        h = self.llm.layers(seq, attn_mask=mask)
+        logits = self.llm.lm_head(h)
+        # Loss only on the answer slice
+        return logits[:, N1 + Np + N2 - 1 : -1, :]
+
+def build_4trunk_mask(N1, Np, N2, Na):
+    """Block-causal mask with bidirectional attention inside non-answer trunks."""
+    L = N1 + Np + N2 + Na
+    m = torch.zeros(L, L, dtype=torch.bool)
+    # Trunk boundaries
+    s1, s2, s3, s4 = 0, N1, N1 + Np, N1 + Np + N2
+    e1, e2, e3, e4 = s2, s3, s4, L
+    # Bidirectional within each non-answer trunk
+    m[s1:e1, s1:e1] = True
+    m[s2:e2, s2:e2] = True
+    m[s3:e3, s3:e3] = True
+    # Causal between trunks (lower-triangular at trunk granularity)
+    m[s2:e2, s1:e1] = True            # prompt    sees vis_1
+    m[s3:e3, s1:e2] = True            # vis_2     sees vis_1 + prompt
+    m[s4:e4, s1:e3] = True            # answer    sees all earlier trunks
+    # Causal within the answer trunk
+    m[s4:e4, s4:e4] = torch.tril(torch.ones(Na, Na, dtype=torch.bool))
+    return m
+</code></pre>
+
+<p>Trainable params: vision encoder (~86M) + vis_proj (~17M) ≈ <strong>~103M</strong> — the same as 3-trunk Variant C. Trunk 3 adds zero parameters because it reuses the Trunk 1 encoding.</p>
+
+<p class="footnote"><strong>Why this works at all.</strong> Even though <code>vis_tokens_2</code> equals <code>vis_tokens_1</code> at the LLM input, the two diverge after layer 1: vis_2's queries can attend to prompt keys/values that vis_1's queries cannot. By the top of the LLM, vis_2 has been refined into a question-aware representation entirely by the LLM's own attention. This is the cheapest possible 4-trunk realization — no new modules, no extra encoder pass. If you want a richer Trunk 3, swap to Mechanism β (paying ~40M extra params for a real refiner stack); the rest of the LLaVA-style assembly is unchanged.</p>
+
+<hr>
+
+<h2>4. Variant A 4-trunk — Flamingo-style with three cross-attentions per layer</h2>
+
+<p>Trunk 2 is the lower 18 frozen LLM layers, producing <code>prompt_features</code>. Trunk 3 uses Mechanism β: a vision refiner with cross-attention to <code>prompt_features</code> produces a genuinely different <code>vis_tokens_2</code>. Trunk 4 is the upper 6 frozen LLM layers, augmented with <strong>three</strong> gated cross-attention modules per layer — one each for <code>vis_tokens_1</code>, <code>prompt_features</code>, and <code>vis_tokens_2</code>. All three gates initialize at zero so the model is identical to a frozen LLM at step 0.</p>
+
+<div class="figure">
+<svg width="1000" height="540" viewBox="0 0 1000 540" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="aAr" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#666"/>
+    </marker>
+  </defs>
+
+  <text x="500" y="22" text-anchor="middle" font-family="-apple-system, sans-serif" font-size="15" font-weight="600" fill="#1a1a1a">Variant A 4-trunk: 3 gated cross-attentions per decoder layer (×6 layers)</text>
+
+  <!-- Top inputs -->
+  <g transform="translate(20, 55)">
+    <rect x="0" y="0" width="170" height="55" rx="6" fill="#7CB342" opacity="0.5" stroke="#7CB342" stroke-width="2"/>
+    <text x="85" y="22" text-anchor="middle" font-size="11" font-weight="600">vis_tokens_1</text>
+    <text x="85" y="40" text-anchor="middle" font-size="10" fill="#1a1a1a">[196, 4096]   (Trunk 1)</text>
+  </g>
+  <g transform="translate(210, 55)">
+    <rect x="0" y="0" width="170" height="55" rx="6" fill="#4A90E2" opacity="0.5" stroke="#4A90E2" stroke-width="2"/>
+    <text x="85" y="22" text-anchor="middle" font-size="11" font-weight="600">prompt_features</text>
+    <text x="85" y="40" text-anchor="middle" font-size="10" fill="#1a1a1a">[6, 4096]   (Trunk 2)</text>
+  </g>
+  <g transform="translate(400, 55)">
+    <rect x="0" y="0" width="170" height="55" rx="6" fill="#2E7D32" opacity="0.5" stroke="#2E7D32" stroke-width="2"/>
+    <text x="85" y="22" text-anchor="middle" font-size="11" font-weight="600">vis_tokens_2</text>
+    <text x="85" y="40" text-anchor="middle" font-size="10" fill="#1a1a1a">[196, 4096]   (Trunk 3, refiner)</text>
+  </g>
+  <g transform="translate(590, 55)">
+    <rect x="0" y="0" width="270" height="55" rx="6" fill="#FF8A65" opacity="0.5" stroke="#FF8A65" stroke-width="2"/>
+    <text x="135" y="22" text-anchor="middle" font-size="11" font-weight="600">answer_embeds (so far)</text>
+    <text x="135" y="40" text-anchor="middle" font-size="10" fill="#1a1a1a">[K, 4096]   (Trunk 4 input)</text>
+  </g>
+  <text x="900" y="78" font-size="11" font-weight="600" fill="#1a1a1a">×6 layers</text>
+  <text x="900" y="93" font-size="10" fill="#666">(stack repeats)</text>
+
+  <!-- 3 cross-attn rows + 1 LLM layer -->
+  <g transform="translate(20, 130)">
+    <rect x="0" y="0" width="840" height="55" rx="6" fill="#fff" stroke="#E94B3C" stroke-width="3"/>
+    <text x="20" y="22" font-size="11" font-weight="600" fill="#E94B3C">[NEW] Gated x-attn  (Q=answer, KV=vis_tokens_1)   gate α₁ init 0   (TRAINED)</text>
+    <text x="20" y="40" font-size="10" fill="#555">h ← h + tanh(α₁) · Attn(h, vis_tokens_1, vis_tokens_1)</text>
+  </g>
+  <g transform="translate(20, 195)">
+    <rect x="0" y="0" width="840" height="55" rx="6" fill="#fff" stroke="#E94B3C" stroke-width="3"/>
+    <text x="20" y="22" font-size="11" font-weight="600" fill="#E94B3C">[NEW] Gated x-attn  (Q=h,      KV=prompt_features)   gate α₂ init 0   (TRAINED)</text>
+    <text x="20" y="40" font-size="10" fill="#555">h ← h + tanh(α₂) · Attn(h, prompt_features, prompt_features)</text>
+  </g>
+  <g transform="translate(20, 260)">
+    <rect x="0" y="0" width="840" height="55" rx="6" fill="#fff" stroke="#E94B3C" stroke-width="3"/>
+    <text x="20" y="22" font-size="11" font-weight="600" fill="#E94B3C">[NEW] Gated x-attn  (Q=h,      KV=vis_tokens_2)   gate α₃ init 0   (TRAINED)</text>
+    <text x="20" y="40" font-size="10" fill="#555">h ← h + tanh(α₃) · Attn(h, vis_tokens_2, vis_tokens_2)   ← the new prompt-aware visual signal</text>
+  </g>
+
+  <!-- Down arrow into LLM -->
+  <line x1="445" y1="315" x2="445" y2="335" stroke="#666" stroke-width="2" marker-end="url(#aAr)"/>
+
+  <!-- Frozen LLM layer -->
+  <g transform="translate(20, 340)">
+    <rect x="0" y="0" width="840" height="100" rx="6" fill="#FF8A65" opacity="0.85" stroke="#BDBDBD" stroke-width="3"/>
+    <text x="20" y="22" font-size="11" font-weight="600" fill="white">[ORIGINAL] LLM Layer (one of layers 19–24, FROZEN)</text>
+    <text x="20" y="42" font-size="10" fill="white">Causal Self-Attention over h [K, 4096]   ← only attends to own answer prefix</text>
+    <text x="20" y="58" font-size="10" fill="white">FFN (SwiGLU) · RMSNorm + RoPE</text>
+    <text x="20" y="78" font-size="10" fill="#fff8" font-style="italic">No modification — wrapped above by the three new x-attn modules</text>
+  </g>
+
+  <!-- Curved down-arrows from inputs to the first cross-attn row -->
+  <line x1="105" y1="110" x2="105" y2="125" stroke="#7CB342" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#aAr)"/>
+  <line x1="295" y1="110" x2="295" y2="190" stroke="#4A90E2" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#aAr)"/>
+  <line x1="485" y1="110" x2="485" y2="255" stroke="#2E7D32" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#aAr)"/>
+  <line x1="725" y1="110" x2="725" y2="125" stroke="#FF8A65" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#aAr)"/>
+
+  <line x1="445" y1="440" x2="445" y2="465" stroke="#666" stroke-width="2" marker-end="url(#aAr)"/>
+  <g transform="translate(265, 470)">
+    <rect x="0" y="0" width="360" height="32" rx="6" fill="#fff" stroke="#BDBDBD" stroke-width="2"/>
+    <text x="180" y="20" text-anchor="middle" font-size="11" font-weight="600">LM Head (FROZEN) → next answer token</text>
+  </g>
+</svg>
+</div>
+
+<p class="caption">Figure 4: Variant A 4-trunk. The decoder layer picks up a third gated cross-attention to <code>vis_tokens_2</code> on top of the two from the 3-trunk version. All three gates start at zero, so the model boots up indistinguishable from the frozen LLM and gradually opens its eyes to (vis_1, prompt, vis_2) over the course of training.</p>
+
+<h4>Pseudocode for Variant A 4-trunk</h4>
+
+<pre><code>class FlamingoStyle4TrunkVLM(nn.Module):
+    def __init__(self, vit_config, llm, n_prompt=18, n_decoder=6, L_refiner=4):
+        # Trunk 1
+        self.vit = ViT(**vit_config)
+        self.vis_proj = nn.Linear(768, 4096)
+
+        # Trunk 2: lower 18 LLM layers, frozen
+        self.embed = llm.embed; self.embed.requires_grad_(False)
+        self.prompt_layers = llm.layers[:n_prompt]
+        for p in self.prompt_layers.parameters():
+            p.requires_grad = False
+
+        # Trunk 3: vision refiner (Mechanism β)
+        self.refiner = VisionRefiner(L_refiner=L_refiner, d=4096)
+
+        # Trunk 4: 3 cross-attn modules + frozen LLM layer per decoder block
+        self.decoder_blocks = nn.ModuleList()
+        for i in range(n_decoder):
+            llm_layer = llm.layers[n_prompt + i]
+            for p in llm_layer.parameters():
+                p.requires_grad = False
+            self.decoder_blocks.append(nn.ModuleDict({
+                "x_vis1":   GatedCrossAttention(d=4096, kv_d=4096),  # NEW
+                "x_prompt": GatedCrossAttention(d=4096, kv_d=4096),  # NEW
+                "x_vis2":   GatedCrossAttention(d=4096, kv_d=4096),  # NEW
+                "llm_layer": llm_layer,                              # FROZEN
+            }))
+        self.lm_head = llm.lm_head; self.lm_head.requires_grad_(False)
+
+    def encode_vision_1(self, image):
+        return self.vis_proj(self.vit(image))                # [B, 196, 4096]
+
+    def encode_prompt(self, prompt_tokens):
+        h = self.embed(prompt_tokens)
+        for layer in self.prompt_layers:
+            h = layer(h, attn_mask="causal")
+        return h                                              # [B, N_prompt, 4096]
+
+    def encode_vision_2(self, vis_tokens_1, prompt_features):
+        return self.refiner(vis_tokens_1, prompt_features)    # [B, 196, 4096]
+
+    def decode_step(self, vis_1, prompt_features, vis_2, answer_so_far):
+        h = self.embed(answer_so_far)                         # [B, K, 4096]
+        for block in self.decoder_blocks:
+            h = block["x_vis1"](h, vis_1)
+            h = block["x_prompt"](h, prompt_features)
+            h = block["x_vis2"](h, vis_2)
+            h = block["llm_layer"](h, attn_mask="causal")
+        return self.lm_head(h[:, -1, :])
+</code></pre>
+
+<p>Trainable params: vision encoder (~86M) + vis_proj (~3M) + refiner (~40M) + 6 × (3 × cross-attention ≈ 33M each) ≈ <strong>~725M</strong>. The largest of the three variants — the price of three independent attention paths into the decoder.</p>
+
+<hr>
+
+<h2>5. Variant B 4-trunk — Cambrian per-block with two Q-Formers per layer</h2>
+
+<p>Trunk 2 is the lower 18 frozen LLM layers (same as A). Trunk 3 uses Mechanism β with the same vision refiner. Trunk 4: at every decoder layer, instantiate <strong>two</strong> Q-Formers — one for <code>vis_tokens_1</code>, one for <code>vis_tokens_2</code> — each producing M=64 compressed visual tokens. Concatenate everything into the LLM sequence at that layer: <code>[vis_compressed_1 | prompt_features | vis_compressed_2 | answer]</code>.</p>
+
+<div class="figure">
+<svg width="1000" height="600" viewBox="0 0 1000 600" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="bAr" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#666"/>
+    </marker>
+    <marker id="bArg" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#7CB342"/>
+    </marker>
+    <marker id="bArg2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#2E7D32"/>
+    </marker>
+    <marker id="bArb" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#4A90E2"/>
+    </marker>
+    <marker id="bAro" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#FF8A65"/>
+    </marker>
+  </defs>
+
+  <text x="500" y="22" text-anchor="middle" font-family="-apple-system, sans-serif" font-size="15" font-weight="600" fill="#1a1a1a">Variant B 4-trunk: 2 Q-Formers per decoder layer (vis_1 + vis_2)</text>
+
+  <!-- 4 inputs -->
+  <g transform="translate(20, 55)">
+    <rect x="0" y="0" width="170" height="55" rx="6" fill="#7CB342" opacity="0.5" stroke="#7CB342" stroke-width="2"/>
+    <text x="85" y="22" text-anchor="middle" font-size="11" font-weight="600">vis_tokens_1</text>
+    <text x="85" y="40" text-anchor="middle" font-size="10" fill="#1a1a1a">[196, 4096]   (Trunk 1)</text>
+  </g>
+  <g transform="translate(210, 55)">
+    <rect x="0" y="0" width="170" height="55" rx="6" fill="#4A90E2" opacity="0.5" stroke="#4A90E2" stroke-width="2"/>
+    <text x="85" y="22" text-anchor="middle" font-size="11" font-weight="600">prompt_features</text>
+    <text x="85" y="40" text-anchor="middle" font-size="10" fill="#1a1a1a">[6, 4096]   (Trunk 2)</text>
+  </g>
+  <g transform="translate(400, 55)">
+    <rect x="0" y="0" width="170" height="55" rx="6" fill="#2E7D32" opacity="0.5" stroke="#2E7D32" stroke-width="2"/>
+    <text x="85" y="22" text-anchor="middle" font-size="11" font-weight="600">vis_tokens_2</text>
+    <text x="85" y="40" text-anchor="middle" font-size="10" fill="#1a1a1a">[196, 4096]   (Trunk 3, refiner)</text>
+  </g>
+  <g transform="translate(590, 55)">
+    <rect x="0" y="0" width="270" height="55" rx="6" fill="#FF8A65" opacity="0.5" stroke="#FF8A65" stroke-width="2"/>
+    <text x="135" y="22" text-anchor="middle" font-size="11" font-weight="600">answer_embeds (so far)</text>
+    <text x="135" y="40" text-anchor="middle" font-size="10" fill="#1a1a1a">[K, 4096]   (Trunk 4 input)</text>
+  </g>
+  <text x="900" y="78" font-size="11" font-weight="600" fill="#1a1a1a">×6 layers</text>
+  <text x="900" y="93" font-size="10" fill="#666">(stack repeats)</text>
+
+  <!-- Two Q-Formers side-by-side -->
+  <g transform="translate(20, 145)">
+    <rect x="0" y="0" width="180" height="115" rx="6" fill="#fff" stroke="#E94B3C" stroke-width="3"/>
+    <text x="90" y="22" text-anchor="middle" font-size="11" font-weight="600" fill="#E94B3C">[NEW] Q-Former₁ (TRAINED)</text>
+    <text x="90" y="42" text-anchor="middle" font-size="10" fill="#555">M=64 own queries</text>
+    <text x="90" y="60" text-anchor="middle" font-size="10" fill="#555">cross-attend to vis_tokens_1</text>
+    <text x="90" y="80" text-anchor="middle" font-size="10" fill="#555">→ vis_compressed_1</text>
+    <text x="90" y="98" text-anchor="middle" font-size="10" fill="#888" font-style="italic">[64, 4096]</text>
+  </g>
+  <g transform="translate(400, 145)">
+    <rect x="0" y="0" width="180" height="115" rx="6" fill="#fff" stroke="#E94B3C" stroke-width="3"/>
+    <text x="90" y="22" text-anchor="middle" font-size="11" font-weight="600" fill="#E94B3C">[NEW] Q-Former₂ (TRAINED)</text>
+    <text x="90" y="42" text-anchor="middle" font-size="10" fill="#555">M=64 own queries</text>
+    <text x="90" y="60" text-anchor="middle" font-size="10" fill="#555">cross-attend to vis_tokens_2</text>
+    <text x="90" y="80" text-anchor="middle" font-size="10" fill="#555">→ vis_compressed_2</text>
+    <text x="90" y="98" text-anchor="middle" font-size="10" fill="#888" font-style="italic">[64, 4096]</text>
+  </g>
+
+  <line x1="105" y1="110" x2="105" y2="140" stroke="#7CB342" stroke-width="2" marker-end="url(#bArg)"/>
+  <line x1="485" y1="110" x2="485" y2="140" stroke="#2E7D32" stroke-width="2" marker-end="url(#bArg2)"/>
+
+  <!-- Bypass arrows: prompt_features and answer_embeds skip the Q-Former row -->
+  <line x1="295" y1="110" x2="295" y2="280" stroke="#4A90E2" stroke-width="2" stroke-dasharray="4,3" marker-end="url(#bArb)"/>
+  <line x1="725" y1="110" x2="725" y2="280" stroke="#FF8A65" stroke-width="2" stroke-dasharray="4,3" marker-end="url(#bAro)"/>
+
+  <!-- Outputs of both Q-Formers down to Concat -->
+  <line x1="105" y1="260" x2="105" y2="280" stroke="#7CB342" stroke-width="2" marker-end="url(#bArg)"/>
+  <line x1="485" y1="260" x2="485" y2="280" stroke="#2E7D32" stroke-width="2" marker-end="url(#bArg2)"/>
+
+  <!-- Concat band -->
+  <g transform="translate(20, 285)">
+    <rect x="0" y="0" width="840" height="60" rx="6" fill="#fff" stroke="#666" stroke-width="2" stroke-dasharray="4,3"/>
+    <text x="20" y="22" font-size="11" font-weight="600" fill="#1a1a1a">Concatenate along sequence dim:  [ vis_compressed_1 | prompt_features | vis_compressed_2 | answer_embeds ]</text>
+    <text x="20" y="40" font-size="10" fill="#555">Shape: [64 + 6 + 64 + K, 4096]   ·   Mask: each non-answer block bidirectional within itself; causal between trunks; answer fully causal</text>
+    <text x="20" y="56" font-size="10" fill="#888" font-style="italic">Same per-block injection pattern as 3-trunk Variant B, just with two Q-Former outputs sandwiching the prompt</text>
+  </g>
+
+  <line x1="445" y1="345" x2="445" y2="375" stroke="#666" stroke-width="2" marker-end="url(#bAr)"/>
+
+  <!-- Frozen LLM layer -->
+  <g transform="translate(20, 380)">
+    <rect x="0" y="0" width="840" height="100" rx="6" fill="#FF8A65" opacity="0.85" stroke="#BDBDBD" stroke-width="3"/>
+    <text x="20" y="22" font-size="11" font-weight="600" fill="white">[ORIGINAL] LLM Layer (one of layers 19–24, FROZEN)</text>
+    <text x="20" y="42" font-size="10" fill="white">Self-Attention over [64 v₁ + 6 p + 64 v₂ + K answer, 4096]</text>
+    <text x="20" y="58" font-size="10" fill="white">FFN (SwiGLU) · RMSNorm + RoPE</text>
+    <text x="20" y="78" font-size="10" fill="#fff8" font-style="italic">No modification — frozen weights process the augmented sequence as if Q-Former tokens were extra prompt tokens</text>
+  </g>
+
+  <line x1="445" y1="480" x2="445" y2="510" stroke="#666" stroke-width="2" marker-end="url(#bAr)"/>
+  <g transform="translate(265, 515)">
+    <rect x="0" y="0" width="360" height="32" rx="6" fill="#fff" stroke="#BDBDBD" stroke-width="2"/>
+    <text x="180" y="20" text-anchor="middle" font-size="11" font-weight="600">LM Head (FROZEN) → next answer token</text>
+  </g>
+</svg>
+</div>
+
+<p class="caption">Figure 5: Variant B 4-trunk. Each decoder layer now hosts two independent Q-Formers — one looking at the problem-blind <code>vis_tokens_1</code>, one at the prompt-aware <code>vis_tokens_2</code>. Their outputs are placed on either side of the prompt features in the LLM sequence, preserving the causal trunk ordering (<code>v₁ ≺ p ≺ v₂ ≺ answer</code>).</p>
+
+<h4>Pseudocode for Variant B 4-trunk</h4>
+
+<pre><code>class CambrianPerBlock4TrunkVLM(nn.Module):
+    def __init__(self, vit_config, llm, M=64, n_prompt=18, n_decoder=6, L_refiner=4):
+        # Trunk 1
+        self.vit = ViT(**vit_config)
+        self.vis_proj = nn.Linear(768, 4096)
+        # Trunk 2: lower 18 LLM layers, frozen
+        self.embed = llm.embed; self.embed.requires_grad_(False)
+        self.prompt_layers = llm.layers[:n_prompt]
+        for p in self.prompt_layers.parameters():
+            p.requires_grad = False
+        # Trunk 3: vision refiner
+        self.refiner = VisionRefiner(L_refiner=L_refiner, d=4096)
+        # Trunk 4: two Q-Formers + frozen LLM layer per block
+        self.decoder_blocks = nn.ModuleList()
+        for i in range(n_decoder):
+            llm_layer = llm.layers[n_prompt + i]
+            for p in llm_layer.parameters():
+                p.requires_grad = False
+            self.decoder_blocks.append(nn.ModuleDict({
+                "qformer1":  QFormer(M=M, d=4096, kv_d=4096),  # NEW (vis_1)
+                "qformer2":  QFormer(M=M, d=4096, kv_d=4096),  # NEW (vis_2)
+                "llm_layer": llm_layer,                         # FROZEN
+            }))
+        self.M = M
+        self.lm_head = llm.lm_head; self.lm_head.requires_grad_(False)
+
+    def encode_vision_1(self, image):
+        return self.vis_proj(self.vit(image))
+
+    def encode_prompt(self, prompt_tokens):
+        h = self.embed(prompt_tokens)
+        for layer in self.prompt_layers:
+            h = layer(h, attn_mask="causal")
+        return h
+
+    def encode_vision_2(self, vis_1, prompt_features):
+        return self.refiner(vis_1, prompt_features)
+
+    def decode_step(self, vis_1, prompt_features, vis_2, answer_so_far):
+        ans = self.embed(answer_so_far)
+        Np = prompt_features.shape[1]
+        for block in self.decoder_blocks:
+            v1c = block["qformer1"](vis_1)               # [B, M, 4096]
+            v2c = block["qformer2"](vis_2)               # [B, M, 4096]
+            seq = torch.cat([v1c, prompt_features, v2c, ans], dim=1)
+            mask = build_4trunk_mask(self.M, Np, self.M, ans.shape[1])
+            seq = block["llm_layer"](seq, attn_mask=mask)
+            ans = seq[:, self.M + Np + self.M:, :]      # carry only answer slice forward
+        return self.lm_head(ans[:, -1, :])
+</code></pre>
+
+<p>Trainable params: vision encoder (~86M) + vis_proj (~3M) + refiner (~40M) + 6 × 2 Q-Formers (~50M each) ≈ <strong>~730M</strong>. Comparable in size to Variant A; slightly larger because of the doubled Q-Former count.</p>
+
+<hr>
+
+<h2>6. Side-by-side comparison (4-trunk)</h2>
+
+<table>
+  <thead>
+    <tr><th>Aspect</th><th>Variant C (LLaVA-style)</th><th>Variant A (Flamingo-style)</th><th>Variant B (Cambrian per-block, Q-Former)</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>How Trunk 3 is realized</td>
+      <td><strong>Mechanism α</strong> (free): vis_2 = vis_1 at LLM input; the LLM's attention mask makes them diverge</td>
+      <td><strong>Mechanism β</strong>: 4-block vision refiner with cross-attn to prompt_features</td>
+      <td><strong>Mechanism β</strong>: same 4-block vision refiner</td>
+    </tr>
+    <tr>
+      <td>How Trunks 1+2+3 enter Trunk 4</td>
+      <td>Concatenated into LLM input as 4 contiguous blocks; no new modules inside LLM</td>
+      <td>3 gated cross-attentions per decoder layer (one each for v₁, p, v₂)</td>
+      <td>2 Q-Formers per decoder layer (for v₁ and v₂); prompt and Q-Former outputs concatenated</td>
+    </tr>
+    <tr>
+      <td>3-trunk separation preserved?</td>
+      <td>No — Trunks 2 and 4 collapse into one frozen LLM</td>
+      <td>Yes — Trunk 2 is pure-text (lower 18 layers); Trunk 4 sees v₁/p/v₂ via cross-attn</td>
+      <td>Yes — Trunk 2 is pure-text; Trunk 4 sees v₁/p/v₂ via per-block injection</td>
+    </tr>
+    <tr>
+      <td>Trunk 3 prompt-awareness</td>
+      <td>From the LLM's attention only (vis_2 attends to prompt inside the LLM)</td>
+      <td>From the refiner's cross-attention (explicit, before the LLM)</td>
+      <td>From the refiner's cross-attention (explicit, before the LLM)</td>
+    </tr>
+    <tr>
+      <td>Sequence length seen by the LLM</td>
+      <td>196 + 6 + 196 + K (all 24 layers)</td>
+      <td>K (decoder layers); 6 (prompt encoder layers)</td>
+      <td>64 + 6 + 64 + K (decoder layers); 6 (prompt encoder layers)</td>
+    </tr>
+    <tr>
+      <td>FLOPs vs. 3-trunk version</td>
+      <td>~2× LLM cost (sequence doubled by adding vis_2)</td>
+      <td>+ refiner + 1 extra cross-attn per decoder layer (~50% more decoder cost)</td>
+      <td>+ refiner + 1 extra Q-Former per decoder layer + ~30% longer LLM sequence per layer</td>
+    </tr>
+    <tr>
+      <td>Trainable params (rough)</td>
+      <td>~103M (same as 3-trunk C)</td>
+      <td>~725M (vs ~485M for 3-trunk A)</td>
+      <td>~730M (vs ~390M for 3-trunk B)</td>
+    </tr>
+    <tr>
+      <td>Closest existing analog</td>
+      <td>LLaVA with the image inserted twice (no published precedent we know of)</td>
+      <td>Flamingo with three perceiver-like inputs</td>
+      <td>Cambrian-1 with two parallel SVAs (here simplified to Q-Formers)</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>Which to start with?</h3>
+
+<ul>
+  <li><strong>Run Variant C 4-trunk first</strong>, against Variant C 3-trunk as the control. The question this directly tests: <em>does putting the image into the LLM sequence twice (with prompt in the middle) help, even with no new parameters?</em> If yes, it's a striking and cheap result. If not, you've ruled out the cheapest version of the 4-trunk hypothesis before paying for refiners or per-block injection.</li>
+  <li><strong>Then test Mechanism β alone in Variant C</strong> (LLaVA-style, with a real refiner). This isolates "is a prompt-aware refiner useful?" from "are per-block cross-attn / Q-Former bridges useful?"</li>
+  <li><strong>Promote to Variant A or B</strong> only if the C-with-refiner result is strong but you suspect the 24-layer-frozen-LLM bottleneck is now what's holding things back.</li>
+</ul>
+
+<hr>
+
+<h2>7. Open questions specific to 4-trunk</h2>
+
+<ol>
+  <li><strong>Does Mechanism α (free) actually do anything useful?</strong> The whole 4-trunk-Variant-C bet rests on the LLM being able to refine vis_2 via its own attention. An ablation: train Variant C 3-trunk and Variant C 4-trunk-α on identical data; if the 4-trunk version wins, the bet pays off.</li>
+  <li><strong>How deep should the refiner be?</strong> L_refiner = 4 is a guess. Sweep {0, 1, 2, 4, 8} — 0 reduces to mechanism α, 8 starts to look like a small encoder of its own.</li>
+  <li><strong>Should Trunk 3 share weights with Trunk 1?</strong> A second-pass-with-shared-encoder would actually re-run the ViT (Falcon-Perception-style) instead of building a separate refiner. More expensive per step but could be more parameter-efficient overall.</li>
+  <li><strong>Cross-attention asymmetry in the refiner.</strong> In Variant C the refiner cross-attends to <code>prompt_embeds</code> (raw token embeddings, no LLM processing). In A/B it cross-attends to <code>prompt_features</code> (after 18 LLM layers). Does the encoded version actually help, or are raw embeddings enough?</li>
+  <li><strong>Sequence-length blowup in Variant C.</strong> 196 + 6 + 196 + K is ~400 tokens for the LLM at every layer. For long contexts or multi-image inputs this scales poorly. Worth measuring whether mechanism α helps enough to justify the doubled sequence cost.</li>
+  <li><strong>Causal-vs-bidirectional inside Trunk 3.</strong> Should vis_2 attend bidirectionally over its own 196 tokens, or causally? Bidirectional is the default and matches the Trunk 1 convention.</li>
+  <li><strong>Multi-pass extension (5-, 6-, … N-trunk).</strong> If Trunk 3 helps, does Trunk 5 (image-after-partial-answer) help further? See section 8.</li>
+</ol>
+
+<hr>
+
+<h2>8. The path to N-trunk (preview)</h2>
+
+<p>The 4-trunk recipe extends to longer chains by interleaving more vision-refiner passes between text trunks. A natural 5-trunk arrangement: <code>[Image | Prompt | Image' | partial-Answer | Image'']</code>, where each successive Image-trunk is a refiner pass that takes the previous vision tokens and the most recent text trunk as cross-attention K/V. This starts to resemble a chain-of-thought over visual primitives (see <a href="../deepseek_vision/00_thinking_visual_primitives.html">DeepSeek's "Thinking with Visual Primitives"</a> and the <a href="../deepseek_vision/01_visual_cot_survey.html">Visual CoT survey</a>) — each visual trunk corresponds to one "look back at the image" step in the reasoning chain.</p>
+
+<p>For each variant the extension is mechanical:</p>
+<ul>
+  <li><strong>Variant C:</strong> add another bidirectional block to the LLM input sequence; the mask just adds another row/column to the trunk-causal block matrix. Free if Mechanism α; pay another refiner stack if Mechanism β.</li>
+  <li><strong>Variant A:</strong> add another gated cross-attention per decoder layer for each new vision trunk. Linear growth in cross-attn count.</li>
+  <li><strong>Variant B:</strong> add another Q-Former per decoder layer for each new vision trunk. Linear growth in Q-Former count.</li>
+</ul>
+
+<p>Beyond ~5 trunks, the per-decoder-layer module count in A and B becomes onerous; Variant C scales most gracefully (just a longer input sequence, no new modules), at the cost of a longer LLM context per step.</p>
+
+<hr>
+
+<h2>Where this fits in the brainstorm series</h2>
+
+<ul>
+  <li><a href="00_depth_split_vlm.html">brainstorm/00</a> — depth-split VLM</li>
+  <li><a href="01_llm_agnostic_vision_encoder.html">brainstorm/01</a> — LLM-agnostic vision encoder via frozen LLM</li>
+  <li><a href="02_depth_split_related_work.html">brainstorm/02</a> — literature scan for depth-split</li>
+  <li><a href="03_vision_encoder_pretraining_survey.html">brainstorm/03</a> — vision encoder pretraining survey</li>
+  <li><a href="04_multi_trunk_vlm.html">brainstorm/04</a> — multi-trunk VLM (3-trunk + 4-trunk concept)</li>
+  <li><a href="05_3trunk_concrete_design.html">brainstorm/05</a> — concrete 3-trunk design (LLaVA + Flamingo + Cambrian per-block variants)</li>
+  <li><strong>brainstorm/06 (this document)</strong> — concrete 4-trunk design, generalizing the same three variants</li>
+</ul>
+
+<blockquote>
+This document lifts the three 3-trunk variants from brainstorm/05 to the 4-trunk setting in which the same image is "looked at twice" — first problem-blind (Trunk 1), then again after the prompt has been read (Trunk 3). Two re-encoding mechanisms are defined: <strong>α</strong> (free — vis_2 = vis_1 at the LLM input, with prompt-awareness emerging from the LLM's attention pattern) and <strong>β</strong> (a small trained vision refiner with cross-attention to prompt features). Variant C uses Mechanism α and adds zero parameters relative to its 3-trunk version; Variants A and B use Mechanism β plus extra cross-attention or Q-Former modules per decoder layer. Recommended starting experiment: Variant C 4-trunk-α vs. Variant C 3-trunk on identical data, to test whether free positional re-encoding alone produces a measurable improvement before paying for refiners or per-block bridges.
+</blockquote>
+
+</body>
+</html>

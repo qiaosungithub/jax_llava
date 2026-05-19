@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>VLM Pretraining Notes</title>
+<style>
+  body { font-family: sans-serif; max-width: 860px; margin: 40px auto; padding: 0 20px; line-height: 1.6; color: #222; }
+  h1 { border-bottom: 2px solid #333; padding-bottom: 8px; }
+  h2 { border-bottom: 1px solid #ccc; padding-bottom: 4px; margin-top: 36px; }
+  h3 { margin-top: 24px; }
+  code { background: #f4f4f4; padding: 1px 5px; border-radius: 3px; font-size: 0.9em; }
+  pre { background: #f4f4f4; padding: 14px; border-radius: 4px; overflow-x: auto; font-size: 0.88em; line-height: 1.5; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+  th, td { border: 1px solid #ccc; padding: 7px 12px; text-align: left; }
+  th { background: #f0f0f0; }
+  .warn { background: #fff8e1; border-left: 4px solid #f0a500; padding: 10px 14px; margin: 12px 0; }
+  .note { background: #f0f7ff; border-left: 4px solid #4a90d9; padding: 10px 14px; margin: 12px 0; }
+  ul, ol { padding-left: 22px; }
+  li { margin-bottom: 4px; }
+</style>
+</head>
+<body>
+
+<h1>VLM Pretraining Notes</h1>
+<p>架构：PaliGemma-style &nbsp;|&nbsp; 关注任务：Detection / Grounded Captioning（Seg 暂缓）</p>
+
+<h2>1. Pretraining 任务格式</h2>
+
+<h3>Detection / Referring Expression（ARef）</h3>
+<pre>prompt:  detect cat ; dog
+label:   &lt;loc0382&gt;&lt;loc0201&gt;&lt;loc0695&gt;&lt;loc0478&gt; cat &lt;loc0156&gt;&lt;loc0089&gt;&lt;loc0401&gt;&lt;loc0312&gt; dog</pre>
+<p>每个 object 输出 4 个 <code>&lt;loc&gt;</code> token（顺序：ymin xmin ymax xmax）+ class name。多个 object 按 y_min 从小到大排序（top-to-bottom）。</p>
+
+<h3>Grounded Captioning（GCap，来自 LocCa）</h3>
+<pre>prompt:  caption &lt;loc0382&gt;&lt;loc0201&gt;&lt;loc0695&gt;&lt;loc0478&gt;
+label:   a cat sitting on a wooden table</pre>
+<p>给定 bbox 作为 prompt 的一部分，输出框内区域的自然语言描述。需要 region-level caption 数据，不能用整图 caption。</p>
+
+<h3>Segmentation（暂缓）</h3>
+<pre>label:   &lt;loc&gt;x4  &lt;seg000&gt;...&lt;seg127&gt; x16  cat</pre>
+<p>16 个 <code>&lt;seg&gt;</code> token 是 VQ-VAE（codebook size=128）对 bbox 内 64×64 binary mask 的编码。VQ-VAE 权重开源于 <code>google-research/big_vision</code>，但集成链路复杂。<strong>先跑 box-only，之后再加。</strong></p>
+
+<h2>2. &lt;loc&gt; Token 机制</h2>
+<p>向词表新增 1024 个 token（<code>&lt;loc0000&gt;</code>~<code>&lt;loc1023&gt;</code>），表示归一化坐标 bin 后的整数值（假设图片 resize 到 1024×1024）。与实际输入分辨率无关。Embedding 随训练学习，初始化建议用 AvgEmb（已有词表均值 + 小噪声）。</p>
+
+<pre>def coord_to_loc(coord_normalized):   # coord in [0.0, 1.0]
+    return int(coord_normalized * 1023)
+
+# Visual Genome box format: x,y = top-left, w,h = size
+def vg_box_to_loc_tokens(x, y, w, h, img_w, img_h):
+    ymin = int((y        / img_h) * 1023)
+    xmin = int((x        / img_w) * 1023)
+    ymax = int(((y+h)    / img_h) * 1023)
+    xmax = int(((x+w)    / img_w) * 1023)
+    return f"&lt;loc{ymin:04d}&gt;&lt;loc{xmin:04d}&gt;&lt;loc{ymax:04d}&gt;&lt;loc{xmax:04d}&gt;"</pre>
+
+<h2>3. LocCa 数据来源（原版 vs 开源复现）</h2>
+<p>原版用 Google 内部 <strong>WebLI</strong>（1B pairs，不开源）+ OWL-ViT 生成伪 box 标注（confidence &gt; 0.3 过滤）。</p>
+<div class="note">
+  <strong>开源复现建议：</strong> CC3M / CC12M（有 alt-text）+ Grounding DINO（开源）→ 对 alt-text 里的名词短语生成 pseudo box。可将 GCap 数据量从 Visual Genome 的 108K 图扩展到 3M~12M 量级，处理 CC3M 全量约需几十 GPU hours。
+</div>
+
+<h2>4. 开源数据集</h2>
+
+<table>
+  <tr>
+    <th>数据集</th>
+    <th>规模</th>
+    <th>Detection</th>
+    <th>Grounded Caption</th>
+    <th>备注</th>
+  </tr>
+  <tr>
+    <td><strong>Visual Genome</strong></td>
+    <td>108K 图 / 3.8M regions</td>
+    <td>✓ objects.json</td>
+    <td>✓ region_descriptions.json</td>
+    <td>GCap 最直接可用；caption 较短（均~5词）</td>
+  </tr>
+  <tr>
+    <td><strong>Objects365</strong></td>
+    <td>2M 图 / 30M boxes / 365类</td>
+    <td>✓ 最推荐</td>
+    <td>✗ 无 caption</td>
+    <td>类别多、质量高；LocCa 论文用它预训练 detector</td>
+  </tr>
+  <tr>
+    <td><strong>OpenImages v7</strong></td>
+    <td>9M 图 / 16M boxes / 600类</td>
+    <td>✓</td>
+    <td>✗ 无 caption</td>
+    <td>规模最大；含 visual relationship 标注</td>
+  </tr>
+  <tr>
+    <td><strong>SA-1B (SAM)</strong></td>
+    <td>11M 图 / 1B masks</td>
+    <td>△ 需补 label</td>
+    <td>✗</td>
+    <td>无 text label；用于 seg task（当前跳过）</td>
+  </tr>
+  <tr>
+    <td><strong>COCO</strong></td>
+    <td>118K 图 / 860K boxes / 80类</td>
+    <td>✓</td>
+    <td>△ 整图 caption，非 region</td>
+    <td>小但质量高；主要用于 eval</td>
+  </tr>
+</table>
+
+<h2>5. Visual Genome 详细说明</h2>
+
+<p>下载地址：<code>homes.cs.washington.edu/~ranjay/visualgenome/data/dataset</code></p>
+<p>与你之前用的 VQA 是同一份图片，不同标注文件：</p>
+<ul>
+  <li><code>region_descriptions.json.zip</code> — Grounded captioning 用</li>
+  <li><code>objects.json.zip</code> — Detection 用</li>
+  <li><code>question_answers.json.zip</code> — 你之前用的 VQA</li>
+</ul>
+
+<h3>region_descriptions.json 结构</h3>
+<pre>[
+  {
+    "id": 1,
+    "regions": [
+      {
+        "region_id": 1382,
+        "image_id": 1,
+        "phrase": "the man is wearing a blue shirt",
+        "x": 251,   // top-left x
+        "y": 10,    // top-left y
+        "width": 108,
+        "height": 269
+      }, ...
+    ]
+  }, ...
+]</pre>
+
+<div class="warn">
+  <strong>预处理注意：</strong>
+  <ul>
+    <li>部分 box 坐标超出图片边界 → clip 到 [0, img_w/h]</li>
+    <li>部分 phrase 为空或单个词 → 过滤 <code>len(phrase.split()) &lt; 2</code></li>
+    <li>box 格式是 x,y,w,h（左上角+宽高），不是 xyxy</li>
+    <li>PaliGemma 坐标顺序是 <strong>ymin xmin ymax xmax</strong>（先 y 后 x）</li>
+  </ul>
+</div>
+
+<h3>完整预处理函数</h3>
+<pre>def process_vg_region(region, img_w, img_h):
+    x, y = region['x'], region['y']
+    w, h = region['width'], region['height']
+    phrase = region['phrase'].strip()
+
+    if len(phrase.split()) < 2:
+        return None
+    if w <= 0 or h <= 0:
+        return None
+
+    # Clip to image bounds
+    x  = max(0, min(x,     img_w))
+    y  = max(0, min(y,     img_h))
+    x2 = max(0, min(x + w, img_w))
+    y2 = max(0, min(y + h, img_h))
+
+    ymin = int((y  / img_h) * 1023)
+    xmin = int((x  / img_w) * 1023)
+    ymax = int((y2 / img_h) * 1023)
+    xmax = int((x2 / img_w) * 1023)
+
+    loc = f"&lt;loc{ymin:04d}&gt;&lt;loc{xmin:04d}&gt;&lt;loc{ymax:04d}&gt;&lt;loc{xmax:04d}&gt;"
+
+    return {
+        'gcap_prompt': f"caption {loc}",
+        'gcap_label':  phrase,
+        'aref_prompt': phrase,
+        'aref_label':  loc,
+    }</pre>
+
+</body>
+</html>

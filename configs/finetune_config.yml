@@ -1,0 +1,112 @@
+model:
+    patch_size: 16
+    num_learnable_tokens: 256 # K
+    feature_dim: 768
+    # und_use_tokens: 128
+
+    # masking config
+    mask_strategy: "exp" # square, uniform, exp
+    und_use_mask: False
+    recon_use_mask: False
+
+    # # encoder (MAE-L)
+    # enc_hidden_dim: 1024
+    # enc_num_patch_sa_layers: 6
+    # enc_num_cross_attn_layers: 12
+    # enc_num_token_sa_layers: 6
+    # encoder (MAE-B)
+    enc_hidden_dim: 768
+    enc_num_patch_sa_layers: 3
+    enc_num_cross_attn_layers: 6
+    enc_num_token_sa_layers: 3
+    # decoder
+    dec_hidden_dim: 512 # MAE default setting
+    dec_num_layers: 6
+
+    lm_backbone_str: "gemma3_270M"
+    projector_use_ln: True
+    attn_logits_soft_cap: 0.0
+    final_logit_softcap: 0.0
+    use_2l_mlp: True
+
+    txt_feature_layer: 15 # gemma3-270M has 18 layers
+
+    # Loss weights (only normal loss for SFT)
+    vlm_loss_weight: 1.0 # the normal image-conditioned NTP
+    text_only_loss_weight: 0.0  # text-only NTP (unconditional branch; ignored when alpha=0)
+    cfg_loss_weight: 0.0        # CFG-style contrastive loss  (ignored when alpha=0)
+    recon_loss_weight: 0.0      # image reconstruction MSE
+    alpha: 0.0                  # CFG contrastive α; set >0 to enable text-only forward pass
+
+dataset:
+    image_size: 256
+    max_txt_length: 256
+    root:
+        - llava-ov-1.5-instruct # data scale: 22M
+        - vqav2                 # data scale: 400K=0.4M
+    mix_weights: [22, 0.4]
+
+    num_workers: 32
+    prefetch_factor: 4
+
+    resize_mode: letterbox # letterbox (padding to square), stretch (resize to square)
+
+training:
+    freeze_lm: False
+    lm_init_pretrained_text_layers_only: False # If on, only load text embedding layers
+    vision_encoder_lr_scale: 1.0
+    optimizer: muon
+    adam:
+        learning_rate: 0.000002
+        adam_b2: 0.95
+        weight_decay: 0.02
+    muon:
+        learning_rate: 0.0001
+        weight_decay: 0.02
+        # learning_rate: 0.00005 # textvqa
+        # weight_decay: 0.2
+
+    grad_clip_norm: 0.0
+
+    log_per_step: 100
+    checkpoint_per_step: 3000
+    log_vis_per_step: 3000
+
+    num_steps: 90000 # vqav2
+    warmup_steps: 9000
+    siglip_warmup_steps: 9000
+
+    lr_schedule: cos
+    batch_size: 256
+
+    online_eval_per_step: 9000
+    online_eval_tasks: [vqav2, mme, textvqa, pope, refcocog, pixelbench]
+    final_eval_tasks: [vqav2, mme, textvqa, pope, mmbench, knn_full, refcocog, pixelbench]
+
+    seed: 30
+
+sampling:
+    max_new_tokens: 64
+    beam_size: 1
+
+eval: {}
+
+finetune: True  # always True in this file
+
+# load_from: '/kmh-nfs-ssd-us-mount/logs/sqa/paligemma-baseline/20260316_023019_8kzuiq_kmh-tpuvm-v6e-64-spot-sqa-5recse_us-central1-b__b_lr_ep_eval'
+# load_from_pretrained: /kmh-nfs-ssd-us-mount/logs/sqa/paligemma-baseline/20260329_153022_4z6uif_kmh-tpuvm-v6e-64-spot-sqa-5bq7o4_asia-northeast1-b__b_lr_ep_eval # recon weight 10.0 baseline
+# load_from_pretrained: /kmh-nfs-ssd-us-mount/logs/sqa/paligemma-baseline/20260402_024944_xdbykd_kmh-tpuvm-v5p-128-spot-sqa-7ra3e6_us-east5-a__b_lr_ep_eval # recon weight 50.0 baseline
+# load_from_pretrained: /kmh-nfs-ssd-us-mount/logs/sqa/paligemma-baseline/20260411_145046_sji9ej_kmh-tpuvm-v6e-64-spot-llq3mtli1_us-east5-b__b_lr_ep_eval # cross attn recon weight 20.0 baseline, exp mask strategy
+# load_from_pretrained: /kmh-nfs-ssd-us-mount/logs/sqa/paligemma-baseline/20260423_170045_s3g71w_kmh-tpuvm-v6e-64-dmy-8b91_asia-northeast1-b__b_lr_ep_eval # [cfg init] 3caption + genomeQA + renderedtext [50, 12, 5, 20, 28], no recon, moun 2e-4 wd0.05, soft cap, loss weight vlm 1.0, text 1.0, cfg 1.0, alpha 1.0
+# load_from_pretrained: /kmh-nfs-ssd-us-mount/logs/sqa/paligemma-baseline/20260517_065641_wijgjv_kmh-tpuvm-v6e-32-spot-gzy-tq1pg4_asia-northeast1-b__b_lr_ep_eval # [150K steps] [correct frozen, 12+6, freeze text embed, vision encoder lr scale 5.0] 1d-MAE-B 3cap + genomeQA + renderedtext + grounded cap + detect + textcaps + tallyqa + dvqa [50, 12, 5, 20, 1.7, 5.4, 5.4, 0.1, 0.25, 2.3], pure und baseline, moun 2e-4 wd0.05 const schedule
+load_from_pretrained: /kmh-nfs-ssd-us-mount/logs/sqa/paligemma-baseline/20260516_163958_stzgus_kmh-tpuvm-v5p-64-kangyang-948c6f_us-east5-a__b_lr_ep_eval # [150K steps] [correct frozen, 15+3, freeze text embed, vision encoder lr scale 5.0] 1d-MAE-B 3cap + genomeQA + renderedtext + grounded cap + detect + textcaps + tallyqa + dvqa [50, 12, 5, 20, 1.7, 5.4, 5.4, 0.1, 0.25, 2.3], pure und baseline, moun 2e-4 wd0.05 const schedule
+
+
+logging:
+    use_wandb: True
+    wandb_project: 'paligemma-baseline'
+    wandb_entity: 'sqa24-massachusetts-institute-of-technology'
+    wandb_tags:
+        - sqa
+        - finetune
+    wandb_notes: "[finetune llava-ov1.5 + vqav2] 15+3 freeze embed, encoder lr 5x baseline. muon 1e-4 wd0.02 cos decay 90000 steps"

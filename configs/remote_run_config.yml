@@ -1,0 +1,132 @@
+model:
+    patch_size: 16
+    num_learnable_tokens: 256 # K
+    feature_dim: 768
+
+    # masking config
+    mask_strategy: "diy" # square, uniform, exp, diy
+    und_use_mask: False
+    recon_use_mask: False
+
+    # # encoder (MAE-L)
+    # enc_hidden_dim: 1024
+    # enc_num_patch_sa_layers: 6
+    # enc_num_cross_attn_layers: 12
+    # enc_num_token_sa_layers: 6
+    # encoder (MAE-B)
+    enc_hidden_dim: 768
+    enc_num_patch_sa_layers: 3
+    enc_num_cross_attn_layers: 6
+    enc_cross_attn_split: 3
+    enc_num_token_sa_layers: 3
+    # decoder
+    dec_hidden_dim: 512 # MAE default setting
+    dec_num_layers: 6
+
+    lm_backbone_str: "gemma3_270M"
+    projector_use_ln: True
+    attn_logits_soft_cap: 50.0
+    final_logit_softcap: 30.0
+    use_2l_mlp: True
+
+    txt_feature_layer: 12 # gemma3-270M has 18 layers
+
+    # Loss weights
+    vlm_loss_weight: 1.0 # the normal image-conditioned NTP
+    text_only_loss_weight: 0.0  # text-only NTP (unconditional branch; ignored when alpha=0)
+    cfg_loss_weight: 0.0        # CFG-style contrastive loss  (ignored when alpha=0)
+    recon_loss_weight: 0.0      # image reconstruction MSE
+    alpha: 1.0                  # CFG contrastive α; set >0 to enable text-only forward pass
+
+dataset:
+    image_size: 256
+    max_txt_length: 256
+    items:
+        - laion-aes           # data scale: 50M
+        - cc12m               # data scale: 12M
+        # - vqav2             # data scale: 0.4M
+        - blip3o-short        # data scale: 5M
+        # - textvqa           # data scale: 0.035M
+        - rendered-text-512   # data scale: ~30M
+        - visual-genome       # data scale: 1.7M  (VQA)
+        - visual-genome-gcap  # data scale: 5.4M  (grounded caption)
+        - visual-genome-det   # data scale: 5.4M  (detect)
+        - textcaps-train      # data scale: 0.1M captions
+        - tallyqa             # data scale: 0.25M QA over 132K images
+        - dvqa-train          # data scale: 2.3M QA over 200K image
+    # mix_weights: [1]
+    # mix_weights: [50, 12, 5, 20, 28]
+    mix_weights: [50, 12, 5, 20, 1.7, 5.4, 5.4, 0.1, 0.25, 2.3]
+
+    num_workers: 16
+    prefetch_factor: 4
+
+    resize_mode: letterbox # letterbox (padding to square), stretch (resize to square)
+
+training:
+    freeze_lm: True # Important!! Modify every time.
+    lm_init_pretrained_text_layers_only: False # If on, only load text embedding layers
+    vision_encoder_lr_scale: 5.0
+    optimizer: muon
+    adam:
+        learning_rate: 0.00005
+        adam_b2: 0.95
+        weight_decay: 0.1
+    muon:
+        learning_rate: 0.0002 # pretrain
+        weight_decay: 0.05
+    
+    # grad_clip_norm: 5.0
+
+    log_per_step: 100
+    checkpoint_per_step: 15000
+    log_vis_per_step: 10000
+
+    # pretrain
+    num_steps: 150000 # train for 300M data
+    warmup_steps: 30000
+    siglip_warmup_steps: 30000
+    lr_schedule: const
+    batch_size: 1024
+    online_eval_per_step: 30000
+    online_eval_tasks: [vqav2, mme, textvqa, pope, knn_partial, refcocog, pixelbench]
+    final_eval_tasks: [vqav2, mme, textvqa, pope, knn_full, refcocog, mmbench, pixelbench]
+    siglip_from_scratch: True
+
+    sample_on_training: True
+    sample_per_step: 5000 # not used for now
+    visualize_recon_per_step: 5000 # same as sample_per_step
+    recon_per_step: 5000
+
+    seed: 42
+
+sampling:
+    max_new_tokens: 64
+    beam_size: 1
+
+eval:
+    eval_recon_tokens: [256]
+
+# set finetune: True to load finetune_config.yml instead
+finetune: True
+
+# load_from: /kmh-nfs-ssd-us-mount/logs/sqa/paligemma-baseline/20260311_013856_nhox25_kmh-tpuvm-v6e-64-spot-xiaoman-npbb3k_us-central1-b__b_lr_ep_eval
+# load_from_pretrained: /kmh-nfs-ssd-us-mount/logs/sqa/paligemma-baseline/20260305_223210_61b0w8_kmh-tpuvm-v5p-64-spot-llqju9qs3_us-central1-a__b_lr_ep_eval # muon 2e-4 baseline without VQA pretrain
+
+# sharding: hsdp # ddp, hsdp, fsdp
+
+logging:
+    use_wandb: True
+    wandb_project: 'paligemma-baseline' # change to your wandb project
+    wandb_entity: 'sqa24-massachusetts-institute-of-technology' # paste your wandb entity here
+    wandb_tags: # use your own tags
+        - lyy
+    wandb_notes: "pretrain lyy, simplify, fix weight decay"
+
+
+# load_from: /kmh-nfs-ssd-us-mount/logs/sqa/paligemma-baseline/20260505_031911_q20fww_kmh-tpuvm-v6e-32-spot-gzy-0g6ho3_asia-northeast1-b__b_lr_ep_eval
+# load_from: /kmh-nfs-ssd-us-mount/logs/sqa/paligemma-baseline/20260219_172229_dc4p6f_kmh-tpuvm-v6e-64-spot-sqazkcq0k_us-central1-b__b_lr_ep_eval
+# eval_only: True
+# eval_show_sample: True
+
+# wandb_resume_id: smbd9pmu

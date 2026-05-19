@@ -1,0 +1,1032 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>4-Trunk VLM — Hybrid Design (extending brainstorm/07 with prompt-aware vision re-encoding)</title>
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --muted: #555;
+    --bg: #fdfdfc;
+    --accent: #8a3324;
+    --accent2: #1a4f72;
+    --rule: #ddd;
+    --code-bg: #f4f1ec;
+    --note-bg: #fdf6e3;
+    --idea-bg: #f0f6f4;
+    --color-image:  #7CB342;
+    --color-image2: #2E7D32;
+    --color-text:   #4A90E2;
+    --color-response: #FF8A65;
+    --color-frozen:  #BDBDBD;
+    --color-trained: #E94B3C;
+  }
+  html { font-size: 16px; }
+  body {
+    max-width: 920px;
+    margin: 3rem auto;
+    padding: 0 1.25rem 4rem;
+    font-family: "Charter", "Iowan Old Style", Georgia, "Times New Roman", serif;
+    color: var(--fg);
+    background: var(--bg);
+    line-height: 1.6;
+  }
+  h1, h2, h3 {
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.25;
+    color: var(--fg);
+  }
+  h1 { font-size: 1.9rem; margin-top: 0; border-bottom: 2px solid var(--fg); padding-bottom: 0.5rem; }
+  h2 { font-size: 1.4rem; margin-top: 2.4rem; color: var(--accent); border-bottom: 1px solid var(--rule); padding-bottom: 0.3rem; }
+  h3 { font-size: 1.05rem; margin-top: 1.4rem; color: var(--accent2); }
+  p { margin: 0.6rem 0; }
+  code {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    background: var(--code-bg);
+    padding: 0.1em 0.35em;
+    border-radius: 3px;
+    font-size: 0.88em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 0.9rem 1.1rem;
+    border-radius: 4px;
+    overflow-x: auto;
+    font-size: 0.85rem;
+    line-height: 1.45;
+  }
+  hr { border: none; border-top: 1px solid var(--rule); margin: 2rem 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1rem 0;
+    font-size: 0.92rem;
+    font-variant-numeric: tabular-nums;
+  }
+  th, td {
+    border: 1px solid var(--rule);
+    padding: 0.5rem 0.7rem;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--code-bg); font-weight: 600; }
+  ul { padding-left: 1.4rem; }
+  li { margin: 0.3rem 0; }
+  blockquote {
+    border-left: 3px solid var(--accent);
+    margin: 1rem 0;
+    padding: 0.2rem 1rem;
+    color: var(--muted);
+    font-style: italic;
+  }
+  .meta { color: var(--muted); font-size: 0.9rem; margin-top: -0.5rem; }
+  .footnote { font-size: 0.85rem; color: var(--muted); margin-top: 0.4rem; }
+  .context {
+    background: var(--idea-bg);
+    border-left: 4px solid var(--accent2);
+    border-radius: 0 4px 4px 0;
+    padding: 0.8rem 1.1rem;
+    font-size: 0.93rem;
+    margin: 0.9rem 0 1.2rem;
+  }
+  .context strong { color: #000; }
+  .figure {
+    text-align: center;
+    margin: 1.8rem 0;
+  }
+  .figure svg {
+    max-width: 100%;
+    height: auto;
+    background: #fafaf7;
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    padding: 1rem;
+  }
+  .caption {
+    font-size: 0.9rem;
+    color: var(--muted);
+    margin: 0.5rem 0 1rem;
+    text-align: center;
+  }
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.7rem 1.5rem;
+    background: #fafaf7;
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 0.7rem 1rem;
+    margin: 0.6rem 0 1rem;
+    font-size: 0.85rem;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .legend-swatch {
+    width: 22px;
+    height: 16px;
+    border-radius: 3px;
+    border: 1px solid rgba(0,0,0,0.2);
+  }
+  strong { color: #000; }
+  .running-example {
+    background: var(--note-bg);
+    border-left: 4px solid #b58900;
+    border-radius: 0 4px 4px 0;
+    padding: 0.8rem 1.1rem;
+    margin: 0.8rem 0 1.2rem;
+  }
+  .running-example strong { color: #000; }
+</style>
+</head>
+<body>
+
+<h1>4-Trunk VLM — Hybrid Design (Image · Prompt · Image-again · Answer)</h1>
+<p class="meta">Extending the 3-trunk hybrid from <a href="07_3trunk_hybrid_variant.html">brainstorm/07</a> with a second, prompt-aware vision encoding</p>
+
+<div class="context">
+<strong>Context for this document.</strong> <a href="07_3trunk_hybrid_variant.html">Brainstorm/07</a> proposed a 3-trunk hybrid: <strong>ViT + Q-Former + Linear → frozen lower-16 LLM blocks (text encoder for [prompt | answer]) → frozen upper-8 LLM blocks (decoder)</strong>. This document extends that recipe to <strong>4 trunks</strong>: the image is "looked at twice" — first problem-blind (Trunk 1, identical to brainstorm/07), then again after the prompt has been read (Trunk 3, the new piece). The 4 trunks, in causal order, are:
+<ul style="margin: 0.4rem 0;">
+<li><strong>Trunk 1 — Image (problem-blind)</strong>: ViT → Q-Former₁ → Linear → <code>img_features_1</code>. Same as brainstorm/07.</li>
+<li><strong>Trunk 2 — Text encoder</strong>: lower 16 frozen LLM blocks on <code>[prompt | answer]</code> → <code>text_features</code>. Same as brainstorm/07.</li>
+<li><strong>Trunk 3 — Image (prompt-aware) — NEW</strong>: a <em>second</em> Q-Former with cross-attention to <code>prompt_features</code> takes the ViT output and produces a refined <code>img_features_2</code>.</li>
+<li><strong>Trunk 4 — Decoder</strong>: upper 8 frozen LLM blocks on <code>concat(img_features_1, prompt_features, img_features_2, answer_features)</code>. Same backbone as brainstorm/07; just a longer concatenated input.</li>
+</ul>
+The trunks are causally ordered: each can attend to all earlier trunks but not to future ones. Compared to brainstorm/07, the only new trained module is the second Q-Former with prompt cross-attention; the frozen-LLM property and the depth-split structure are preserved.
+</div>
+
+<div class="running-example">
+<strong>Running example used throughout</strong> (same as brainstorm/07):
+<ul style="margin: 0.3rem 0;">
+  <li><strong>Image:</strong> 3 × 224 × 224 RGB photo of a black cat</li>
+  <li><strong>Prompt:</strong> <code>"What color is the cat?"</code> → L_txt = 6 tokens</li>
+  <li><strong>Target answer:</strong> <code>"The cat is black."</code> → L_ans = 5 tokens</li>
+</ul>
+<p style="margin:0.3rem 0;"><strong>Intuition for the 4th trunk.</strong> Trunk 1 produces a problem-blind compressed view of the cat-on-chair scene. After the prompt is encoded in Trunk 2, Trunk 3 re-runs vision compression with prompt awareness — its 64 query tokens now know "the question is about color," so they can produce visual features more focused on cat-color-relevant regions. Trunk 4 then generates the answer using both views (broad first look + focused second look) plus the prompt.</p>
+</div>
+
+<h3>Reference dimensions</h3>
+
+<p>Same as <a href="07_3trunk_hybrid_variant.html">brainstorm/07</a>, with one addition for Trunk 3:</p>
+
+<table>
+  <thead><tr><th>Symbol</th><th>Value</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>P</code></td><td>14</td><td>Patch size</td></tr>
+    <tr><td><code>N_patch</code></td><td>256</td><td>Number of ViT patches (16×16)</td></tr>
+    <tr><td><code>D_img</code></td><td>1024</td><td>ViT hidden dim</td></tr>
+    <tr><td><code>L_img</code></td><td>64</td><td>Q-Former query count (same for Q-Former₁ and Q-Former₂)</td></tr>
+    <tr><td><code>D_txt</code></td><td>4096</td><td>LLM hidden dim</td></tr>
+    <tr><td><code>L_txt</code></td><td>6</td><td>Prompt length</td></tr>
+    <tr><td><code>L_ans</code></td><td>5</td><td>Answer length</td></tr>
+    <tr><td><code>L_low</code></td><td>16</td><td>Lower LLM blocks (text encoder)</td></tr>
+    <tr><td><code>L_high</code></td><td>8</td><td>Upper LLM blocks (decoder)</td></tr>
+    <tr><td><code>L_qf2</code></td><td>4</td><td><strong>NEW</strong> — number of blocks in the second Q-Former (Trunk 3)</td></tr>
+  </tbody>
+</table>
+
+<div class="legend">
+<div class="legend-item"><div class="legend-swatch" style="background: #7CB342;"></div>Trunk 1: Image (problem-blind)</div>
+<div class="legend-item"><div class="legend-swatch" style="background: #4A90E2;"></div>Trunk 2: Prompt</div>
+<div class="legend-item"><div class="legend-swatch" style="background: #2E7D32;"></div>Trunk 3: Image (prompt-aware)</div>
+<div class="legend-item"><div class="legend-swatch" style="background: #FF8A65;"></div>Trunk 4: Answer</div>
+<div class="legend-item"><div class="legend-swatch" style="background: #BDBDBD;"></div>Frozen module</div>
+<div class="legend-item"><div class="legend-swatch" style="background: #E94B3C;"></div>Trained module</div>
+</div>
+
+<hr>
+
+<h2>1. Pipeline at a glance</h2>
+
+<pre><code>(Trunk 1) Image (problem-blind)
+     (3, 224, 224)
+  → ViT-Large + Q-Former₁ + Linear  (TRAINED)
+                    →  img_features_1   (L_img = 64,  D_txt = 4096)
+
+(Trunk 2) Text encoder
+     [prompt | answer]               # 6 + 5 = 11 ids
+  → embed → LLM blocks 1 → 16 (FROZEN, causal)
+                    →  text_features   (11, 4096)
+        split:  prompt_features = text_features[:6]
+                answer_features = text_features[6:]
+
+(Trunk 3) Image (prompt-aware)  ← NEW
+     reuse ViT output  +  prompt_features
+  → Q-Former₂  (TRAINED, 4 blocks; queries cross-attend to ViT output and to prompt_features)
+  → Linear₂  (TRAINED)
+                    →  img_features_2   (L_img = 64,  D_txt = 4096)
+
+(Trunk 4) Decoder
+     concat(img_features_1, prompt_features, img_features_2, answer_features)
+                    →  (64 + 6 + 64 + 5, 4096)  =  (139, 4096)
+  → LLM blocks 17 → 24 (FROZEN, prefix-LM mask with trunk-causal ordering)
+  → LM Head (FROZEN)
+                    →  next-token logits on the answer slice (NTP loss)
+</code></pre>
+
+<p>Three things to flag up front:</p>
+<ul>
+  <li><strong>Only Trunk 3 is new.</strong> Trunks 1, 2, 4 are structurally identical to brainstorm/07; just the decoder's input sequence is longer because <code>img_features_2</code> sits between the prompt and the answer.</li>
+  <li><strong>Q-Former₂ is the only new trained module.</strong> It re-uses the ViT output from Trunk 1 (no second ViT pass), and it cross-attends to <code>prompt_features</code> (no second text encoder pass). So the only extra training cost is ~30M params for the 4-block Q-Former₂.</li>
+  <li><strong>The frozen-LLM property and the depth-split are preserved.</strong> The full LLM (embed, all 24 blocks, LM head) stays frozen. End-to-end the text path traverses all 24 LLM blocks; the image path traverses only the upper 8.</li>
+</ul>
+
+<hr>
+
+<h2>2. Trunks 1 and 2 — recap (unchanged from brainstorm/07)</h2>
+
+<p>For full detail of Trunks 1 and 2 see <a href="07_3trunk_hybrid_variant.html">brainstorm/07</a>. Here's just the summary of what they produce:</p>
+
+<div class="figure">
+<svg width="1000" height="280" viewBox="0 0 1000 280" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="rec" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#666"/>
+    </marker>
+  </defs>
+
+  <text x="500" y="22" text-anchor="middle" font-family="-apple-system, sans-serif" font-size="14" font-weight="600" fill="#1a1a1a">Trunks 1 &amp; 2 outputs (recap from brainstorm/07)</text>
+
+  <!-- Trunk 1 -->
+  <g transform="translate(20, 60)">
+    <rect x="0" y="0" width="440" height="60" rx="6" fill="#7CB342" opacity="0.85" stroke="#E94B3C" stroke-width="3" stroke-dasharray="6,3"/>
+    <text x="220" y="22" text-anchor="middle" font-size="12" font-weight="600" fill="white">Trunk 1: ViT-Large + Q-Former₁ + Linear  (TRAINED)</text>
+    <text x="220" y="42" text-anchor="middle" font-size="10" fill="white">Image (3,224,224) → 256 patches → 64 compressed visual tokens → projected to D_txt</text>
+  </g>
+  <!-- Trunk 2 -->
+  <g transform="translate(540, 60)">
+    <rect x="0" y="0" width="440" height="60" rx="6" fill="#4A90E2" opacity="0.85" stroke="#BDBDBD" stroke-width="3"/>
+    <text x="220" y="22" text-anchor="middle" font-size="12" font-weight="600" fill="white">Trunk 2: Embed + LLM Layers 1 → 16  (FROZEN, CAUSAL)</text>
+    <text x="220" y="42" text-anchor="middle" font-size="10" fill="white">Text [prompt | answer] → 11 token ids → 11 D_txt-dim text features</text>
+  </g>
+
+  <line x1="240" y1="120" x2="240" y2="155" stroke="#666" stroke-width="2" marker-end="url(#rec)"/>
+  <line x1="760" y1="120" x2="760" y2="155" stroke="#666" stroke-width="2" marker-end="url(#rec)"/>
+
+  <!-- img_features_1 sequence -->
+  <g transform="translate(0, 165)">
+    <g transform="translate(168, 0)">
+      <rect x="0"   y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="21"  y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="42"  y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <text x="76" y="14" text-anchor="middle" font-size="14" fill="#666">⋯</text>
+      <rect x="92"  y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="113" y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="134" y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+    </g>
+    <text x="240" y="36" text-anchor="middle" font-size="11" font-weight="600" fill="#1a1a1a">img_features_1  (64, 4096)</text>
+  </g>
+
+  <!-- text_features sequence -->
+  <g transform="translate(0, 165)">
+    <g transform="translate(646, 0)">
+      <rect x="0"   y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="21"  y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="42"  y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="63"  y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="84"  y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="105" y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="129" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+      <rect x="150" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+      <rect x="171" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+      <rect x="192" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+      <rect x="213" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+    </g>
+    <text x="760" y="36" text-anchor="middle" font-size="11" font-weight="600" fill="#1a1a1a">text_features (11, 4096)</text>
+    <text x="760" y="50" text-anchor="middle" font-size="9" fill="#888">[ prompt_features (6) | answer_features (5) ]</text>
+  </g>
+
+  <text x="500" y="245" text-anchor="middle" font-size="11" fill="#555" font-style="italic">Trunk 1 also exposes its intermediate ViT output (256, 1024) — re-used by Trunk 3 below.</text>
+</svg>
+</div>
+
+<p class="caption">Recap of brainstorm/07 outputs: <code>img_features_1 (64, 4096)</code> from Trunk 1, and <code>text_features (11, 4096) = [prompt_features | answer_features]</code> from Trunk 2. The intermediate ViT output <code>(256, 1024)</code> is also re-used by Trunk 3 below — no second ViT pass.</p>
+
+<hr>
+
+<h2>3. Trunk 3 — Prompt-aware vision re-encoding (NEW)</h2>
+
+<p>Trunk 3's job is to produce a <em>second</em> compressed visual sequence that has been refined with knowledge of the prompt. Architecturally, it is a Q-Former with one extra cross-attention per block — the queries now attend to both the ViT output (the visual content) and <code>prompt_features</code> (the question context). Output shape matches <code>img_features_1</code> so the decoder treats both visual sequences uniformly.</p>
+
+<div class="figure">
+<svg width="1000" height="700" viewBox="0 0 1000 700" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="t3ar" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#666"/>
+    </marker>
+    <marker id="t3arg" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#558B2F"/>
+    </marker>
+    <marker id="t3arb" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1976D2"/>
+    </marker>
+  </defs>
+
+  <text x="500" y="22" text-anchor="middle" font-family="-apple-system, sans-serif" font-size="15" font-weight="600" fill="#1a1a1a">Trunk 3 — Q-Former₂ with prompt cross-attention  (TRAINED)</text>
+
+  <!-- Two parallel input sequences at top -->
+  <!-- ViT output on the left -->
+  <g transform="translate(50, 55)">
+    <text x="100" y="0" text-anchor="middle" font-size="10" fill="#888">re-used from Trunk 1 (intermediate, before Q-Former₁):</text>
+    <g transform="translate(28, 12)">
+      <rect x="0"   y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="21"  y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="42"  y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <text x="76" y="14" text-anchor="middle" font-size="14" fill="#666">⋯</text>
+      <rect x="92"  y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="113" y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="134" y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+    </g>
+    <text x="100" y="50" text-anchor="middle" font-size="10" fill="#1a1a1a">ViT output  (256, 1024)</text>
+  </g>
+
+  <!-- prompt_features on the right -->
+  <g transform="translate(700, 55)">
+    <text x="120" y="0" text-anchor="middle" font-size="10" fill="#888">prompt slice from Trunk 2:</text>
+    <g transform="translate(57, 12)">
+      <rect x="0"   y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="21"  y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="42"  y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="63"  y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="84"  y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="105" y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+    </g>
+    <text x="120" y="50" text-anchor="middle" font-size="10" fill="#1a1a1a">prompt_features  (6, 4096)</text>
+  </g>
+
+  <!-- arrows down to Q-Former₂ -->
+  <line x1="150" y1="115" x2="320" y2="170" stroke="#7CB342" stroke-width="2" marker-end="url(#t3arg)"/>
+  <line x1="820" y1="115" x2="680" y2="170" stroke="#4A90E2" stroke-width="2" marker-end="url(#t3arb)"/>
+
+  <!-- Q-Former₂ box (with M=64 internal queries shown) -->
+  <g transform="translate(110, 175)">
+    <rect x="0" y="0" width="780" height="195" rx="8" fill="#2E7D32" opacity="0.85" stroke="#E94B3C" stroke-width="3" stroke-dasharray="6,3"/>
+    <text x="390" y="24" text-anchor="middle" font-size="13" font-weight="600" fill="white">Q-Former₂  (TRAINED, L_qf2 = 4 blocks)  —  M = 64 learnable queries (own, separate from Q-Former₁)</text>
+    <text x="390" y="46" text-anchor="middle" font-size="11" fill="white">For each of 4 blocks:</text>
+    <text x="390" y="64" text-anchor="middle" font-size="10" fill="#fff">  • Self-Attention over the M queries</text>
+    <text x="390" y="80" text-anchor="middle" font-size="10" fill="#fff">  • Cross-Attention from queries → ViT output       (queries pull visual content)</text>
+    <text x="390" y="96" text-anchor="middle" font-size="10" fill="#fff">  • Cross-Attention from queries → prompt_features  (queries see the question — this is the new piece)</text>
+    <text x="390" y="112" text-anchor="middle" font-size="10" fill="#fff">  • FFN (SwiGLU)</text>
+    <text x="390" y="138" text-anchor="middle" font-size="10" fill="#fff8" font-style="italic">Compared to Q-Former₁: same query count and per-block cost,</text>
+    <text x="390" y="152" text-anchor="middle" font-size="10" fill="#fff8" font-style="italic">plus one extra cross-attention per block (prompt KV is small: 6 tokens).</text>
+    <text x="390" y="178" text-anchor="middle" font-size="10" fill="#fff">~30M trainable params (4 blocks × ~8M per block)</text>
+  </g>
+
+  <line x1="500" y1="370" x2="500" y2="395" stroke="#666" stroke-width="2" marker-end="url(#t3ar)"/>
+
+  <!-- Q-Former₂ output: 64 darker-green squares -->
+  <g transform="translate(0, 405)">
+    <g transform="translate(428, 0)">
+      <rect x="0"   y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="21"  y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="42"  y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <text x="76" y="14" text-anchor="middle" font-size="14" fill="#666">⋯</text>
+      <rect x="92"  y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="113" y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="134" y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+    </g>
+    <text x="500" y="36" text-anchor="middle" font-size="10" fill="#1a1a1a">prompt-aware compressed visual seq  (L_img = 64, D_img = 1024)</text>
+  </g>
+
+  <line x1="500" y1="450" x2="500" y2="475" stroke="#666" stroke-width="2" marker-end="url(#t3ar)"/>
+
+  <!-- Linear projection box -->
+  <g transform="translate(330, 480)">
+    <rect x="0" y="0" width="340" height="40" rx="6" fill="#fff" stroke="#E94B3C" stroke-width="2.5" stroke-dasharray="6,3"/>
+    <text x="170" y="18" text-anchor="middle" font-size="11" font-weight="600" fill="#1a1a1a">Linear projection₂  (TRAINED)</text>
+    <text x="170" y="33" text-anchor="middle" font-size="9" fill="#666">D_img = 1024  →  D_txt = 4096   (separate weights from Linear₁)</text>
+  </g>
+
+  <line x1="500" y1="520" x2="500" y2="545" stroke="#666" stroke-width="2" marker-end="url(#t3ar)"/>
+
+  <!-- img_features_2 sequence -->
+  <g transform="translate(0, 555)">
+    <g transform="translate(428, 0)">
+      <rect x="0"   y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="21"  y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="42"  y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <text x="76" y="14" text-anchor="middle" font-size="14" fill="#666">⋯</text>
+      <rect x="92"  y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="113" y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="134" y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+    </g>
+    <text x="500" y="36" text-anchor="middle" font-size="11" fill="#1a1a1a" font-weight="600">img_features_2  (L_img = 64, D_txt = 4096)   → to Trunk 4</text>
+    <text x="500" y="52" text-anchor="middle" font-size="9" fill="#888">same shape as img_features_1, but prompt-aware (darker green to distinguish in later figures)</text>
+  </g>
+
+  <text x="500" y="685" text-anchor="middle" font-size="11" fill="#555" font-style="italic">No second ViT pass and no second text-encoder pass — Trunk 3 only adds one trained module (Q-Former₂) and a small linear projection.</text>
+</svg>
+</div>
+
+<p class="caption">Figure 1: Trunk 3, top-to-bottom. Two input sequences arrive: the intermediate <code>ViT output (256, 1024)</code> from Trunk 1 and <code>prompt_features (6, 4096)</code> from Trunk 2. The new Q-Former₂ has its own 64 learnable queries and runs 4 transformer-style blocks; each block does self-attention over the queries, cross-attention from queries to ViT output (visual content), cross-attention from queries to <code>prompt_features</code> (question context), and an FFN. The output is projected via a separate Linear₂ to <code>img_features_2 (64, 4096)</code> — same shape as <code>img_features_1</code> from Trunk 1, but now refined with knowledge of the question. Trainable params added: ~30M Q-Former₂ + ~4M Linear₂.</p>
+
+<h3>3.1 Cheaper alternative: Mechanism α (no extra params)</h3>
+
+<p>If you want the cheapest possible 4-trunk extension, you can set <code>img_features_2 = img_features_1</code> and skip Q-Former₂ entirely (zero new parameters; Trunk 3 just re-references Trunk 1's output). The two visual encodings then start identical at the decoder input but diverge inside the upper 8 LLM blocks because they sit at different sequence positions: <code>img_features_1</code> attends to nothing else, while <code>img_features_2</code> attends to <code>prompt_features</code> via the LLM's self-attention. This mirrors Mechanism α from <a href="06_4trunk_concrete_design.html">brainstorm/06</a> and is the strict zero-cost baseline. The pseudocode and figures below show the full Mechanism β version (with Q-Former₂); switching to α just deletes Q-Former₂ and aliases <code>img_features_2</code> to <code>img_features_1</code>.</p>
+
+<hr>
+
+<h2>4. Trunk 4 — Decoder with 4-way concat</h2>
+
+<p>Same upper 8 frozen LLM blocks as in brainstorm/07. The only change is that the input is now a four-way concatenation in causal trunk order: <code>[img_features_1 | prompt_features | img_features_2 | answer_features]</code>. The mask preserves the trunk ordering so each trunk only sees earlier ones (and within the answer, attention is causal).</p>
+
+<div class="figure">
+<svg width="1000" height="660" viewBox="0 0 1000 660" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="t4ar" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#666"/>
+    </marker>
+    <marker id="t4arg1" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#558B2F"/>
+    </marker>
+    <marker id="t4arb" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1976D2"/>
+    </marker>
+    <marker id="t4arg2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1B5E20"/>
+    </marker>
+    <marker id="t4aro" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#D84315"/>
+    </marker>
+  </defs>
+
+  <text x="500" y="22" text-anchor="middle" font-family="-apple-system, sans-serif" font-size="15" font-weight="600" fill="#1a1a1a">Trunk 4 — Decoder  (FROZEN: upper 8 LLM blocks; nothing new inside)</text>
+
+  <!-- Four parallel input sequences at top -->
+  <!-- img_features_1 -->
+  <g transform="translate(20, 55)">
+    <text x="120" y="0" text-anchor="middle" font-size="10" fill="#888">from Trunk 1:</text>
+    <g transform="translate(48, 12)">
+      <rect x="0"   y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="21"  y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="42"  y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <text x="76" y="14" text-anchor="middle" font-size="14" fill="#666">⋯</text>
+      <rect x="92"  y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="113" y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="134" y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+    </g>
+    <text x="120" y="50" text-anchor="middle" font-size="10" fill="#1a1a1a">img_features_1  (64, 4096)</text>
+  </g>
+  <!-- prompt_features -->
+  <g transform="translate(280, 55)">
+    <text x="100" y="0" text-anchor="middle" font-size="10" fill="#888">from Trunk 2:</text>
+    <g transform="translate(34, 12)">
+      <rect x="0"   y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="21"  y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="42"  y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="63"  y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="84"  y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="105" y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+    </g>
+    <text x="100" y="50" text-anchor="middle" font-size="10" fill="#1a1a1a">prompt_features (6, 4096)</text>
+  </g>
+  <!-- img_features_2 -->
+  <g transform="translate(520, 55)">
+    <text x="120" y="0" text-anchor="middle" font-size="10" fill="#888">from Trunk 3:</text>
+    <g transform="translate(48, 12)">
+      <rect x="0"   y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="21"  y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="42"  y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <text x="76" y="14" text-anchor="middle" font-size="14" fill="#666">⋯</text>
+      <rect x="92"  y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="113" y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="134" y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+    </g>
+    <text x="120" y="50" text-anchor="middle" font-size="10" fill="#1a1a1a">img_features_2 (64, 4096)</text>
+  </g>
+  <!-- answer_features -->
+  <g transform="translate(780, 55)">
+    <text x="100" y="0" text-anchor="middle" font-size="10" fill="#888">answer slice from Trunk 2:</text>
+    <g transform="translate(46, 12)">
+      <rect x="0"  y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+      <rect x="21" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+      <rect x="42" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+      <rect x="63" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+      <rect x="84" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+    </g>
+    <text x="100" y="50" text-anchor="middle" font-size="10" fill="#1a1a1a">answer_features (5, 4096)</text>
+  </g>
+
+  <!-- Convergence arrows (4 lanes → concat band) -->
+  <line x1="140" y1="115" x2="290" y2="195" stroke="#7CB342" stroke-width="2" marker-end="url(#t4arg1)"/>
+  <line x1="380" y1="115" x2="430" y2="195" stroke="#4A90E2" stroke-width="2" marker-end="url(#t4arb)"/>
+  <line x1="640" y1="115" x2="570" y2="195" stroke="#2E7D32" stroke-width="2" marker-end="url(#t4arg2)"/>
+  <line x1="880" y1="115" x2="710" y2="195" stroke="#FF8A65" stroke-width="2" marker-end="url(#t4aro)"/>
+
+  <!-- Concat sequence -->
+  <g transform="translate(0, 200)">
+    <text x="500" y="-3" text-anchor="middle" font-size="10" fill="#888">concatenate along sequence dim, in causal trunk order</text>
+    <g transform="translate(176, 5)">
+      <!-- Trunk 1: 6 light-green (with ⋯) -->
+      <rect x="0"   y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="21"  y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="42"  y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <text x="76" y="14" text-anchor="middle" font-size="14" fill="#666">⋯</text>
+      <rect x="92"  y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="113" y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="134" y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <!-- Trunk 2: 6 blue (with small gap) -->
+      <rect x="161" y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="182" y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="203" y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="224" y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="245" y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="266" y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <!-- Trunk 3: 6 darker-green -->
+      <rect x="293" y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="314" y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="335" y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <text x="369" y="14" text-anchor="middle" font-size="14" fill="#666">⋯</text>
+      <rect x="385" y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="406" y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="427" y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <!-- Trunk 4: 5 orange -->
+      <rect x="454" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+      <rect x="475" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+      <rect x="496" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+      <rect x="517" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+      <rect x="538" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+    </g>
+    <text x="500" y="40" text-anchor="middle" font-size="10" fill="#1a1a1a">[ img_features_1 | prompt_features | img_features_2 | answer_features ]   (64+6+64+5, 4096) = (139, 4096)</text>
+    <text x="500" y="56" text-anchor="middle" font-size="9" fill="#888" font-style="italic">Mask: each non-answer trunk bidirectional within itself; causal between trunks; answer fully causal</text>
+  </g>
+
+  <line x1="500" y1="265" x2="500" y2="290" stroke="#666" stroke-width="2" marker-end="url(#t4ar)"/>
+
+  <!-- Decoder box -->
+  <g transform="translate(180, 295)">
+    <rect x="0" y="0" width="640" height="80" rx="6" fill="#FF8A65" opacity="0.85" stroke="#BDBDBD" stroke-width="3"/>
+    <text x="320" y="22" text-anchor="middle" font-size="13" font-weight="600" fill="white">LLM Layers 17 → 24  (FROZEN)  —  the "Decoder",  D_dec = D_txt = 4096</text>
+    <text x="320" y="42" text-anchor="middle" font-size="10" fill="white">8 transformer blocks · self-attn (4-trunk causal mask above) · FFN  ·  shape preserved (139, 4096)</text>
+    <text x="320" y="60" text-anchor="middle" font-size="10" fill="#fff8" font-style="italic">no new modules; both image trunks ride through as extra prefix tokens around the prompt</text>
+  </g>
+
+  <line x1="500" y1="375" x2="500" y2="400" stroke="#666" stroke-width="2" marker-end="url(#t4ar)"/>
+
+  <!-- Decoder output sequence (139, 4096) — same 4-color row -->
+  <g transform="translate(0, 410)">
+    <g transform="translate(176, 0)">
+      <rect x="0"   y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="21"  y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="42"  y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <text x="76" y="14" text-anchor="middle" font-size="14" fill="#666">⋯</text>
+      <rect x="92"  y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="113" y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="134" y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="161" y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="182" y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="203" y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="224" y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="245" y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="266" y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="293" y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="314" y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="335" y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <text x="369" y="14" text-anchor="middle" font-size="14" fill="#666">⋯</text>
+      <rect x="385" y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="406" y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="427" y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="454" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+      <rect x="475" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+      <rect x="496" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+      <rect x="517" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+      <rect x="538" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+    </g>
+    <text x="500" y="36" text-anchor="middle" font-size="10" fill="#1a1a1a">decoder output  (139, 4096)</text>
+  </g>
+
+  <text x="500" y="475" text-anchor="middle" font-size="10" fill="#8a3324" font-style="italic">only the orange (answer) slice is fed to the LM head for NTP</text>
+
+  <line x1="730" y1="430" x2="730" y2="500" stroke="#FF8A65" stroke-width="2" stroke-dasharray="4,3" marker-end="url(#t4aro)"/>
+
+  <!-- LM head box -->
+  <g transform="translate(560, 505)">
+    <rect x="0" y="0" width="340" height="40" rx="6" fill="#fff" stroke="#BDBDBD" stroke-width="2.5"/>
+    <text x="170" y="18" text-anchor="middle" font-size="11" font-weight="600" fill="#1a1a1a">LM Head  (FROZEN)</text>
+    <text x="170" y="33" text-anchor="middle" font-size="9" fill="#666">D_dec = 4096  →  vocab</text>
+  </g>
+
+  <line x1="730" y1="545" x2="730" y2="565" stroke="#666" stroke-width="2" marker-end="url(#t4ar)"/>
+
+  <!-- Predicted next token -->
+  <g transform="translate(0, 570)">
+    <g transform="translate(695, 0)">
+      <rect x="0" y="0" width="70" height="22" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+      <text x="35" y="16" text-anchor="middle" font-size="10" fill="white" font-family="monospace">"black"</text>
+    </g>
+    <text x="730" y="42" text-anchor="middle" font-size="10" fill="#1a1a1a">next answer token (one per autoregressive step)</text>
+  </g>
+
+  <!-- Loss callout -->
+  <g transform="translate(20, 505)">
+    <rect x="0" y="0" width="340" height="65" rx="6" fill="#fff" stroke="#8a3324" stroke-width="1.5"/>
+    <text x="170" y="20" text-anchor="middle" font-size="11" font-weight="600" fill="#8a3324">NTP cross-entropy loss</text>
+    <text x="170" y="38" text-anchor="middle" font-size="10" fill="#555">computed on the answer slice only (orange tokens)</text>
+    <text x="170" y="54" text-anchor="middle" font-size="9" fill="#888" font-style="italic">L = − Σ_t log P(answer_t | image, prompt, image-again, answer_{&lt;t})</text>
+  </g>
+</svg>
+</div>
+
+<p class="caption">Figure 2: Trunk 4 (decoder), top-to-bottom. Four input sequences arrive — the two image features (light green from Trunk 1, dark green from Trunk 3) and the prompt/answer slices (blue and orange) of <code>text_features</code>. They are concatenated in causal trunk order into a 139-token sequence at D=4096 and pushed through the upper 8 frozen LLM blocks. The mask preserves the trunk ordering: <code>img_features_1</code> attends only to itself; <code>prompt_features</code> attends to img_1; <code>img_features_2</code> attends to img_1 + prompt; <code>answer_features</code> is causal and attends to all three earlier trunks. Only the orange answer slice is fed to the LM head.</p>
+
+<hr>
+
+<h2>5. End-to-end pipeline</h2>
+
+<div class="figure">
+<svg width="1000" height="800" viewBox="0 0 1000 800" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="eAr" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#666"/>
+    </marker>
+    <marker id="eArred" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#8a3324"/>
+    </marker>
+  </defs>
+
+  <text x="500" y="22" text-anchor="middle" font-family="-apple-system, sans-serif" font-size="16" font-weight="600" fill="#1a1a1a">End-to-end 4-trunk pipeline (training-time view, running example)</text>
+
+  <!-- TOP ROW: Image lane (left), Text lane (right) -->
+  <text x="240" y="55" text-anchor="middle" font-size="12" font-weight="600" fill="#558B2F">Trunk 1 — Image lane</text>
+  <text x="760" y="55" text-anchor="middle" font-size="12" font-weight="600" fill="#1976D2">Trunk 2 — Text lane</text>
+
+  <!-- Image input box -->
+  <g transform="translate(160, 70)">
+    <rect x="0" y="0" width="160" height="40" rx="6" fill="#fff" stroke="#7CB342" stroke-width="2"/>
+    <text x="80" y="18" text-anchor="middle" font-size="11" font-weight="600">Image (3, 224, 224)</text>
+    <text x="80" y="32" text-anchor="middle" font-size="9" fill="#888">running ex.: black cat photo</text>
+  </g>
+  <line x1="240" y1="110" x2="240" y2="130" stroke="#666" stroke-width="2" marker-end="url(#eAr)"/>
+
+  <!-- Image stack box (ViT + Q-Former₁ + Linear₁) -->
+  <g transform="translate(60, 135)">
+    <rect x="0" y="0" width="360" height="80" rx="6" fill="#7CB342" opacity="0.85" stroke="#E94B3C" stroke-width="3" stroke-dasharray="6,3"/>
+    <text x="180" y="22" text-anchor="middle" font-size="12" font-weight="600" fill="white">ViT-Large  +  Q-Former₁  +  Linear₁</text>
+    <text x="180" y="42" text-anchor="middle" font-size="10" fill="white">all TRAINED · expose ViT output for Trunk 3</text>
+    <text x="180" y="60" text-anchor="middle" font-size="10" fill="#fff8" font-style="italic">256 patches → 64 compressed tokens at D_txt = 4096</text>
+  </g>
+  <line x1="240" y1="215" x2="240" y2="235" stroke="#666" stroke-width="2" marker-end="url(#eAr)"/>
+
+  <!-- img_features_1 sequence -->
+  <g transform="translate(0, 245)">
+    <g transform="translate(168, 0)">
+      <rect x="0"   y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="21"  y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="42"  y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <text x="76" y="14" text-anchor="middle" font-size="14" fill="#666">⋯</text>
+      <rect x="92"  y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="113" y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="134" y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+    </g>
+    <text x="240" y="36" text-anchor="middle" font-size="10" fill="#1a1a1a" font-weight="600">img_features_1 (64, 4096)</text>
+  </g>
+
+  <!-- Text token row -->
+  <g transform="translate(566, 70)">
+    <rect x="0" y="0" width="388" height="40" rx="6" fill="#fff" stroke="#4A90E2" stroke-width="2"/>
+    <g transform="translate(20, 9)">
+      <rect x="0"   y="0" width="38" height="22" rx="2" fill="#4A90E2"/><text x="19" y="16" text-anchor="middle" font-size="10" fill="white" font-family="monospace">What</text>
+      <rect x="40"  y="0" width="38" height="22" rx="2" fill="#4A90E2"/><text x="59" y="16" text-anchor="middle" font-size="10" fill="white" font-family="monospace">color</text>
+      <rect x="80"  y="0" width="22" height="22" rx="2" fill="#4A90E2"/><text x="91" y="16" text-anchor="middle" font-size="10" fill="white" font-family="monospace">is</text>
+      <rect x="104" y="0" width="32" height="22" rx="2" fill="#4A90E2"/><text x="120" y="16" text-anchor="middle" font-size="10" fill="white" font-family="monospace">the</text>
+      <rect x="138" y="0" width="32" height="22" rx="2" fill="#4A90E2"/><text x="154" y="16" text-anchor="middle" font-size="10" fill="white" font-family="monospace">cat</text>
+      <rect x="172" y="0" width="14" height="22" rx="2" fill="#4A90E2"/><text x="179" y="16" text-anchor="middle" font-size="10" fill="white" font-family="monospace">?</text>
+      <line x1="194" y1="-2" x2="194" y2="24" stroke="#888" stroke-dasharray="2,2"/>
+      <rect x="200" y="0" width="32" height="22" rx="2" fill="#FF8A65"/><text x="216" y="16" text-anchor="middle" font-size="10" fill="white" font-family="monospace">The</text>
+      <rect x="234" y="0" width="32" height="22" rx="2" fill="#FF8A65"/><text x="250" y="16" text-anchor="middle" font-size="10" fill="white" font-family="monospace">cat</text>
+      <rect x="268" y="0" width="22" height="22" rx="2" fill="#FF8A65"/><text x="279" y="16" text-anchor="middle" font-size="10" fill="white" font-family="monospace">is</text>
+      <rect x="292" y="0" width="40" height="22" rx="2" fill="#FF8A65"/><text x="312" y="16" text-anchor="middle" font-size="10" fill="white" font-family="monospace">black</text>
+      <rect x="334" y="0" width="14" height="22" rx="2" fill="#FF8A65"/><text x="341" y="16" text-anchor="middle" font-size="10" fill="white" font-family="monospace">.</text>
+    </g>
+  </g>
+  <line x1="760" y1="110" x2="760" y2="130" stroke="#666" stroke-width="2" marker-end="url(#eAr)"/>
+
+  <!-- Text encoder box (Embed + LLM 1-16) -->
+  <g transform="translate(580, 135)">
+    <rect x="0" y="0" width="360" height="80" rx="6" fill="#4A90E2" opacity="0.85" stroke="#BDBDBD" stroke-width="3"/>
+    <text x="180" y="22" text-anchor="middle" font-size="12" font-weight="600" fill="white">Embed  +  LLM Layers 1 → 16</text>
+    <text x="180" y="42" text-anchor="middle" font-size="10" fill="white">all FROZEN · single causal pass over [prompt | answer]</text>
+    <text x="180" y="60" text-anchor="middle" font-size="10" fill="#fff8" font-style="italic">11 tokens at D_txt = 4096</text>
+  </g>
+  <line x1="760" y1="215" x2="760" y2="235" stroke="#666" stroke-width="2" marker-end="url(#eAr)"/>
+
+  <!-- text_features sequence -->
+  <g transform="translate(0, 245)">
+    <g transform="translate(646, 0)">
+      <rect x="0"   y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="21"  y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="42"  y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="63"  y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="84"  y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="105" y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="129" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+      <rect x="150" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+      <rect x="171" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+      <rect x="192" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+      <rect x="213" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+    </g>
+    <text x="760" y="36" text-anchor="middle" font-size="10" fill="#1a1a1a" font-weight="600">text_features (11, 4096)  =  [prompt_features | answer_features]</text>
+  </g>
+
+  <!-- ===== MIDDLE: Trunk 3 (vision refiner) ===== -->
+  <text x="500" y="320" text-anchor="middle" font-size="12" font-weight="600" fill="#1B5E20">Trunk 3 — Image (prompt-aware) lane</text>
+
+  <!-- arrows: ViT output (from inside Trunk 1 box) and prompt_features (from text lane) into Q-Former₂ -->
+  <line x1="240" y1="215" x2="380" y2="345" stroke="#7CB342" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#eAr)"/>
+  <line x1="700" y1="290" x2="620" y2="345" stroke="#4A90E2" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#eAr)"/>
+
+  <!-- Q-Former₂ box -->
+  <g transform="translate(220, 350)">
+    <rect x="0" y="0" width="560" height="65" rx="6" fill="#2E7D32" opacity="0.85" stroke="#E94B3C" stroke-width="3" stroke-dasharray="6,3"/>
+    <text x="280" y="22" text-anchor="middle" font-size="12" font-weight="600" fill="white">Q-Former₂  +  Linear₂  (TRAINED, 4 blocks)</text>
+    <text x="280" y="42" text-anchor="middle" font-size="10" fill="white">queries cross-attend to ViT output AND to prompt_features  →  prompt-aware compressed visual seq</text>
+    <text x="280" y="58" text-anchor="middle" font-size="10" fill="#fff8" font-style="italic">~30M trainable params; same query count (M = L_img = 64) as Q-Former₁</text>
+  </g>
+  <line x1="500" y1="415" x2="500" y2="435" stroke="#666" stroke-width="2" marker-end="url(#eAr)"/>
+
+  <!-- img_features_2 sequence -->
+  <g transform="translate(0, 445)">
+    <g transform="translate(428, 0)">
+      <rect x="0"   y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="21"  y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="42"  y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <text x="76" y="14" text-anchor="middle" font-size="14" fill="#666">⋯</text>
+      <rect x="92"  y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="113" y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="134" y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+    </g>
+    <text x="500" y="36" text-anchor="middle" font-size="10" fill="#1a1a1a" font-weight="600">img_features_2 (64, 4096)</text>
+  </g>
+
+  <!-- ===== BOTTOM: Trunk 4 (decoder) ===== -->
+  <text x="500" y="510" text-anchor="middle" font-size="12" font-weight="600" fill="#D84315">Trunk 4 — Decoder lane</text>
+
+  <!-- Convergence arrows: 4 sources -->
+  <line x1="240" y1="290" x2="370" y2="525" stroke="#7CB342" stroke-width="2" marker-end="url(#eAr)"/>
+  <line x1="700" y1="290" x2="450" y2="525" stroke="#4A90E2" stroke-width="2" marker-end="url(#eAr)"/>
+  <line x1="500" y1="490" x2="530" y2="525" stroke="#2E7D32" stroke-width="2" marker-end="url(#eAr)"/>
+  <line x1="820" y1="290" x2="630" y2="525" stroke="#FF8A65" stroke-width="2" marker-end="url(#eAr)"/>
+
+  <!-- Concat sequence -->
+  <g transform="translate(0, 530)">
+    <text x="500" y="-3" text-anchor="middle" font-size="10" fill="#888">concatenate along sequence dim, in causal trunk order</text>
+    <g transform="translate(176, 5)">
+      <rect x="0"   y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="21"  y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="42"  y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <text x="76" y="14" text-anchor="middle" font-size="14" fill="#666">⋯</text>
+      <rect x="92"  y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="113" y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="134" y="0" width="18" height="18" rx="2" fill="#7CB342" stroke="#558B2F" stroke-width="0.7"/>
+      <rect x="161" y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="182" y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="203" y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="224" y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="245" y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="266" y="0" width="18" height="18" rx="2" fill="#4A90E2" stroke="#1976D2" stroke-width="0.7"/>
+      <rect x="293" y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="314" y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="335" y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <text x="369" y="14" text-anchor="middle" font-size="14" fill="#666">⋯</text>
+      <rect x="385" y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="406" y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="427" y="0" width="18" height="18" rx="2" fill="#2E7D32" stroke="#1B5E20" stroke-width="0.7"/>
+      <rect x="454" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+      <rect x="475" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+      <rect x="496" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+      <rect x="517" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+      <rect x="538" y="0" width="18" height="18" rx="2" fill="#FF8A65" stroke="#D84315" stroke-width="0.7"/>
+    </g>
+    <text x="500" y="40" text-anchor="middle" font-size="10" fill="#1a1a1a">[ img_1 (64) | prompt (6) | img_2 (64) | answer (5) ]   (139, 4096)</text>
+  </g>
+
+  <line x1="500" y1="595" x2="500" y2="615" stroke="#666" stroke-width="2" marker-end="url(#eAr)"/>
+
+  <!-- Decoder box -->
+  <g transform="translate(180, 620)">
+    <rect x="0" y="0" width="640" height="70" rx="6" fill="#FF8A65" opacity="0.85" stroke="#BDBDBD" stroke-width="3"/>
+    <text x="320" y="22" text-anchor="middle" font-size="12" font-weight="600" fill="white">LLM Layers 17 → 24  (FROZEN)  —  the "Decoder"</text>
+    <text x="320" y="42" text-anchor="middle" font-size="10" fill="white">8 transformer blocks · 4-trunk causal mask · FFN · shape preserved (139, 4096)</text>
+    <text x="320" y="60" text-anchor="middle" font-size="10" fill="#fff8" font-style="italic">no new modules; both image trunks ride through as extra prefix tokens around the prompt</text>
+  </g>
+  <line x1="500" y1="690" x2="500" y2="715" stroke="#666" stroke-width="2" marker-end="url(#eAr)"/>
+
+  <!-- LM head + loss -->
+  <g transform="translate(330, 720)">
+    <rect x="0" y="0" width="340" height="40" rx="6" fill="#fff" stroke="#BDBDBD" stroke-width="2.5"/>
+    <text x="170" y="18" text-anchor="middle" font-size="11" font-weight="600">LM Head (FROZEN) → next answer token</text>
+    <text x="170" y="33" text-anchor="middle" font-size="9" fill="#888">+ NTP cross-entropy loss on answer slice (orange)</text>
+  </g>
+  <line x1="500" y1="760" x2="500" y2="780" stroke="#8a3324" stroke-width="2" marker-end="url(#eArred)"/>
+</svg>
+</div>
+
+<p class="caption">Figure 3: End-to-end 4-trunk pipeline. <strong>Top row:</strong> the same Trunk 1 (image lane) and Trunk 2 (text lane) as in brainstorm/07, producing <code>img_features_1 (64, 4096)</code> and <code>text_features (11, 4096)</code>. <strong>Middle:</strong> the new Trunk 3 lane — Q-Former₂ + Linear₂ takes the intermediate ViT output (re-used from Trunk 1) plus <code>prompt_features</code> (from Trunk 2) and produces a prompt-aware <code>img_features_2 (64, 4096)</code>. <strong>Bottom:</strong> all four sequences are concatenated in causal trunk order into a 139-token sequence, run through the upper 8 frozen LLM blocks, and fed to the LM head. Trainable additions vs. brainstorm/07: ~30M for Q-Former₂ + ~4M for Linear₂.</p>
+
+<hr>
+
+<h2>6. Pseudocode</h2>
+
+<pre><code>class Hybrid4TrunkVLM(nn.Module):
+    def __init__(self, vit_config, llm,
+                 P=14, L_low=16, L_img=64, D_img=1024, L_qf2=4):
+        # ---- Trunk 1 (same as Hybrid3TrunkVLM from brainstorm/07) ----
+        self.patch_embed = nn.Linear(3 * P * P, D_img)
+        self.vit         = ViT(**vit_config)
+        self.qformer1    = QFormer(M=L_img, d=D_img, kv_d=D_img)     # vision-only
+        self.vis_proj1   = nn.Linear(D_img, llm.d_hidden)             # 1024 → 4096
+
+        # ---- Trunk 2 (same: lower L_low frozen LLM blocks for [prompt|answer]) ----
+        self.embed       = llm.embed
+        self.text_layers = llm.layers[:L_low]
+        for p in self.embed.parameters():       p.requires_grad = False
+        for p in self.text_layers.parameters(): p.requires_grad = False
+
+        # ---- Trunk 3 (NEW): Q-Former with prompt cross-attention ----
+        self.qformer2    = QFormerWithPromptXAttn(
+            M=L_img, d=D_img, kv_d_vis=D_img, kv_d_txt=llm.d_hidden,
+            n_blocks=L_qf2,
+        )
+        self.vis_proj2   = nn.Linear(D_img, llm.d_hidden)
+
+        # ---- Trunk 4 (same: upper LLM blocks + LM head, frozen) ----
+        self.decoder_layers = llm.layers[L_low:]
+        for p in self.decoder_layers.parameters(): p.requires_grad = False
+        self.lm_head = llm.lm_head
+        for p in self.lm_head.parameters(): p.requires_grad = False
+        self.P = P
+
+    # -------- Trunk 1 forward (also exposes the intermediate ViT output for Trunk 3) --------
+    def encode_image_problem_blind(self, image):
+        B = image.shape[0]
+        patches = image.unfold(2, self.P, self.P).unfold(3, self.P, self.P)
+        patches = patches.permute(0, 2, 3, 1, 4, 5).contiguous()
+        patches = patches.view(B, -1, 3 * self.P * self.P)        # [B, 256, 588]
+        h_vit = self.vit(self.patch_embed(patches))               # [B, 256, 1024]  (KEEP for Trunk 3)
+        v1 = self.qformer1(h_vit)                                  # [B, L_img, 1024]
+        img_features_1 = self.vis_proj1(v1)                        # [B, L_img, 4096]
+        return img_features_1, h_vit
+
+    # -------- Trunk 2 forward (causal pass over [prompt | answer]) --------
+    def encode_text(self, text_tokens):
+        h = self.embed(text_tokens)                                # [B, L_txt+L_ans, 4096]
+        for layer in self.text_layers:
+            h = layer(h, attn_mask="causal")
+        return h                                                   # text_features
+
+    # -------- Trunk 3 forward (NEW): prompt-aware vision re-encoding --------
+    def encode_image_prompt_aware(self, h_vit, prompt_features):
+        v2 = self.qformer2(h_vit, prompt_features)                 # [B, L_img, 1024]
+        img_features_2 = self.vis_proj2(v2)                        # [B, L_img, 4096]
+        return img_features_2
+
+    # -------- Trunk 4 forward (training: teacher-forced) --------
+    def forward(self, image, prompt_tokens, answer_tokens):
+        L_p, L_a = prompt_tokens.shape[1], answer_tokens.shape[1]
+
+        img_1, h_vit = self.encode_image_problem_blind(image)      # Trunk 1
+        text = self.encode_text(torch.cat([prompt_tokens, answer_tokens], dim=1))  # Trunk 2
+        prompt_features = text[:, :L_p, :]
+        answer_features = text[:, L_p:, :]
+        img_2 = self.encode_image_prompt_aware(h_vit, prompt_features)             # Trunk 3
+
+        seq = torch.cat([img_1, prompt_features, img_2, answer_features], dim=1)   # [B, 139, 4096]
+        L_i1, L_i2 = img_1.shape[1], img_2.shape[1]
+        mask = build_4trunk_mask(L_i1, L_p, L_i2, L_a)
+        for layer in self.decoder_layers:
+            seq = layer(seq, attn_mask=mask)                       # frozen blocks 17..24
+
+        logits = self.lm_head(seq)                                 # [B, 139, vocab]
+        # answer slice for NTP, shifted
+        start = L_i1 + L_p + L_i2
+        return logits[:, start - 1 : -1, :]
+
+
+def build_4trunk_mask(L_i1, L_p, L_i2, L_a):
+    """Each non-answer trunk bidirectional within itself; causal between trunks; answer fully causal."""
+    L = L_i1 + L_p + L_i2 + L_a
+    m = torch.zeros(L, L, dtype=torch.bool)
+    s1, s2, s3, s4 = 0, L_i1, L_i1 + L_p, L_i1 + L_p + L_i2
+    e1, e2, e3, e4 = s2, s3, s4, L
+    # Bidirectional within each non-answer trunk
+    m[s1:e1, s1:e1] = True
+    m[s2:e2, s2:e2] = True
+    m[s3:e3, s3:e3] = True
+    # Causal between trunks
+    m[s2:e2, s1:e1] = True            # prompt sees img_1
+    m[s3:e3, s1:e2] = True            # img_2  sees img_1 + prompt
+    m[s4:e4, s1:e3] = True            # answer sees img_1 + prompt + img_2
+    # Causal within the answer trunk
+    m[s4:e4, s4:e4] = torch.tril(torch.ones(L_a, L_a, dtype=torch.bool))
+    return m
+
+
+class QFormerWithPromptXAttn(nn.Module):
+    """Q-Former with one extra cross-attention per block (queries → prompt_features)."""
+    def __init__(self, M, d, kv_d_vis, kv_d_txt, n_blocks=4, n_heads=16):
+        super().__init__()
+        self.queries = nn.Parameter(torch.randn(M, d) * 0.02)
+        self.blocks = nn.ModuleList([
+            QFormerBlockWithPrompt(d, kv_d_vis, kv_d_txt, n_heads) for _ in range(n_blocks)
+        ])
+
+    def forward(self, vit_output, prompt_features):
+        # vit_output: [B, 256, kv_d_vis], prompt_features: [B, L_p, kv_d_txt]
+        B = vit_output.shape[0]
+        Q = self.queries.unsqueeze(0).expand(B, -1, -1)
+        for block in self.blocks:
+            Q = block(Q, vit_output, prompt_features)
+        return Q
+
+
+class QFormerBlockWithPrompt(nn.Module):
+    def __init__(self, d, kv_d_vis, kv_d_txt, n_heads):
+        super().__init__()
+        self.self_attn   = SelfAttention(d, n_heads)
+        self.x_attn_vis  = CrossAttention(d, kv_d_vis, n_heads)
+        self.x_attn_text = CrossAttention(d, kv_d_txt, n_heads)
+        self.ffn = SwiGLU(d, 4 * d)
+        self.n1, self.n2, self.n3, self.n4 = (nn.LayerNorm(d) for _ in range(4))
+
+    def forward(self, Q, vit_output, prompt_features):
+        Q = Q + self.self_attn(self.n1(Q))                              # self-attn over queries
+        Q = Q + self.x_attn_vis (self.n2(Q), kv=vit_output)             # cross-attn → vision
+        Q = Q + self.x_attn_text(self.n3(Q), kv=prompt_features)        # cross-attn → prompt   (NEW vs. Q-Former₁)
+        Q = Q + self.ffn(self.n4(Q))
+        return Q
+</code></pre>
+
+<p>Trainable parameter footprint:</p>
+<ul>
+  <li>Trunk 1: patch_embed + ViT-Large + Q-Former₁ + vis_proj₁ ≈ <strong>~335M</strong> (same as brainstorm/07)</li>
+  <li>Trunk 3 (new): Q-Former₂ (4 blocks) + vis_proj₂ ≈ <strong>~30M + ~4M = ~34M</strong></li>
+  <li>Trunk 2 + Trunk 4: 0 (LLM is fully frozen, including embed and LM head)</li>
+  <li><strong>Total: ~370M</strong> on top of a fully frozen 24-layer LLM (vs. ~335M for the 3-trunk hybrid)</li>
+</ul>
+
+<hr>
+
+<h2>7. Comparison with the 3-trunk hybrid</h2>
+
+<table>
+  <thead>
+    <tr><th>Aspect</th><th>3-trunk hybrid (brainstorm/07)</th><th>4-trunk hybrid (this doc)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Vision encodings</td><td>Single (Q-Former₁ output, problem-blind)</td><td>Two: <code>img_1</code> (problem-blind, Q-Former₁) and <code>img_2</code> (prompt-aware, Q-Former₂)</td></tr>
+    <tr><td>Text encoder</td><td>Lower 16 frozen LLM blocks on [prompt | answer]</td><td>Same — single causal pass</td></tr>
+    <tr><td>Decoder backbone</td><td>Upper 8 frozen LLM blocks</td><td>Same — upper 8 frozen LLM blocks</td></tr>
+    <tr><td>Decoder input</td><td>(64 + 6 + 5, 4096) = (75, 4096)</td><td>(64 + 6 + 64 + 5, 4096) = (139, 4096)</td></tr>
+    <tr><td>New trained module(s)</td><td>—</td><td><strong>Q-Former₂ (~30M) + Linear₂ (~4M)</strong></td></tr>
+    <tr><td>Decoder cost per layer</td><td>O(75²) ≈ 5,625 attention entries</td><td>O(139²) ≈ 19,300 attention entries (~3.4× more)</td></tr>
+    <tr><td>Trainable params (rough)</td><td>~335M</td><td>~370M</td></tr>
+    <tr><td>What the design tests</td><td>"Can a frozen depth-split LLM teach a vision encoder via NTP?"</td><td>"Does a second, prompt-aware vision pass help on top of (a)?"</td></tr>
+  </tbody>
+</table>
+
+<h3>How to run the comparison</h3>
+
+<p>The 4-trunk hybrid is a strict superset of the 3-trunk hybrid. The cleanest ablation:</p>
+<ul>
+  <li><strong>3-trunk baseline</strong> = brainstorm/07 as-is</li>
+  <li><strong>4-trunk Mechanism α</strong> = same Trunks 1, 2, 4, with <code>img_features_2 = img_features_1</code> (zero new params; tests pure positional re-encoding)</li>
+  <li><strong>4-trunk Mechanism β</strong> = this document (Q-Former₂ with prompt cross-attention; the full-strength version)</li>
+</ul>
+<p>The α vs. β gap measures how much an explicit prompt-aware refiner buys you over the LLM's own attention pattern. The 3-trunk vs. (α or β) gap measures whether two visual encodings — at any cost — actually help.</p>
+
+<hr>
+
+<h2>8. Open questions</h2>
+
+<ol>
+  <li><strong>How many blocks in Q-Former₂?</strong> 4 is a starting guess. Sweep {2, 4, 8} — 2 may be too shallow to integrate prompt context, 8 starts to overlap with the upper-8 decoder's job.</li>
+  <li><strong>Share queries with Q-Former₁?</strong> Could either (a) tie the 64 queries between Q-Former₁ and Q-Former₂ (fewer params, same "vocabulary" of visual abstractions), or (b) keep them separate (more flexible, more params). Default: separate.</li>
+  <li><strong>Cross-attend to <code>prompt_features</code> or to raw <code>prompt_embeds</code>?</strong> Default: <code>prompt_features</code> (after the lower 16 LLM blocks) — richer, mid-LLM representation. Alternative: raw embeddings (cheaper to compute, no waiting for Trunk 2).</li>
+  <li><strong>Should Q-Former₂ also see the partially-generated answer at inference?</strong> If yes, Trunk 3 becomes a function of (image, prompt, answer-so-far) — a much richer signal but requires re-running Q-Former₂ at every decoding step. Default: no; Trunk 3 sees only image + full prompt and is computed once per sample.</li>
+  <li><strong>Decoder mask: should <code>img_features_2</code> attend to <code>img_features_1</code>?</strong> The default trunk-causal mask says yes (Trunk 3 sees Trunk 1). An alternative is to have Trunk 3 attend only to itself + prompt (forcing it to be a "pure refinement" of the prompt-conditioned visual content). Worth ablating.</li>
+  <li><strong>Where does the gradient come from?</strong> Q-Former₂ only gets gradient through the upper 8 frozen LLM blocks → answer slice. The signal could be weaker than for Q-Former₁ (which is closer to the input position in the decoder sequence). Sample efficiency may differ.</li>
+  <li><strong>Path to N-trunk.</strong> If Trunk 3 helps, does Trunk 5 (image-after-partial-answer) help further? Each new vision trunk adds another Q-Former (with cross-attention to all earlier text trunks). Linear growth in trained params; quadratic growth in decoder sequence length.</li>
+</ol>
+
+<hr>
+
+<h2>Where this fits in the brainstorm series</h2>
+
+<ul>
+  <li><a href="04_multi_trunk_vlm.html">brainstorm/04</a> — multi-trunk concept (3-trunk + 4-trunk)</li>
+  <li><a href="06_4trunk_concrete_design.html">brainstorm/06</a> — earlier 4-trunk generalizations of the LLaVA/Flamingo/Cambrian variants</li>
+  <li><a href="07_3trunk_hybrid_variant.html">brainstorm/07</a> — the 3-trunk hybrid baseline (LLaVA + Q-Former + depth-split)</li>
+  <li><a href="08_hybrid_related_work.html">brainstorm/08</a> — related work survey for the hybrid design</li>
+  <li><a href="09_hybrid_assessment.html">brainstorm/09</a> — assessment: is the hybrid sensible? why hasn't it been done?</li>
+  <li><strong>brainstorm/10 (this document)</strong> — 4-trunk extension of the hybrid, with a second prompt-aware Q-Former</li>
+</ul>
+
+<blockquote>
+The 4-trunk hybrid extends brainstorm/07 by adding a second visual encoding that is aware of the prompt. The only structural change is one new trained module — Q-Former₂ with cross-attention to <code>prompt_features</code> — and one extra projection. Trunks 1, 2, and 4 are unchanged; Trunk 4's input sequence just gets longer (75 → 139 tokens). The frozen-LLM property and the depth-split structure are preserved. Trainable budget grows from ~335M to ~370M. The clean ablation (3-trunk vs. 4-trunk-α vs. 4-trunk-β) measures whether a second, prompt-aware vision pass provides signal over and above what the LLM's own attention already extracts.
+</blockquote>
+
+</body>
+</html>

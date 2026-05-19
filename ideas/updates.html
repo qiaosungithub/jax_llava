@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PaliGemma Project Updates - New Additions Report</title>
+  <style>
+    :root {
+      --bg: #f4f6fa;
+      --card: #ffffff;
+      --text: #1e293b;
+      --muted: #5b667a;
+      --accent: #0b7285;
+      --accent-soft: #e6f5f8;
+      --border: #d7e0ea;
+      --good: #17643a;
+      --mono: "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      --sans: "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      color: var(--text);
+      background:
+        radial-gradient(circle at 8% 2%, #d8edf2 0%, transparent 35%),
+        radial-gradient(circle at 95% 8%, #e8edf9 0%, transparent 32%),
+        var(--bg);
+      line-height: 1.6;
+    }
+
+    .wrap { width: min(1120px, 92vw); margin: 30px auto 56px; }
+    .hero, .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      box-shadow: 0 8px 28px rgba(19, 38, 63, 0.07);
+    }
+    .hero { padding: 24px 28px; }
+    .hero h1 { margin: 0 0 6px; font-size: clamp(1.55rem, 2.2vw, 2rem); }
+    .hero p { margin: 0; color: var(--muted); }
+
+    .stack { margin-top: 16px; }
+    .card { padding: 18px 20px; margin-bottom: 16px; }
+    .card h2 { margin: 0 0 8px; font-size: 1.15rem; }
+    .card h3 { margin: 14px 0 6px; font-size: 1rem; }
+
+    .badge {
+      display: inline-block;
+      margin-bottom: 8px;
+      padding: 2px 9px;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: var(--accent);
+      background: var(--accent-soft);
+      border: 1px solid #c7e9ef;
+    }
+
+    code {
+      font-family: var(--mono);
+      font-size: 0.92em;
+      background: #f1f5fa;
+      border: 1px solid #e1e8f0;
+      border-radius: 6px;
+      padding: 1px 6px;
+    }
+
+    ul { margin: 6px 0 0 18px; padding: 0; }
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 0.95rem; }
+    th, td { border: 1px solid var(--border); padding: 8px 10px; text-align: left; vertical-align: top; }
+    th { background: #f7fbff; }
+    .muted { color: var(--muted); }
+    .good { color: var(--good); }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="hero">
+      <h1>Project Update Report (Recent Additions)</h1>
+      <p>
+        This document focuses on newly implemented components since the previous baseline summary,
+        including new tasks, evaluation infrastructure, data pipelines, and prompt-system migration.
+      </p>
+    </section>
+
+    <section class="stack">
+      <article class="card">
+        <span class="badge">New Evaluation Task</span>
+        <h2>RefCOCOg Evaluation Added End-to-End</h2>
+        <ul>
+          <li>Implemented a new evaluator in <code>evals/eval_refcocog.py</code> for referring-expression grounding.</li>
+          <li>The evaluator decodes model outputs into quantized <code>&lt;loc####&gt;</code> tokens, recovers predicted boxes, and computes IoU-based metrics.</li>
+          <li>Main reported metrics include <strong>Acc@IoU thresholds</strong> and <strong>mIoU</strong>, with host/process-safe aggregation for distributed runs.</li>
+          <li>Task registration added in <code>evals/eval.py</code> so <code>refcocog</code> can be triggered from unified eval task lists.</li>
+          <li>Prompt switched to natural language: <code>Locate the region described by this phrase: {phrase}</code> (prefix-free).</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <span class="badge">New Pretrain Data</span>
+        <h2>Detection and TextCaps Data Paths Integrated</h2>
+
+        <h3>Visual Genome Detection (<code>genome_det</code>)</h3>
+        <ul>
+          <li>Added a new pretraining route in <code>input_pipeline.py</code> that formats examples as phrase-to-box prediction.</li>
+          <li>Integrated a dedicated iterable dataset path for region/object supervision with shuffle-buffer sampling.</li>
+          <li>Target format uses quantized bbox location tokens, fully aligned with the model's existing <code>&lt;loc####&gt;</code> vocabulary.</li>
+        </ul>
+
+        <h3>TextCaps</h3>
+        <ul>
+          <li>Added dataset mapping and routing for <code>textcaps-train</code> and <code>textcaps-val</code> in <code>utils/data_util.py</code>.</li>
+          <li>Added <code>textcaps</code>-specific prompt behavior in <code>input_pipeline.py</code> to keep outputs concise and text-reading aware.</li>
+          <li>Upload pipeline now supports WebDataset tar shard generation where each image is stored once and captions are grouped.</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <span class="badge">Prompt Migration</span>
+        <h2>Task Prefix Removal and Natural Prompt Standardization</h2>
+        <ul>
+          <li>Removed task-token prefixes in training and eval paths (for example <code>caption en</code>, <code>answer en</code>, <code>ocr en</code>, <code>detect en</code>).</li>
+          <li>QA/OCR-style tasks now use direct natural prompts, typically <code>{question}?</code> followed by newline.</li>
+          <li>Applied to eval implementations including <code>eval_vqav2.py</code>, <code>eval_textvqa.py</code>, <code>eval_mme.py</code>, <code>eval_refcocog.py</code>, <code>eval_pope.py</code>, and <code>eval_mmbench.py</code>.</li>
+          <li>Config defaults updated to match runtime behavior (for example <code>eval.pope_prompt_template</code> and <code>eval.mmbench_prompt_prefix</code>).</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <span class="badge">Training Runtime</span>
+        <h2>Online/Final Evaluation Interface Updated</h2>
+        <ul>
+          <li><code>train.py</code> now uses task-list based evaluation scheduling via <code>training.online_eval_per_step</code>, <code>training.online_eval_tasks</code>, and <code>training.final_eval_tasks</code>.</li>
+          <li>Legacy per-task step keys were replaced in <code>configs/remote_run_config.yml</code> and <code>configs/finetune_config.yml</code>.</li>
+          <li>The new scheme makes eval orchestration explicit, centralized, and easier to maintain as tasks expand.</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <span class="badge">Optimization</span>
+        <h2>LM Freeze Training Option Added</h2>
+        <ul>
+          <li>Added trainable/frozen parameter split-merge support (via <code>utils/frozen_util.py</code> and <code>train.py</code> integration).</li>
+          <li>When <code>training.freeze_lm</code> is enabled, gradients are computed only on trainable subtrees while preserving optimizer state structure.</li>
+          <li>This supports controlled ablations and efficient adaptation experiments with reduced trainable footprint.</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <span class="badge">Data Infra</span>
+        <h2>Uploader and Dataset Logistics Improvements</h2>
+        <ul>
+          <li>Added zone-aware upload scripts for RefCOCOg, COCO, and TextCaps in the companion tooling directory.</li>
+          <li>Switched COCO upload from many-small-file mode to tar-sharded mode to avoid API overhead and argument-length failure modes.</li>
+          <li>RefCOCOg validation annotations are now resolved from local SSD path by default for stable access in eval jobs.</li>
+        </ul>
+
+        <h3>Representative New Utilities</h3>
+        <table>
+          <thead>
+            <tr><th>Script</th><th>Purpose</th><th>Notes</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>refcocog-val-upload.py</code></td><td>Prepare and upload RefCOCOg val annotations</td><td>Includes fallback download paths and JSON-safe filtering</td></tr>
+            <tr><td><code>COCO-train-upload.py</code></td><td>Prepare and upload COCO train data</td><td>Tar-shard based upload, zone-aware bucket targets</td></tr>
+            <tr><td><code>TextCaps-upload.py</code></td><td>Build/upload TextCaps WebDataset shards</td><td>Single image copy + caption list packing</td></tr>
+          </tbody>
+        </table>
+      </article>
+
+      <article class="card">
+        <span class="badge">Status</span>
+        <h2>Net Effect of the Update Batch</h2>
+        <ul>
+          <li class="good"><strong>Task coverage expanded:</strong> grounded referring-expression evaluation and detection-style pretraining are now first-class.</li>
+          <li class="good"><strong>Prompting policy unified:</strong> old prefixed prompt conventions are replaced by natural-language prompting across train/eval.</li>
+          <li class="good"><strong>Ops reliability improved:</strong> data upload and path resolution are more robust for multi-region TPU workflows.</li>
+          <li class="good"><strong>Experiment control improved:</strong> LM freeze and task-list eval scheduling simplify controlled ablation design.</li>
+        </ul>
+      </article>
+    </section>
+  </main>
+</body>
+</html>

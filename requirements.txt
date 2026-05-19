@@ -1,0 +1,2 @@
+pycocotools
+pycocoevalcap==1.2

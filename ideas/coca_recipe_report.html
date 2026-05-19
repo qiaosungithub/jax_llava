@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CoCa Paper Recipe Report</title>
+  <style>
+    :root {
+      --bg: #f4f7fb;
+      --card: #ffffff;
+      --text: #16202f;
+      --muted: #59677b;
+      --accent: #0a6a58;
+      --accent-soft: #e6f4f0;
+      --border: #d6e0ec;
+      --warn: #8a5a00;
+      --good: #11643b;
+      --mono: "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      --sans: "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      color: var(--text);
+      background:
+        radial-gradient(circle at 8% 5%, #d8eee8 0%, transparent 36%),
+        radial-gradient(circle at 95% 8%, #e3ebfa 0%, transparent 33%),
+        var(--bg);
+      line-height: 1.65;
+    }
+    .wrap { width: min(1160px, 92vw); margin: 28px auto 56px; }
+    .hero, .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      box-shadow: 0 8px 28px rgba(18, 37, 63, 0.07);
+    }
+    .hero { padding: 24px 28px; }
+    .hero h1 { margin: 0 0 8px; font-size: clamp(1.45rem, 2.2vw, 2rem); }
+    .hero p { margin: 0; color: var(--muted); }
+    .stack { margin-top: 16px; }
+    .card { padding: 18px 20px; margin-bottom: 16px; }
+    .card h2 { margin: 0 0 8px; font-size: 1.15rem; }
+    .card h3 { margin: 12px 0 6px; font-size: 1.02rem; }
+    .badge {
+      display: inline-block;
+      margin-bottom: 8px;
+      padding: 2px 9px;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: var(--accent);
+      background: var(--accent-soft);
+      border: 1px solid #c5e8df;
+    }
+    .muted { color: var(--muted); }
+    .warn { color: var(--warn); }
+    .good { color: var(--good); }
+    ul { margin: 6px 0 0 18px; padding: 0; }
+    ol { margin: 6px 0 0 20px; padding: 0; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 8px;
+      font-size: 0.95rem;
+    }
+    th, td {
+      border: 1px solid var(--border);
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th { background: #f8fbff; }
+    code {
+      font-family: var(--mono);
+      font-size: 0.92em;
+      background: #f2f6fb;
+      border: 1px solid #dfe8f3;
+      border-radius: 6px;
+      padding: 1px 6px;
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="hero">
+      <h1>CoCa 论文 Recipe 拆解（结合你的 vision-centric 目标）</h1>
+      <p>
+        阅读来源：<code>../readings/CoCa-Contrastive-Captioners-are-Image-Text-Foundation-Models.pdf</code>
+        （并结合同目录 txt 版本逐行提取超参与 ablation）。
+      </p>
+    </section>
+
+    <section class="stack">
+      <article class="card">
+        <span class="badge">TL;DR</span>
+        <h2>一句话理解 CoCa</h2>
+        <p>
+          CoCa 不是简单“CLIP + captioning 两阶段”，而是 <strong>单阶段、同一计算图、同一次 forward</strong> 同时优化
+          <code>L_contrastive</code> 和 <code>L_caption</code>：
+          下半段 decoder 做 text-only 表征，上半段 decoder 做 image-text 融合与自回归生成。
+        </p>
+        <ul>
+          <li>你现在的 <code>txt_feature_layer + 后层融合</code> 思路与 CoCa 的 decoupled decoder 高度同构。</li>
+          <li>CoCa 的关键不是“投敌 CLIP”，而是用 contrastive 约束保全局对齐、用 captioning 保细粒度语义。</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <span class="badge">Architecture</span>
+        <h2>模型结构 recipe</h2>
+        <h3>1) 解耦 decoder（核心）</h3>
+        <ul>
+          <li>Decoder 前半层（<code>n_uni</code>）不看图像，只做因果自注意力，输出 unimodal text embedding。</li>
+          <li>Decoder 后半层（<code>n_multi</code>）继续因果自注意力，并 cross-attend image tokens，输出 multimodal 表征。</li>
+          <li>默认 <code>n_uni = n_multi</code>（“一半一半”）。</li>
+        </ul>
+
+        <h3>2) 双损失同训</h3>
+        <ul>
+          <li><code>L = λ_con * L_con + λ_cap * L_cap</code>。</li>
+          <li><code>L_con</code> 用 image embedding 与 text embedding 做对比学习。</li>
+          <li><code>L_cap</code> 用 multimodal decoder 输出做 teacher-forcing 自回归预测。</li>
+        </ul>
+
+        <h3>3) 任务特定 pooler</h3>
+        <ul>
+          <li>contrastive 分支用单 query pooler（全局 embedding）。</li>
+          <li>generative 分支用长序列 query（默认 256）保细粒度视觉 token 供 decoder 使用。</li>
+          <li>小规模 ablation 中 “cascade pooler” 略优于并行 pooler。</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <span class="badge">Pretrain Hyperparams</span>
+        <h2>预训练超参（论文主设置）</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>项目</th>
+              <th>设置</th>
+              <th>备注</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>数据</td><td>JFT-3B + ALIGN alt-text</td><td>batch 中 1:1 混合（各占一半）</td></tr>
+            <tr><td>训练方式</td><td>单阶段、from scratch、端到端</td><td>不先训 image encoder</td></tr>
+            <tr><td>文本处理</td><td>SentencePiece vocab=64k</td><td>JFT 标签转文本并加 prompt 模板</td></tr>
+            <tr><td>输入分辨率</td><td>288x288（主训）</td><td>后续再 576x576 继续 1 epoch</td></tr>
+            <tr><td>patch size</td><td>18x18</td><td>得到 256 image tokens</td></tr>
+            <tr><td>总 batch size</td><td>65,536 image-text pairs</td><td>超大 batch 对比学习稳定</td></tr>
+            <tr><td>训练步数</td><td>500k steps</td><td>约 JFT 5 epoch, ALIGN 10 epoch</td></tr>
+            <tr><td>损失权重</td><td><code>λ_cap=2.0</code>, <code>λ_con=1.0</code></td><td>captioning 权重更大更好</td></tr>
+            <tr><td>对比温度</td><td>trainable τ, init 0.07</td><td>CLIP/ALIGN 风格</td></tr>
+            <tr><td>优化器</td><td>Adafactor, β1=0.9, β2=0.999</td><td>decoupled wd=0.01</td></tr>
+            <tr><td>学习率</td><td>peak 8e-4</td><td>前 2% steps warmup，随后线性衰减</td></tr>
+          </tbody>
+        </table>
+      </article>
+
+      <article class="card">
+        <span class="badge">Model Sizes</span>
+        <h2>模型规模（Table 1）</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Variant</th>
+              <th>Image Encoder</th>
+              <th>Decoder (uni/multi)</th>
+              <th>总参数</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>CoCa-Base</td><td>12层, hidden 768, 12 heads, ~86M</td><td>12/12 层, decoder ~297M</td><td>~383M</td></tr>
+            <tr><td>CoCa-Large</td><td>24层, hidden 1024, 16 heads, ~303M</td><td>12/12 层, decoder ~484M</td><td>~787M</td></tr>
+            <tr><td>CoCa</td><td>40层, hidden 1408, 16 heads, ~1B</td><td>18/18 层, decoder ~1.1B</td><td>~2.1B</td></tr>
+          </tbody>
+        </table>
+      </article>
+
+      <article class="card">
+        <span class="badge">Ablation Findings</span>
+        <h2>对你最有用的 ablation 结论</h2>
+        <h3>1) 损失配比</h3>
+        <ul>
+          <li><code>λ_cap:λ_con = 2:1</code> 在他们的小规模消融里优于 1:1 / 1:2。</li>
+          <li>结论：captioning loss 不只是帮生成，也改善对齐和 VQA。</li>
+        </ul>
+
+        <h3>2) uni / multi 层数平衡</h3>
+        <ul>
+          <li>uni 层太少会伤 zero-shot 对齐；multi 层太少会伤多模态推理。</li>
+          <li>“一半一半”是可行平衡点（与你的 split 设计吻合）。</li>
+        </ul>
+
+        <h3>3) 对比文本 embedding</h3>
+        <ul>
+          <li>用单个可学习 <code>[CLS]</code> 做对比文本表征，比“[CLS]+全部 token 聚合”更稳。</li>
+          <li>解释：减少 contrastive 与 captioning 目标在文本侧的干扰。</li>
+        </ul>
+
+        <h3>4) pooler 序列长度</h3>
+        <ul>
+          <li>generative 分支保留长 token（query=256）对多模态理解更有利。</li>
+          <li>如果把 generative query 缩得太短，会明显伤 VQA。</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <span class="badge">Downstream Hyperparams</span>
+        <h2>下游任务超参（Appendix Table 9/10）</h2>
+        <h3>视觉识别（ImageNet/Kinetics/Moments）</h3>
+        <ul>
+          <li>Optimizer: Adafactor + decoupled wd；grad clip=1.0；EMA=0.9999；cosine schedule。</li>
+          <li>Frozen-feature: pooler LR=5e-4，encoder LR=0；ImageNet batch=512，Kinetics/MIT batch=128。</li>
+          <li>Finetune: encoder LR=5e-4（视觉任务），warmup：ImageNet=0，视频任务=1000。</li>
+          <li>Train steps: ImageNet 200k；Kinetics/MIT 120k。</li>
+        </ul>
+
+        <h3>多模态理解与caption</h3>
+        <ul>
+          <li>VQA: steps=100k, batch=64, pooler LR=5e-4, encoder LR=2e-5, wd=0.1。</li>
+          <li>SNLI-VE: steps=50k, batch=128, pooler LR=1e-3, encoder LR=5e-5, wd=0.1。</li>
+          <li>NLVR2: steps=50k, batch=64, pooler LR=5e-4, encoder LR=2e-5, wd=0.1。</li>
+          <li>MSCOCO caption: steps=50k, batch=128, encoder LR=1e-5, wd=0.1。</li>
+          <li>NoCaps transfer: steps=10k, batch=128, encoder LR=1e-5, wd=0.1。</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <span class="badge">For Your Project</span>
+        <h2>映射到你当前架构的可执行建议</h2>
+        <ol>
+          <li><strong>保留 split 架构：</strong>你的 <code>txt_feature_layer</code> 本质就是 CoCa 的 <code>n_uni/n_multi</code>。优先扫 1/3、1/2、2/3 切分点。</li>
+          <li><strong>不要只靠 NTP：</strong>加一个低权重 image-text contrastive 分支（建议从 <code>λ_con = 0.25~0.5 * λ_vlm</code> 起）。</li>
+          <li><strong>captioning 权重要偏大：</strong>CoCa 结论偏向 <code>λ_cap > λ_con</code>；你可用 <code>vlm:con = 2:1</code> 作为初始点。</li>
+          <li><strong>视觉 token 保持足够长：</strong>若你要做 OCR/grounding，K 不建议过早降到很小；先保 256，再做 token budget 课程学习。</li>
+          <li><strong>文本对比头简化：</strong>可仿 CoCa 用单 CLS/单 query 作为 text embedding，减轻生成目标冲突。</li>
+          <li><strong>冻结策略：</strong>先冻结前层稳态训练，再小 LR staged unfreeze；这和 CoCa 的“先保证双目标兼容”逻辑一致。</li>
+        </ol>
+      </article>
+
+      <article class="card">
+        <span class="badge">What CoCa Does NOT Say</span>
+        <h2>你需要谨慎外推的地方</h2>
+        <ul>
+          <li>CoCa 使用的是极大规模数据与 batch；小规模下超参最优点可能偏移。</li>
+          <li>CoCa 的 tokenizer/数据清洗/去重流程很重，复现时数据质量对结果影响非常大。</li>
+          <li>他们不是“冻结 LLM”范式，而是从头训 encoder-decoder；和你“加载预训练 LM 并部分冻结”有分布差。</li>
+        </ul>
+      </article>
+    </section>
+  </main>
+</body>
+</html>

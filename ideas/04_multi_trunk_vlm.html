@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Multi-Trunk VLM — 3-Trunk Baseline and 4-Trunk Extension</title>
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --muted: #555;
+    --bg: #fdfdfc;
+    --accent: #8a3324;
+    --accent2: #1a4f72;
+    --rule: #ddd;
+    --code-bg: #f4f1ec;
+    --note-bg: #fdf6e3;
+    --idea-bg: #f0f6f4;
+    --color-image: #7CB342;
+    --color-text: #4A90E2;
+    --color-image2: #9CCC65;
+    --color-response: #FF8A65;
+  }
+  html { font-size: 16px; }
+  body {
+    max-width: 880px;
+    margin: 3rem auto;
+    padding: 0 1.25rem 4rem;
+    font-family: "Charter", "Iowan Old Style", Georgia, "Times New Roman", serif;
+    color: var(--fg);
+    background: var(--bg);
+    line-height: 1.6;
+  }
+  h1, h2, h3 {
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.25;
+    color: var(--fg);
+  }
+  h1 { font-size: 1.9rem; margin-top: 0; border-bottom: 2px solid var(--fg); padding-bottom: 0.5rem; }
+  h2 { font-size: 1.4rem; margin-top: 2.4rem; color: var(--accent); border-bottom: 1px solid var(--rule); padding-bottom: 0.3rem; }
+  h3 { font-size: 1.05rem; margin-top: 1.4rem; color: var(--accent2); }
+  p { margin: 0.6rem 0; }
+  code {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    background: var(--code-bg);
+    padding: 0.1em 0.35em;
+    border-radius: 3px;
+    font-size: 0.88em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 0.8rem 1rem;
+    border-radius: 4px;
+    overflow-x: auto;
+    font-size: 0.88rem;
+    line-height: 1.5;
+  }
+  hr { border: none; border-top: 1px solid var(--rule); margin: 2rem 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1rem 0;
+    font-size: 0.92rem;
+    font-variant-numeric: tabular-nums;
+  }
+  th, td {
+    border: 1px solid var(--rule);
+    padding: 0.5rem 0.7rem;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--code-bg); font-weight: 600; }
+  ul { padding-left: 1.4rem; }
+  li { margin: 0.3rem 0; }
+  blockquote {
+    border-left: 3px solid var(--accent);
+    margin: 1rem 0;
+    padding: 0.2rem 1rem;
+    color: var(--muted);
+    font-style: italic;
+  }
+  .meta { color: var(--muted); font-size: 0.9rem; margin-top: -0.5rem; }
+  .footnote { font-size: 0.85rem; color: var(--muted); margin-top: 0.4rem; }
+  .context {
+    background: var(--idea-bg);
+    border-left: 4px solid var(--accent2);
+    border-radius: 0 4px 4px 0;
+    padding: 0.8rem 1.1rem;
+    font-size: 0.93rem;
+    margin: 0.9rem 0 1.2rem;
+  }
+  .context strong { color: #000; }
+  .proposal {
+    background: var(--note-bg);
+    border-left: 4px solid #b58900;
+    border-radius: 0 4px 4px 0;
+    padding: 0.8rem 1.1rem;
+    font-size: 0.95rem;
+    margin: 0.9rem 0 1.2rem;
+  }
+  .proposal strong { color: #000; }
+  .figure {
+    text-align: center;
+    margin: 1.5rem 0;
+  }
+  .figure svg {
+    max-width: 100%;
+    height: auto;
+    background: #fafaf7;
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    padding: 1rem;
+  }
+  .caption {
+    font-size: 0.9rem;
+    color: var(--muted);
+    margin: 0.5rem 0 1rem;
+    text-align: center;
+  }
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.8rem 1.5rem;
+    background: #fafaf7;
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 0.7rem 1rem;
+    margin: 0.6rem 0 1rem;
+    font-size: 0.88rem;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .legend-swatch {
+    width: 22px;
+    height: 16px;
+    border-radius: 3px;
+    border: 1px solid rgba(0,0,0,0.2);
+  }
+  strong { color: #000; }
+</style>
+</head>
+<body>
+
+<h1>Multi-Trunk VLM — 3-Trunk Baseline and 4-Trunk Extension</h1>
+<p class="meta">A research proposal: organizing a VLM as a sequence of "trunks" with explicit causal ordering, and re-encoding the image after the question for question-aware vision features</p>
+
+<div class="context">
+<strong>Context for this document.</strong> This is the next round of brainstorming, building on the broader research direction sketched in <a href="01_llm_agnostic_vision_encoder.html">brainstorm/01 (LLM-agnostic vision encoder)</a> and <a href="03_vision_encoder_pretraining_survey.html">brainstorm/03 (vision encoder pretraining survey)</a>. The high-level goal remains the same: <strong>train a strong vision encoder using a (preferably frozen) LLM as supervisor, with the vision encoder as the deliverable</strong>. This document refines the architectural picture into a "trunk-based" framing and proposes a 4-trunk extension where the image is re-encoded after the question is seen.
+</div>
+
+<h2>The high-level goal (recap)</h2>
+
+<div class="proposal">
+<strong>Goal:</strong> Use a (preferably frozen) LLM as supervisor to train a Vision Encoder. The vision encoder is always trained and is the main object of the training procedure. We want a recipe similar in spirit to PaliGemma but with the vision encoder as the deliverable, optimized for the supervision signal a frozen LLM can provide.
+</div>
+
+<hr>
+
+<h2>The 3-trunk baseline (PaliGemma-style)</h2>
+
+<p>We can view a PaliGemma-style VLM as a sequence of three <strong>trunks</strong>:</p>
+
+<ul>
+  <li><strong>Trunk 1 — Image</strong>: image patches encoded by the vision encoder.</li>
+  <li><strong>Trunk 2 — Text prompt (question)</strong>: the user's question, embedded into the LLM's token space.</li>
+  <li><strong>Trunk 3 — Text response (answer)</strong>: the answer, generated autoregressively.</li>
+</ul>
+
+<p><strong>Inter-trunk attention rule</strong>: causal between trunks. A trunk can only see itself or preceding trunks. <strong>Intra-trunk attention</strong>: bidirectional for vision (default), causal for text (default).</p>
+
+<div class="legend">
+<div class="legend-item"><div class="legend-swatch" style="background: #7CB342;"></div>Image (vision encoder)</div>
+<div class="legend-item"><div class="legend-swatch" style="background: #4A90E2;"></div>Text prompt (question)</div>
+<div class="legend-item"><div class="legend-swatch" style="background: #FF8A65;"></div>Text response (answer)</div>
+<div class="legend-item"><div class="legend-swatch" style="background: #9CCC65;"></div>Image (re-encoded, second pass)</div>
+</div>
+
+<div class="figure">
+<svg width="900" height="320" viewBox="0 0 900 320" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr1" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#666"/>
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="450" y="26" text-anchor="middle" font-family="-apple-system, sans-serif" font-size="16" font-weight="600" fill="#1a1a1a">3-Trunk VLM (PaliGemma-style baseline)</text>
+
+  <!-- Trunks -->
+  <g transform="translate(60, 70)">
+    <rect x="0" y="0" width="220" height="110" rx="8" fill="#7CB342" opacity="0.85"/>
+    <text x="110" y="34" text-anchor="middle" font-size="14" fill="white" font-weight="600">Trunk 1: Image</text>
+    <text x="110" y="56" text-anchor="middle" font-size="11" fill="white">vision encoder output</text>
+    <text x="110" y="76" text-anchor="middle" font-size="11" fill="white" font-style="italic">intra: bidirectional</text>
+    <text x="110" y="96" text-anchor="middle" font-size="11" fill="white" font-style="italic">sees: nothing prior</text>
+  </g>
+
+  <g transform="translate(330, 70)">
+    <rect x="0" y="0" width="220" height="110" rx="8" fill="#4A90E2" opacity="0.85"/>
+    <text x="110" y="34" text-anchor="middle" font-size="14" fill="white" font-weight="600">Trunk 2: Text Prompt</text>
+    <text x="110" y="56" text-anchor="middle" font-size="11" fill="white">the question</text>
+    <text x="110" y="76" text-anchor="middle" font-size="11" fill="white" font-style="italic">intra: causal</text>
+    <text x="110" y="96" text-anchor="middle" font-size="11" fill="white" font-style="italic">sees: T1 (image)</text>
+  </g>
+
+  <g transform="translate(600, 70)">
+    <rect x="0" y="0" width="220" height="110" rx="8" fill="#FF8A65" opacity="0.85"/>
+    <text x="110" y="34" text-anchor="middle" font-size="14" fill="white" font-weight="600">Trunk 3: Text Response</text>
+    <text x="110" y="56" text-anchor="middle" font-size="11" fill="white">the answer (AR)</text>
+    <text x="110" y="76" text-anchor="middle" font-size="11" fill="white" font-style="italic">intra: causal</text>
+    <text x="110" y="96" text-anchor="middle" font-size="11" fill="white" font-style="italic">sees: T1, T2</text>
+  </g>
+
+  <!-- Arrows -->
+  <line x1="280" y1="125" x2="328" y2="125" stroke="#666" stroke-width="2" marker-end="url(#arr1)"/>
+  <line x1="550" y1="125" x2="598" y2="125" stroke="#666" stroke-width="2" marker-end="url(#arr1)"/>
+
+  <!-- Loss arrow on Trunk 3 -->
+  <line x1="710" y1="190" x2="710" y2="220" stroke="#8a3324" stroke-width="2" marker-end="url(#arr1)"/>
+  <text x="710" y="245" text-anchor="middle" font-size="12" font-weight="600" fill="#8a3324">LM cross-entropy loss</text>
+  <text x="710" y="263" text-anchor="middle" font-size="11" fill="#666">(supervision flows back into Vision Encoder via T1)</text>
+
+  <!-- Trainable / frozen labels -->
+  <g transform="translate(60, 200)">
+    <text x="110" y="0" text-anchor="middle" font-size="12" font-weight="600" fill="#8a3324">Vision encoder: TRAINED</text>
+    <text x="110" y="18" text-anchor="middle" font-size="11" fill="#888" font-style="italic">(the deliverable)</text>
+  </g>
+
+  <g transform="translate(330, 200)">
+    <text x="110" y="0" text-anchor="middle" font-size="12" font-weight="600" fill="#1a4f72">LLM: FROZEN</text>
+    <text x="110" y="18" text-anchor="middle" font-size="11" fill="#888" font-style="italic">(plays supervisor role)</text>
+  </g>
+
+  <g transform="translate(600, 200)">
+    <text x="110" y="0" text-anchor="middle" font-size="12" font-weight="600" fill="#1a4f72">LLM: FROZEN</text>
+    <text x="110" y="18" text-anchor="middle" font-size="11" fill="#888" font-style="italic">(autoregressive head)</text>
+  </g>
+</svg>
+</div>
+
+<p class="caption">Figure 1: The 3-trunk baseline. Image → Text prompt → Text response, with strict causal ordering between trunks. The vision encoder is trained; the LLM stays frozen. Gradients from the LM cross-entropy loss flow back through the frozen LLM into the vision encoder.</p>
+
+<h3>Why this baseline matters</h3>
+
+<p>This is essentially the LLaVA / PaliGemma layout, framed as trunks. Two design knobs are exposed:</p>
+
+<ol>
+  <li><strong>Inter-trunk attention</strong>: strict causal — each trunk only sees itself + preceding trunks. This matches the "input → context → output" flow.</li>
+  <li><strong>Intra-trunk attention</strong>: configurable per trunk. Vision is naturally 2D so default is bidirectional; text is sequential so default is causal.</li>
+</ol>
+
+<p>Calling out these knobs explicitly makes it easy to reason about the next extension.</p>
+
+<hr>
+
+<h2>The 4-trunk extension — re-encode the image after the question</h2>
+
+<div class="proposal">
+<strong>The new idea:</strong> Add a fourth trunk by re-encoding the same image a second time, this time after the model has seen the question. The sequence becomes:
+<ol>
+  <li>Trunk 1: <strong>Image</strong> (first encoding, sees nothing)</li>
+  <li>Trunk 2: <strong>Text prompt</strong> (the question, sees T1)</li>
+  <li>Trunk 3: <strong>Image again</strong> (second encoding, sees T1 + T2 — i.e., the question is in context)</li>
+  <li>Trunk 4: <strong>Text response</strong> (the answer, sees T1, T2, T3)</li>
+</ol>
+The second image trunk lets the vision encoder produce <strong>question-aware features</strong> — features that have been computed with the question already in context.
+</div>
+
+<div class="figure">
+<svg width="900" height="380" viewBox="0 0 900 380" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#666"/>
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="450" y="26" text-anchor="middle" font-family="-apple-system, sans-serif" font-size="16" font-weight="600" fill="#1a1a1a">4-Trunk VLM (proposed extension)</text>
+
+  <!-- Trunks (smaller, 4 of them) -->
+  <g transform="translate(35, 70)">
+    <rect x="0" y="0" width="195" height="125" rx="8" fill="#7CB342" opacity="0.85"/>
+    <text x="97.5" y="32" text-anchor="middle" font-size="13" fill="white" font-weight="600">Trunk 1</text>
+    <text x="97.5" y="50" text-anchor="middle" font-size="13" fill="white" font-weight="600">Image (1st pass)</text>
+    <text x="97.5" y="70" text-anchor="middle" font-size="11" fill="white">unconditional</text>
+    <text x="97.5" y="86" text-anchor="middle" font-size="11" fill="white">visual features</text>
+    <text x="97.5" y="104" text-anchor="middle" font-size="11" fill="white" font-style="italic">intra: bidirectional</text>
+    <text x="97.5" y="120" text-anchor="middle" font-size="11" fill="white" font-style="italic">sees: nothing</text>
+  </g>
+
+  <g transform="translate(245, 70)">
+    <rect x="0" y="0" width="195" height="125" rx="8" fill="#4A90E2" opacity="0.85"/>
+    <text x="97.5" y="32" text-anchor="middle" font-size="13" fill="white" font-weight="600">Trunk 2</text>
+    <text x="97.5" y="50" text-anchor="middle" font-size="13" fill="white" font-weight="600">Text prompt</text>
+    <text x="97.5" y="70" text-anchor="middle" font-size="11" fill="white">the question</text>
+    <text x="97.5" y="104" text-anchor="middle" font-size="11" fill="white" font-style="italic">intra: causal</text>
+    <text x="97.5" y="120" text-anchor="middle" font-size="11" fill="white" font-style="italic">sees: T1</text>
+  </g>
+
+  <g transform="translate(455, 70)">
+    <rect x="0" y="0" width="195" height="125" rx="8" fill="#9CCC65" opacity="0.85"/>
+    <text x="97.5" y="32" text-anchor="middle" font-size="13" fill="white" font-weight="600">Trunk 3</text>
+    <text x="97.5" y="50" text-anchor="middle" font-size="13" fill="white" font-weight="600">Image (2nd pass)</text>
+    <text x="97.5" y="70" text-anchor="middle" font-size="11" fill="white">question-aware</text>
+    <text x="97.5" y="86" text-anchor="middle" font-size="11" fill="white">visual features</text>
+    <text x="97.5" y="104" text-anchor="middle" font-size="11" fill="white" font-style="italic">intra: bidirectional</text>
+    <text x="97.5" y="120" text-anchor="middle" font-size="11" fill="white" font-style="italic">sees: T1 + T2</text>
+  </g>
+
+  <g transform="translate(665, 70)">
+    <rect x="0" y="0" width="195" height="125" rx="8" fill="#FF8A65" opacity="0.85"/>
+    <text x="97.5" y="32" text-anchor="middle" font-size="13" fill="white" font-weight="600">Trunk 4</text>
+    <text x="97.5" y="50" text-anchor="middle" font-size="13" fill="white" font-weight="600">Text response</text>
+    <text x="97.5" y="70" text-anchor="middle" font-size="11" fill="white">the answer (AR)</text>
+    <text x="97.5" y="104" text-anchor="middle" font-size="11" fill="white" font-style="italic">intra: causal</text>
+    <text x="97.5" y="120" text-anchor="middle" font-size="11" fill="white" font-style="italic">sees: T1, T2, T3</text>
+  </g>
+
+  <!-- Arrows -->
+  <line x1="230" y1="130" x2="243" y2="130" stroke="#666" stroke-width="2" marker-end="url(#arr2)"/>
+  <line x1="440" y1="130" x2="453" y2="130" stroke="#666" stroke-width="2" marker-end="url(#arr2)"/>
+  <line x1="650" y1="130" x2="663" y2="130" stroke="#666" stroke-width="2" marker-end="url(#arr2)"/>
+
+  <!-- Same Image Note -->
+  <g transform="translate(60, 215)">
+    <text x="270" y="0" text-anchor="middle" font-size="12" font-weight="600" fill="#388E3C">↑ same image, encoded twice ↑</text>
+    <text x="270" y="18" text-anchor="middle" font-size="11" fill="#666">first time: pure visual representation</text>
+    <text x="270" y="35" text-anchor="middle" font-size="11" fill="#666">second time: representation conditioned on having seen the question</text>
+  </g>
+
+  <!-- Loss -->
+  <line x1="763" y1="200" x2="763" y2="240" stroke="#8a3324" stroke-width="2" marker-end="url(#arr2)"/>
+  <text x="763" y="265" text-anchor="middle" font-size="12" font-weight="600" fill="#8a3324">LM cross-entropy loss</text>
+  <text x="763" y="282" text-anchor="middle" font-size="11" fill="#666">(supervises both T1 and T3)</text>
+
+  <!-- Bottom training/frozen labels -->
+  <g transform="translate(35, 305)">
+    <text x="97.5" y="0" text-anchor="middle" font-size="12" font-weight="600" fill="#8a3324">Vision encoder: TRAINED</text>
+    <text x="97.5" y="16" text-anchor="middle" font-size="11" fill="#888" font-style="italic">(unconditional pass)</text>
+  </g>
+
+  <g transform="translate(245, 305)">
+    <text x="97.5" y="0" text-anchor="middle" font-size="12" font-weight="600" fill="#1a4f72">LLM: FROZEN</text>
+  </g>
+
+  <g transform="translate(455, 305)">
+    <text x="97.5" y="0" text-anchor="middle" font-size="12" font-weight="600" fill="#8a3324">Vision encoder: TRAINED</text>
+    <text x="97.5" y="16" text-anchor="middle" font-size="11" fill="#888" font-style="italic">(question-conditioned)</text>
+  </g>
+
+  <g transform="translate(665, 305)">
+    <text x="97.5" y="0" text-anchor="middle" font-size="12" font-weight="600" fill="#1a4f72">LLM: FROZEN</text>
+  </g>
+</svg>
+</div>
+
+<p class="caption">Figure 2: The 4-trunk extension. Trunks 1 and 3 process the <em>same</em> image — Trunk 1 produces unconditional visual features; Trunk 3 produces question-aware features (because by the time Trunk 3 runs, the question has already been seen via the causal attention). Both encodings flow into the answer.</p>
+
+<hr>
+
+<h2>What's new in the 4-trunk version</h2>
+
+<p>The single conceptual innovation: <strong>the same image is encoded twice, with the second encoding conditioned on having seen the question</strong>.</p>
+
+<h3>Why this is interesting</h3>
+
+<p>In a standard PaliGemma-style 3-trunk model, the image encoder is <em>question-agnostic</em>: it produces the same features regardless of what's asked. The LLM has to do all the question-relevant feature selection on the language side, working from a fixed visual representation.</p>
+
+<p>The 4-trunk version lets the vision encoder itself produce <em>question-aware</em> features. Trunk 3's encoder has access to:</p>
+<ul>
+  <li>The original image (via Trunk 1, plus the same pixel input)</li>
+  <li>The question (via Trunk 2)</li>
+</ul>
+
+<p>So Trunk 3 can ask: "given the question, which visual features matter most? Which regions should I emphasize? Which fine-grained details should I extract that I didn't bother with the first time?"</p>
+
+<p>This mirrors how humans look at images for VQA: a quick first glance to understand the scene, then read the question, then a focused second look to extract the answer-relevant information.</p>
+
+<h3>What it could enable for vision encoder training</h3>
+
+<p>Recall the high-level goal: <strong>train a strong vision encoder using a frozen LLM</strong>. The 4-trunk design changes what "strong" means for the encoder:</p>
+
+<ol>
+  <li><strong>Trunk 1's encoder learns general-purpose features</strong> (no question available). This is closest to a CLIP/SigLIP-style "summarize the image" encoding.</li>
+  <li><strong>Trunk 3's encoder learns conditional, attention-driven features</strong> (question available). This is closer to "look at the image with a goal in mind."</li>
+</ol>
+
+<p>If the same encoder weights handle both passes, the encoder must learn <em>both</em> behaviors — general visual understanding AND question-conditioned focus. This is a richer learning signal than either alone.</p>
+
+<p>Alternative: use two separate encoders for Trunk 1 and Trunk 3, with different weights. Then Trunk 1's encoder is a pure feature extractor (CLIP-like) and Trunk 3's encoder is specifically a question-conditioned reader.</p>
+
+<hr>
+
+<h2>Open design questions</h2>
+
+<p>Several knobs to set before this becomes concrete:</p>
+
+<table>
+  <thead>
+    <tr><th>Question</th><th>Options</th><th>Tradeoff</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Same encoder weights for T1 and T3?</td>
+      <td>(a) Shared (single encoder, used twice) (b) Separate (two encoders)</td>
+      <td>Shared = parameter-efficient + forces unified behavior. Separate = more capacity, easier to specialize.</td>
+    </tr>
+    <tr>
+      <td>What does T3 actually attend to?</td>
+      <td>(a) T3 self-attention only sees T3, with cross-attention to T1+T2 (b) T3 is in the same Transformer stack as T1+T2 (one big sequence)</td>
+      <td>(a) is closer to a "question-conditioned vision encoder." (b) is simpler — just a longer sequence. Choice affects implementation a lot.</td>
+    </tr>
+    <tr>
+      <td>Does T3 produce raw image features (like T1) or summary tokens (like Q-Former)?</td>
+      <td>(a) Same N tokens as T1 (b) Compressed K queries (Q-Former-like)</td>
+      <td>(a) gives T4 maximum information. (b) gives T4 a focused "summary for this question" — could be a good information bottleneck.</td>
+    </tr>
+    <tr>
+      <td>How much extra compute does T3 add?</td>
+      <td>~1× the vision encoder cost (for the second pass)</td>
+      <td>Doubles vision encoder forward pass cost. May be worth it if the encoder is small relative to the LLM.</td>
+    </tr>
+    <tr>
+      <td>What if the question is multi-turn?</td>
+      <td>(a) Re-encode after every question (T3, T5, T7, ...) (b) Re-encode just once</td>
+      <td>(a) is more powerful but expensive. (b) is the cheap default.</td>
+    </tr>
+    <tr>
+      <td>How does this interact with the "LLM-agnostic encoder" goal?</td>
+      <td>The encoder still gets gradients via the frozen LLM. T3 specifically learns to encode for "what this LLM will need next" — this could leak LLM-specific bias.</td>
+      <td>Could mitigate via multi-LLM training (from <a href="01_llm_agnostic_vision_encoder.html">brainstorm/01</a>): T3's encoder must produce features that satisfy multiple frozen LLMs.</td>
+    </tr>
+  </tbody>
+</table>
+
+<hr>
+
+<h2>Connections to existing work</h2>
+
+<p>The 4-trunk pattern is reminiscent of (but not identical to) several existing ideas:</p>
+
+<ul>
+  <li><strong>Two-pass attention in classical VQA</strong> (e.g., Show, Attend and Tell; Bottom-Up Top-Down) — model produces attention over image features conditioned on the question. The 4-trunk design generalizes this to a full re-encoding rather than just attention reweighting.</li>
+  <li><strong>Q-Former</strong> (BLIP-2; see <a href="../related/09_qformer_explainer.html">related/09</a>) — learnable queries pull task-relevant information from frozen image features. The 4-trunk Trunk 3 plays a similar role, but the queries come from the actual question text rather than from learned vectors.</li>
+  <li><strong>Cross-attention insertion</strong> (Flamingo) — frozen LLM with trainable cross-attention layers that look at image features. The 4-trunk design is the inverse: trainable image encoder that looks at frozen text features.</li>
+  <li><strong>"Thinking with Images"</strong> (V*, Visual Sketchpad — see <a href="../deepseek_vision/01_visual_cot_survey.html">deepseek_vision/01</a>) — model iteratively re-examines the image at higher resolution. 4-trunk is a structural single-pass version of "look again" — the second look is built into the architecture rather than triggered at test time.</li>
+  <li><strong>Reasoning-conditioned encoding</strong> in some recent VLMs (e.g., InternVL re-encoding crops) — similar spirit, different mechanism.</li>
+</ul>
+
+<p>What's distinctive about the 4-trunk framing: it's an <strong>architectural</strong> commitment to question-conditioned vision encoding, with explicit causal ordering between trunks. Most prior work either (a) does this implicitly via attention without re-encoding pixels, or (b) does it at test time via tool use rather than as part of training.</p>
+
+<hr>
+
+<h2>Why this serves the high-level goal</h2>
+
+<p>Recall the high-level goal: <strong>train a strong vision encoder using a frozen LLM as supervisor</strong>. The 4-trunk extension serves this goal in two ways:</p>
+
+<ol>
+  <li><strong>Richer supervision signal</strong>. The vision encoder now receives gradients via two paths: (a) Trunk 1's contribution to the answer (general features matter), and (b) Trunk 3's contribution to the answer (question-conditioned features matter). The encoder must learn to do both.</li>
+  <li><strong>Forces the encoder to be task-aware</strong>. By being given the question before encoding, the encoder learns to produce features that are <em>useful given a goal</em>, not just "what's in this image." This is closer to how vision is used in practice — almost always as input to some downstream task.</li>
+</ol>
+
+<p>The risk: Trunk 3's encoding may "overfit" to the questions seen in training. Mitigations: diverse questions per image, multi-LLM training (from brainstorm/01), and possibly periodically training Trunk 3 with the question masked to preserve generality.</p>
+
+<hr>
+
+<h2>Where this fits in the brainstorm series</h2>
+
+<ul>
+  <li><a href="00_depth_split_vlm.html">brainstorm/00</a> — depth-split VLM (a deployment-time architecture)</li>
+  <li><a href="01_llm_agnostic_vision_encoder.html">brainstorm/01</a> — LLM-agnostic vision encoder via frozen-LLM supervision (the high-level goal)</li>
+  <li><a href="02_depth_split_related_work.html">brainstorm/02</a> — literature scan for the depth-split design</li>
+  <li><a href="03_vision_encoder_pretraining_survey.html">brainstorm/03</a> — literature scan for vision encoder pretraining via LLM</li>
+  <li><strong>brainstorm/04 (this document)</strong> — multi-trunk VLM design (3-trunk baseline + 4-trunk extension)</li>
+</ul>
+
+<p>This document is the architectural concrete next step: given the goal (brainstorm/01) and the literature (brainstorm/03), here's a specific design (multi-trunk) that operationalizes the goal.</p>
+
+<blockquote>
+The 4-trunk design takes the standard PaliGemma-style "Image → Prompt → Response" layout and inserts a second image-encoding trunk after the prompt, letting the vision encoder produce question-aware features. The proposal is structurally simple but has substantial design questions to resolve (shared vs separate encoders, what T3 attends to, raw vs compressed output). The goal is to give the vision encoder richer supervision — both unconditional (Trunk 1) and conditional (Trunk 3) — while keeping the LLM frozen.
+</blockquote>
+
+</body>
+</html>

@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PaliGemma-style Visual Understanding Baseline - Detailed Summary</title>
+  <style>
+    :root {
+      --bg: #f5f7fb;
+      --card: #ffffff;
+      --text: #1f2a37;
+      --muted: #58657a;
+      --accent: #0f766e;
+      --accent-soft: #e7f6f3;
+      --border: #dbe3ee;
+      --good: #156a3f;
+      --warn: #915f00;
+      --mono: "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      --sans: "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      color: var(--text);
+      background:
+        radial-gradient(circle at 10% 0%, #d7efe9 0%, transparent 38%),
+        radial-gradient(circle at 100% 12%, #e2ecfb 0%, transparent 32%),
+        var(--bg);
+      line-height: 1.6;
+    }
+
+    .wrap {
+      width: min(1100px, 92vw);
+      margin: 32px auto 56px;
+    }
+
+    .hero, .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      box-shadow: 0 8px 28px rgba(18, 35, 63, 0.07);
+    }
+
+    .hero { padding: 26px 28px; }
+    .hero h1 { margin: 0 0 6px; font-size: clamp(1.55rem, 2.2vw, 2rem); }
+    .hero p { margin: 0; color: var(--muted); }
+
+    .stack { margin-top: 16px; }
+
+    .card { padding: 18px 20px; margin-bottom: 16px; }
+    .card h2 { margin: 0 0 8px; font-size: 1.15rem; }
+    .card h3 { margin: 14px 0 6px; font-size: 1rem; }
+
+    .badge {
+      display: inline-block;
+      margin-bottom: 8px;
+      padding: 2px 9px;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: var(--accent);
+      background: var(--accent-soft);
+      border: 1px solid #c6ece5;
+    }
+
+    code {
+      font-family: var(--mono);
+      font-size: 0.92em;
+      background: #f1f5fa;
+      border: 1px solid #e0e7f0;
+      border-radius: 6px;
+      padding: 1px 6px;
+    }
+
+    ul { margin: 6px 0 0 18px; padding: 0; }
+    .muted { color: var(--muted); }
+    .good { color: var(--good); }
+    .warn { color: var(--warn); }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 8px;
+      font-size: 0.95rem;
+    }
+    th, td {
+      border: 1px solid var(--border);
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th { background: #f8fbff; }
+
+    .foot {
+      margin-top: 14px;
+      font-size: 0.86rem;
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="hero">
+      <h1>PaliGemma-style Visual Understanding Baseline</h1>
+      <p>
+        This report presents an autoregressive multimodal baseline built on a <strong>Vision Encoder + Gemma Decoder</strong>.
+        It consolidates architecture, implementation details, training settings, evaluation protocols, and current experimental results.
+      </p>
+    </section>
+
+    <section class="stack">
+      <article class="card">
+        <span class="badge">Architecture</span>
+        <h2>Model Overview</h2>
+        <ul>
+          <li><strong>Overall paradigm:</strong> image and text are combined and decoded with next-token prediction (AR generation).</li>
+          <li><strong>Vision encoder:</strong> flexible transformer-based module; the current implementation uses a 1-D tokenizer route.</li>
+          <li><strong>Language decoder:</strong> Gemma initialized from pretrained checkpoint; the vision side is trained from scratch.</li>
+        </ul>
+
+        <h3>Tensor Flow</h3>
+        <ul>
+          <li><code>image (B,H,W,C) -&gt; patchify (B,T,C) -&gt; vision encoder (B,T,C)</code></li>
+          <li><code>2-layer MLP + RMSNorm -&gt; image embeddings (B,T,D)</code></li>
+          <li><code>text -&gt; Gemma tokenizer -&gt; text embeddings (B,T,D)</code></li>
+          <li><code>concat(image, text) -&gt; Gemma decoder -&gt; logits (B,T,V) -&gt; cross entropy</code></li>
+        </ul>
+
+        <h3>Attention Mask (same policy as PaliGemma)</h3>
+        <ul>
+          <li>Image tokens and prompt tokens use <strong>full attention</strong>.</li>
+          <li>Answer tokens use <strong>causal attention</strong>.</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <span class="badge">1-D Encoder</span>
+        <h2>Current Image Encoder Implementation</h2>
+        <ul>
+          <li>From <code>models/siglip_enc_dec.py</code>: three-stage encoding with patch self-attn, learnable-token cross-attn, then token self-attn.</li>
+          <li>Default MAE-B style setup: <code>enc_hidden_dim=768</code>, <code>num_learnable_tokens=256</code>, and stage depths <code>3/6/3</code>.</li>
+          <li>Optional mid-stream visibility masking (<code>enc_cross_attn_split</code>) controls information bottleneck in visual token flow.</li>
+        </ul>
+
+        <h3>Generation Strategy</h3>
+        <ul>
+          <li>Default decoding is <strong>greedy</strong> (<code>beam_size=1</code>).</li>
+          <li>Beam search is implemented, but currently provides limited gains for QA-style tasks.</li>
+        </ul>
+
+        <h3>LM Backbones (present in this codebase)</h3>
+        <ul>
+          <li><strong>Base:</strong> <code>gemma3_270M</code> (main baseline).</li>
+          <li><strong>Larger:</strong> <code>gemma2_2B</code> (supported in loader and training path).</li>
+        </ul>
+
+        <p class="foot">For the referenced run, the log reports <code>358,511,104</code> trainable parameters (~358.5M).</p>
+      </article>
+
+      <article class="card">
+        <span class="badge">Datasets</span>
+        <h2>Data Composition and Task Formatting</h2>
+
+        <h3>Pretraining Mix</h3>
+        <table>
+          <thead>
+            <tr><th>Category</th><th>Data Source</th><th>Prompt Pattern (example)</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Caption</td><td>LAION-AES, recaptioned CC12M, BLIP3o-short</td><td><code>caption en\n ...</code></td></tr>
+            <tr><td>VQA</td><td>Visual Genome</td><td><code>answer en\n{question}\n ...</code></td></tr>
+            <tr><td>OCR</td><td>rendered-text-512</td><td><code>ocr en\n{question}\n ...</code></td></tr>
+            <tr><td>Grounded Caption</td><td>Visual Genome (region-level)</td><td><code>caption &lt;loc_ymin&gt;&lt;loc_xmin&gt;&lt;loc_ymax&gt;&lt;loc_xmax&gt;\n ...</code></td></tr>
+          </tbody>
+        </table>
+
+        <h3>&lt;loc&gt; Token Mechanism</h3>
+        <ul>
+          <li>Bounding-box coordinates are quantized into <code>[0, 1023]</code> and represented by four discrete tokens (ymin/xmin/ymax/xmax).</li>
+          <li>Tokens are formatted as <code>&lt;loc0000&gt; ... &lt;loc1023&gt;</code>; embeddings are initialized at training startup.</li>
+          <li>Initialization follows the sinusoidal scheme described in your note, and these embeddings remain learnable.</li>
+        </ul>
+
+        <h3>Finetuning Data</h3>
+        <ul>
+          <li>Two practical finetuning routes are used:
+            (1) finetune on <code>VQAv2 train</code> / <code>TextVQA train</code> for matched evaluation;
+            (2) alternative SFT on <code>LLaVA-1.5-Instruct</code> then broader zero-shot evaluation.</li>
+          <li>The current example in <code>configs/finetune_config.yml</code> uses <code>llava-1.5</code>.</li>
+        </ul>
+
+        <h3>Input Resolution</h3>
+        <ul>
+          <li>Pretraining commonly uses fixed resolution without a separate high-resolution stage.</li>
+          <li>With large-patch transformers, both <code>256</code> and <code>512</code> are practical options.</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <span class="badge">Training</span>
+        <h2>Training Setup (Pretrain / Finetune)</h2>
+
+        <h3>Pretrain (from remote_run_config)</h3>
+        <ul>
+          <li>Optimizer: <strong>Muon</strong> in the main setup, with <code>lr=2e-4</code>, <code>wd=0.05</code>; Adam is available as an alternative.</li>
+          <li>Schedule: <code>lr_schedule=const</code>, <code>warmup_steps=30000</code>.</li>
+          <li>Scale: <code>batch_size=1024</code>, <code>num_steps=300000</code>.</li>
+          <li>Soft caps: <code>attn_logits_soft_cap=50.0</code>, <code>final_logit_softcap=30.0</code>.</li>
+          <li>Vision path: <code>siglip_from_scratch=True</code> with MAE-B style encoder settings.</li>
+        </ul>
+
+        <h3>Finetune (from finetune_config)</h3>
+        <ul>
+          <li>Optimizer: Muon, typically <code>lr=2e-5</code>, <code>wd=0.02</code>.</li>
+          <li>Schedule: <code>lr_schedule=cos</code>, <code>warmup_steps=4000</code>, <code>num_steps=40000</code>.</li>
+          <li>Scale: <code>batch_size=256</code>.</li>
+          <li>Soft caps are disabled in the shown finetune file (both set to 0.0).</li>
+        </ul>
+
+        <h3>CFG-related Training Terms</h3>
+        <ul>
+          <li><code>vlm_loss_weight</code>: standard image-conditioned NTP loss.</li>
+          <li><code>text_only_loss_weight</code>: text-only branch loss (corresponding to <code>loss_text_only</code>).</li>
+          <li><code>cfg_loss_weight</code>: CFG-style contrastive term (corresponding to <code>loss_cfg</code>).</li>
+          <li><code>alpha</code>: CFG contrastive strength; <code>alpha &gt; 0</code> enables text-only forward pass.</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <span class="badge">Evaluation</span>
+        <h2>Benchmarks and Protocols</h2>
+        <ul>
+          <li><strong>VQAv2:</strong> train/val available; standard accuracy tracking.</li>
+          <li><strong>MME:</strong> report both MME-P and MME-S scores.</li>
+          <li><strong>TextVQA:</strong> train/val available; currently a key weakness area.</li>
+          <li><strong>POPE:</strong> can be run zero-shot; report macro F1 and split-wise metrics (random/popular/adversarial).</li>
+          <li><strong>ImageNet KNN:</strong> supports online partial monitoring (128 images/class) and final full evaluation; can be run zero-shot.</li>
+          <li><strong>MMBench:</strong> treated as non-zero-shot in your current setup notes.</li>
+        </ul>
+
+      </article>
+
+      <article class="card">
+        <span class="badge">Current Results</span>
+        <h2>Current Status (Partial)</h2>
+        <p class="muted">Results are still in flux due to ongoing development; the current table mainly reflects base-model status.</p>
+        <table>
+          <thead>
+            <tr><th>Metric</th><th>Best Current (approx.)</th><th>Comment</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>VQAv2</td><td class="good">~65</td><td>Main base-model result currently tracked.</td></tr>
+            <tr><td>MME</td><td class="good">~805 / 1030</td><td>Combined report from P/S parts.</td></tr>
+            <tr><td>TextVQA</td><td class="warn">~10</td><td>Low at present; 512-resolution runs have not been systematically explored yet.</td></tr>
+            <tr><td>POPE</td><td>~68</td><td>Zero-shot capable in current pipeline.</td></tr>
+            <tr><td>ImageNet KNN</td><td>~52</td><td>Both partial and full protocols are wired.</td></tr>
+          </tbody>
+        </table>
+      </article>
+    </section>
+  </main>
+</body>
+</html>
