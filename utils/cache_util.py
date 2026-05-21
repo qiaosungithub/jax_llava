@@ -34,7 +34,7 @@ class HHFileCache:
     
     # recursive ls
     all_files = glob.glob(os.path.join(SHARED_PATH, '**'), recursive=True)
-    all_files = [f for f in all_files if len(os.path.basename(f)) > 68] # jit-fnnanmeHASH / pmap-fnnanmeHASH, HASH is 64 chars
+    all_files = [f for f in all_files if len(os.path.basename(f)) > 68] # jit-fnnanmeHASH / pjit-fnnanmeHASH, HASH is 64 chars
     print0(f'zhh: Found {len(all_files)} cached files in HHFileCache', flush=True)
     self.key_to_file = {os.path.basename(f): f for f in all_files}
 
@@ -135,21 +135,8 @@ def zhh_cache_write(cache_key: str,
     else:
       # worker 0
       # Write the cache entry.
-      if cache_key.startswith('pmap'):
-        print0(f'🤖 Detected pmap cache key {cache_key}. Caching...', flush=True)
-        try:
-          compilation_cache.put_executable_and_time(
-              cache_key, module_name, executable, backend, int(compile_time_secs))
-        except Exception as ex:
-          raise RuntimeError(f'zhh: failed to write cache') from ex
-          # if config.raise_persistent_cache_errors.value:
-          #   raise
-          # warnings.warn(
-          #     f"Error writing persistent compilation cache entry for "
-          #     f"'{module_name}': {type(ex).__name__}: {ex}")
-        print0(f'{Emoji.GOOD} caching key {cache_key} finished', flush=True)
-      elif cache_key.startswith('pjit'):
-        print0(f'{Emoji.ROBOT} Detected pjit cache key {cache_key}. Caching...', flush=True)
+      if cache_key.startswith('pjit') or cache_key.startswith('jit'):
+        print0(f'{Emoji.ROBOT} Detected jit/pjit cache key {cache_key}. Caching...', flush=True)
         try:
           compilation_cache.put_executable_and_time(
               cache_key, module_name, executable, backend, int(compile_time_secs))
@@ -157,8 +144,8 @@ def zhh_cache_write(cache_key: str,
           raise RuntimeError(f'zhh: failed to write cache') from ex
         print0(f'{Emoji.GOOD} caching key {cache_key} finished', flush=True)
       else:
-        print0(f'{Emoji.WARNING} WARNING: Not caching key {cache_key} since it do not begin with pmap or pjit.', flush=True)
-        print0(f'{Emoji.THUMBS} Please use pmap or pjit instead of JIT compilation on multiple devices.', flush=True)
+        print0(f'{Emoji.WARNING} WARNING: Not caching key {cache_key} since it do not begin with jit or pjit.', flush=True)
+        print0(f'{Emoji.THUMBS} Please use jit/HSDP compilation on multiple devices.', flush=True)
 
   # sync devices before proceeding
   mu.sync_global_devices(f'cache write')

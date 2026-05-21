@@ -1,289 +1,268 @@
+"""jit/HSDP sharding helpers for JAX training."""
+
 import enum
 import functools
-import jax
-import jax.numpy as jnp
-import jax.tree_util as jtu
-import numpy as np
-from jax.sharding import Mesh as M, PartitionSpec as P, NamedSharding
-from jax.experimental import mesh_utils, multihost_utils
-from jax.experimental.pjit import pjit
-from utils.logging_util import log_for_0, print0, Emoji
 from typing import Tuple
 
-TOPOLOGIES = {
-  "v6": {
-    32: (8, 4),
-    64: (8, 8),
-    128: (8, 16),
-  },
-  "v5": {
-    16: (4, 4), # v5-32
-    32: (2, 4, 4), # v5-64
-    64: (4, 4, 4), # v5-128
-  },
-  "v4": {
-    4: (4, 1), # v4-8
-    16: (4, 4), # v4-32
-    32: (2, 4, 4), # v4-64
-    64: (4, 4, 4), # v4-128
-  }
-}
+import jax
+import jax.tree_util as jtu
+import numpy as np
+from jax.experimental import mesh_utils, multihost_utils
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-def _get_shape(p):
-  if hasattr(p, 'shape'):
-    return "shape", p.shape
-  elif hasattr(p, 'value'):
-    return "value.shape", p.value.shape
-  elif isinstance(p, Tuple):
-    return "self", p
-  elif isinstance(p, int) or isinstance(p, float):
-    return "scalar", ()
-  else:
-    return "unk", p
-  
-def _path_keys(path):
-  '''
-  Convert a path (tuple of keys) to a list of string keys.
-  '''
-  keys = []
-  for k in path:
-    if hasattr(k, "key"):
-      keys.append(str(k.key))
-    elif hasattr(k, "name"):
-      keys.append(str(k.name))
-    elif hasattr(k, "idx"):
-      keys.append(str(k.idx))
-    else:
-      keys.append(str(k))
-  return keys
+from utils.logging_util import log_for_0
+
+_mesh = None
+
 
 class MeshMode(enum.Enum):
-  DATA = enum.auto()
-  MODEL = enum.auto()
-  
-def validate_sharding_spec(leaf, spec, mesh_shape: dict):
-  """
-  Check if the leaf shape is divisible by the mesh dimensions specified in spec.
-  """
-  if spec is None:
-    return True, "No spec provided"
-  
-  msg, shape = _get_shape(leaf)
-  if msg == "unk":
-    return False, f"Cannot get shape of leaf: {leaf}"
-  
-  shape_len = len(shape)
-  spec_len = len(spec)
-  
-  if shape_len < spec_len:
-    return False, f"Leaf shape {shape} has fewer dimensions than spec {spec}"
-  
-  for i in range(spec_len):
-    axis_rule = spec[i]
-    if axis_rule is None:
-      continue
-        
-    dim_size = shape[i]
-    divisor = 1
-    
-    try:
-      if isinstance(axis_rule, str):
-        divisor = mesh_shape.get(axis_rule, 0)
-      elif isinstance(axis_rule, (tuple, list)):
-        for ax in axis_rule:
-          divisor *= mesh_shape.get(ax, 0)
-      else:
-        return False, f"Unknown axis rule type: {type(axis_rule)}"
-    except Exception as e:
-      return False, f"Error parsing axis rule {axis_rule}: {str(e)}"
+    DATA = enum.auto()
+    MODEL = enum.auto()
 
-    if divisor == 0:
-      return False, f"Axis rule {axis_rule} not found in mesh {mesh_shape}"
 
-    if dim_size % divisor != 0:
-      return False, f"Dim {i} size {dim_size} is not divisible by mesh axes {axis_rule} (total size {divisor})"
+TOPOLOGIES = {
+    "v6": {
+        4: (1, 4),
+        16: (4, 4),
+        32: (8, 4),
+        64: (8, 8),
+        128: (8, 16),
+    },
+    "v5": {
+        4: (1, 4),
+        8: (2, 4),
+        16: (4, 4),
+        32: (2, 4, 4),
+        64: (4, 4, 4),
+        128: (8, 4, 4),
+    },
+    "v4": {
+        4: (4, 1),
+        16: (4, 4),
+        32: (2, 4, 4),
+        64: (4, 4, 4),
+    },
+}
 
-  return True, "ok"
 
-def shard_cpu_state_to_mesh(cpu_state, mesh, partition_specs):
-    sharding_tree = jax.tree_util.tree_map(
-        lambda spec: NamedSharding(mesh, spec),
-        partition_specs
+def _get_shape(x):
+    if hasattr(x, "shape"):
+        return "shape", x.shape
+    if hasattr(x, "value"):
+        return "value.shape", x.value.shape
+    if isinstance(x, Tuple):
+        return "self", x
+    if isinstance(x, (int, float)):
+        return "scalar", ()
+    return "unknown", x
+
+
+def _as_tuple_spec(spec):
+    return tuple(spec) if spec is not None else ()
+
+
+def _validate_sharding_spec(leaf, spec, mesh_shape):
+    if spec is None:
+        return True, "ok"
+    msg, shape = _get_shape(leaf)
+    if msg == "unknown":
+        return False, f"cannot get shape for {leaf}"
+    spec_tuple = _as_tuple_spec(spec)
+    if len(shape) < len(spec_tuple):
+        return False, f"shape {shape} has fewer dims than spec {spec}"
+    for dim, axis_rule in enumerate(spec_tuple):
+        if axis_rule is None:
+            continue
+        divisor = 1
+        if isinstance(axis_rule, str):
+            divisor = mesh_shape.get(axis_rule, 0)
+        elif isinstance(axis_rule, (tuple, list)):
+            for axis_name in axis_rule:
+                divisor *= mesh_shape.get(axis_name, 0)
+        else:
+            return False, f"unsupported axis rule {axis_rule}"
+        if divisor == 0:
+            return False, f"axis rule {axis_rule} missing from mesh"
+        if shape[dim] % divisor != 0:
+            return False, f"dim {dim}={shape[dim]} not divisible by {divisor}"
+    return True, "ok"
+
+
+def _make_valid_spec(leaf, spec, mesh_shape):
+    if spec is None:
+        return P()
+    msg, shape = _get_shape(leaf)
+    if msg == "unknown":
+        return P()
+    spec_tuple = _as_tuple_spec(spec)
+    if len(shape) < len(spec_tuple):
+        spec_tuple = spec_tuple[-len(shape):]
+    if len(shape) > len(spec_tuple):
+        spec_tuple = (None,) * (len(shape) - len(spec_tuple)) + spec_tuple
+
+    out = []
+    for dim, axis_rule in enumerate(spec_tuple):
+        if axis_rule is None:
+            out.append(None)
+            continue
+        divisor = 1
+        if isinstance(axis_rule, str):
+            divisor = mesh_shape.get(axis_rule, 0)
+        elif isinstance(axis_rule, (tuple, list)):
+            for axis_name in axis_rule:
+                divisor *= mesh_shape.get(axis_name, 0)
+        else:
+            out.append(None)
+            continue
+        out.append(axis_rule if divisor and shape[dim] % divisor == 0 else None)
+    return P() if all(x is None for x in out) else P(*out)
+
+
+def apply_spec_to_last_dims(leaf, spec):
+    msg, shape = _get_shape(leaf)
+    if msg == "unknown":
+        return P()
+    spec_tuple = _as_tuple_spec(spec)
+    if len(shape) < len(spec_tuple):
+        return P(*spec_tuple[-len(shape):]) if shape else P()
+    return P(*((None,) * (len(shape) - len(spec_tuple)) + spec_tuple))
+
+
+def get_spec_dict(tree, mesh: Mesh, param_mode: MeshMode, sharding_mode: str):
+    sharding_mode = str(sharding_mode).lower()
+    if param_mode == MeshMode.DATA:
+        spec_tree = jax.tree.map(lambda _: P(tuple(mesh.axis_names)), tree)
+    elif sharding_mode == "ddp":
+        spec_tree = jax.tree.map(lambda _: P(), tree)
+    elif sharding_mode == "hsdp":
+        model_shard = P(mesh.axis_names[-1])
+        spec_tree = jax.tree.map(lambda leaf: apply_spec_to_last_dims(leaf, model_shard), tree)
+    elif sharding_mode == "fsdp":
+        if len(mesh.axis_names) == 1:
+            model_shard = P(mesh.axis_names[-1])
+        else:
+            model_shard = P(mesh.axis_names[-1], tuple(mesh.axis_names[:-1]))
+        spec_tree = jax.tree.map(lambda leaf: apply_spec_to_last_dims(leaf, model_shard), tree)
+    else:
+        raise ValueError(f"Unsupported sharding mode: {sharding_mode}")
+
+    mesh_shape = {name: size for name, size in zip(mesh.axis_names, mesh.devices.shape)}
+    tree_flat, _ = jtu.tree_flatten_with_path(tree)
+    spec_flat, treedef = jtu.tree_flatten_with_path(spec_tree)
+    if len(tree_flat) != len(spec_flat):
+        raise ValueError(f"Tree/spec length mismatch: {len(tree_flat)} vs {len(spec_flat)}")
+
+    new_specs = []
+    for (path, leaf), (spec_path, spec) in zip(tree_flat, spec_flat):
+        if path != spec_path:
+            raise ValueError(f"Tree/spec path mismatch: {path} vs {spec_path}")
+        valid, reason = _validate_sharding_spec(leaf, spec, mesh_shape)
+        if valid:
+            new_specs.append(spec)
+            continue
+        best_spec = _make_valid_spec(leaf, spec, mesh_shape)
+        log_for_0(
+            "Sharding fallback at %s: %s -> %s (%s)",
+            jtu.keystr(path),
+            spec,
+            best_spec,
+            reason,
+        )
+        new_specs.append(best_spec)
+    return jtu.tree_unflatten(treedef, new_specs)
+
+
+def get_mesh() -> Mesh:
+    global_device_count = jax.device_count()
+    device_kind = jax.local_devices()[0].device_kind.lower()
+    mesh_shape = None
+    for topo_name, topo_shapes in TOPOLOGIES.items():
+        if topo_name in device_kind:
+            if global_device_count not in topo_shapes:
+                raise ValueError(
+                    f"Unsupported device count {global_device_count} for TPU kind {device_kind}"
+                )
+            mesh_shape = topo_shapes[global_device_count]
+            break
+    if mesh_shape is None:
+        # Local CPU/GPU debug path.
+        mesh_shape = (global_device_count,)
+
+    devices = mesh_utils.create_device_mesh(
+        mesh_shape,
+        allow_split_physical_axes=(len(mesh_shape) > 2),
     )
+    return Mesh(devices, tuple(f"AXIS_{i}" for i in range(len(mesh_shape))))
 
-    def _callback_fn(leaf, index):
-        return leaf[index]
 
-    def _to_global_array(leaf, sharding):
+def prepare_pjit_funcs(mode: str = "hsdp"):
+    global _mesh
+    mode = str(mode).lower()
+    mesh = get_mesh()
+    _mesh = mesh
+    mesh_size = int(np.prod(mesh.devices.shape))
+    mesh_dict = {name: size for name, size in zip(mesh.axis_names, mesh.devices.shape)}
+    log_for_0("Setting up jit/HSDP mesh mode=%s shape=%s size=%d axes=%s", mode, mesh.devices.shape, mesh_size, mesh_dict)
+
+    def get_partition_spec(tree, param_mode: MeshMode):
+        return get_spec_dict(tree, mesh, param_mode=param_mode, sharding_mode=mode)
+
+    def pjit_all_gather(tree):
+        return multihost_utils.host_local_array_to_global_array(
+            tree,
+            mesh,
+            P(tuple(mesh.axis_names)),
+        )
+
+    def pjit_reduce_scatter(tree, param_mode=MeshMode.DATA):
+        spec = get_partition_spec(tree, param_mode=param_mode)
+        return multihost_utils.global_array_to_host_local_array(tree, mesh, spec)
+
+    def _to_named_sharding(shardings):
+        def convert(spec):
+            if isinstance(spec, NamedSharding):
+                return spec
+            return NamedSharding(mesh, spec)
+
+        return jax.tree_util.tree_map(convert, shardings)
+
+    def pjit_compile(fn, in_shardings, out_shardings, donate_argnums=()):
+        compiled = jax.jit(
+            fn,
+            in_shardings=_to_named_sharding(in_shardings),
+            out_shardings=_to_named_sharding(out_shardings),
+            donate_argnums=donate_argnums,
+        )
+
+        @functools.wraps(fn)
+        def wrapped(*args, **kwargs):
+            with Mesh(mesh.devices, mesh.axis_names):
+                return compiled(*args, **kwargs)
+
+        def lower(*args, **kwargs):
+            with Mesh(mesh.devices, mesh.axis_names):
+                return compiled.lower(*args, **kwargs)
+
+        wrapped.lower = lower
+        return wrapped
+
+    return mesh, get_partition_spec, pjit_all_gather, pjit_reduce_scatter, pjit_compile
+
+
+def named_sharding(mesh, spec):
+    return NamedSharding(mesh, spec)
+
+
+def shard_cpu_tree_to_mesh(cpu_tree, mesh, partition_specs):
+    sharding_tree = jax.tree_util.tree_map(lambda spec: NamedSharding(mesh, spec), partition_specs)
+
+    def to_global_array(leaf, sharding):
+        if isinstance(leaf, jax.Array) and leaf.is_fully_addressable is False:
+            return leaf
         return jax.make_array_from_callback(
             np.shape(leaf),
             sharding,
-            lambda index: _callback_fn(leaf, index)
+            lambda index: np.asarray(leaf)[index],
         )
 
-    return jax.tree_util.tree_map(_to_global_array, cpu_state, sharding_tree)
-
-def apply_spec_to_last_dims(leaf, spec):
-  """
-  Apply the given PartitionSpec to the last dimensions of the leaf.
-  Returns a new PartitionSpec with None prepended as needed.
-  """
-  msg, shape = _get_shape(leaf)
-  if msg == "unk":
-    raise ValueError(f"Cannot get shape of leaf: {leaf}")
-  
-  shape_len = len(shape)
-  spec_len = len(spec)
-  
-  if shape_len < spec_len: # by default, prune spec
-    new_spec = list(spec[-shape_len:]) if shape_len > 0 else []
-    return P(*new_spec)
-  
-  new_spec = [None] * (shape_len - spec_len) + list(spec)
-  return P(*new_spec)
-
-def get_spec_dict(tree, mesh: M, param_mode: MeshMode, sharding_mode: str):
-  length = len(mesh.shape)
-  assert length == 2 or length == 3, f"Only 2D or 3D mesh supported, got {length}D: {mesh.shape}"
-  
-  prepared_spec_dict = None
-  
-  if sharding_mode == 'ddp':
-    if param_mode == MeshMode.MODEL:
-      prepared_spec_dict = jax.tree_map(lambda _: P(), tree)
-    
-    if param_mode == MeshMode.DATA:
-      prepared_spec_dict = jax.tree_map(lambda _: P(tuple(mesh.axis_names),), tree)
-  
-  elif sharding_mode == 'hsdp':
-    if param_mode == MeshMode.MODEL:
-      model_shard = P(mesh.axis_names[-1],)
-      prepared_spec_dict = jax.tree_map(lambda l: apply_spec_to_last_dims(l, model_shard), tree)
-
-    if param_mode == MeshMode.DATA:
-      # data_shard = P(tuple(mesh.axis_names[:-1]),)
-      # prepared_spec_dict = jax.tree_map(lambda _: data_shard, tree)
-      prepared_spec_dict = jax.tree_map(lambda _: P(tuple(mesh.axis_names),), tree)
-  
-  elif sharding_mode == 'fsdp':
-    if param_mode == MeshMode.MODEL:
-      model_shard = P(mesh.axis_names[-1], tuple(mesh.axis_names[:-1]))
-      prepared_spec_dict = jax.tree_map(lambda l: apply_spec_to_last_dims(l, model_shard), tree)
-    
-    if param_mode == MeshMode.DATA:
-      data_shard = P(tuple(mesh.axis_names),)
-      prepared_spec_dict = jax.tree_map(lambda _: data_shard, tree)
-    
-  if prepared_spec_dict is None:
-    raise ValueError(f"Unsupported sharding mode: {sharding_mode} with param mode: {param_mode}")
-  
-  # now, validate all specs
-  mesh_info_dict = {name: size for name, size in zip(mesh.axis_names, mesh.devices.shape)}
-  
-  tree_flat_with_path, _ = jtu.tree_flatten_with_path(tree)
-  spec_flat_with_path, treedef = jtu.tree_flatten_with_path(prepared_spec_dict)
-  new_spec_flat_with_path = []
-  
-  # sanity check
-  assert len(tree_flat_with_path) == len(spec_flat_with_path), \
-    f"Tree and spec length mismatch: {len(tree_flat_with_path)} vs {len(spec_flat_with_path)}"
-    
-  for (path, leaf), (_path, spec) in zip(tree_flat_with_path, spec_flat_with_path):
-    if path != _path:
-      raise ValueError(f"Path mismatch between tree and spec at {path} vs {_path}")
-    
-    valid, reason = validate_sharding_spec(leaf, spec, mesh_info_dict)
-    if not valid:
-      print0(f"{Emoji.WARNING} Warning: invalid sharding spec {spec} for leaf at {jtu.keystr(path)} with shape {_get_shape(leaf)}. Reason: {reason}", flush=True)
-      new_spec_flat_with_path.append((path, P()))  # fallback to no sharding
-    else:
-      new_spec_flat_with_path.append((path, spec))
-      
-  prepared_spec_dict = jtu.tree_unflatten(treedef, [s for _, s in new_spec_flat_with_path])
-  
-  return prepared_spec_dict
-  
-def get_mesh() -> M:
-  tpu_type = jax.local_devices()[0].device_kind
-  GDC = jax.device_count()  # global device count
-  mesh_tuple = None
-  for topo_name, topo_dict in TOPOLOGIES.items():
-    if topo_name in tpu_type.lower():
-      if GDC in topo_dict:
-        mesh_tuple = topo_dict[GDC]
-        break
-      else:
-        raise ValueError(f"Unsupported Global Device Count {GDC} for TPU type {tpu_type}")
-    else:
-      continue
-  
-  if mesh_tuple is None:
-    raise ValueError(f"Unsupported TPU type: {tpu_type}")
-  
-  # create mesh
-  device_mesh = mesh_utils.create_device_mesh(
-    mesh_tuple,
-    allow_split_physical_axes=(len(mesh_tuple) > 2),
-  ) 
-  mesh = M(device_mesh, tuple(f"AXIS_{i}" for i in range(len(mesh_tuple))))
-  return mesh
-    
-def prepare_pjit_funcs(mode: str = 'ddp'):
-  print0(f"{Emoji.ROCKET} Setting up FSDP mesh and functions for mode='{mode}' ...", flush=True)
-  
-  mesh = get_mesh()
-  mesh_dim_size = int(np.prod(mesh.devices.shape))
-  mesh_dict = {name: size for name, size in zip(mesh.axis_names, mesh.devices.shape)}
-  
-  print0(f"{Emoji.INFO} Mesh: {mesh.devices.shape}", flush=True)
-  print0(f"{Emoji.INFO} Total Mesh Size for FSDP: {mesh_dim_size}", flush=True)
-  print0(f"{Emoji.INFO} Mesh Dict: {mesh_dict}", flush=True)
-  
-  # get_partition_spec: input a pytree, return its PartitionSpec over batch
-  def get_partition_spec(tree, param_mode: MeshMode):
-    return get_spec_dict(tree, mesh, param_mode=param_mode, sharding_mode=mode)
-  
-  # pjit_all_gather: input a [LOCAL] pytree, return a [GLOBAL] version of it by all-gathering over batch
-  def pjit_all_gather(tree, param_mode=MeshMode.DATA):
-    tree = multihost_utils.host_local_array_to_global_array(tree, mesh, P(tuple(mesh.axis_names),))
-    return tree
-  
-  # pjit_reduce_scatter: input a [GLOBAL] pytree, return a [LOCAL] version of it
-  def pjit_reduce_scatter(tree, param_mode=MeshMode.DATA):
-    spec = get_partition_spec(tree, param_mode=param_mode)
-    return multihost_utils.global_array_to_host_local_array(tree, mesh, spec)
-  
-  # pjit_compile: a wrapper of pjit, but with mesh context
-  def pjit_compile(fn, in_shardings, out_shardings):
-    jitted = pjit(
-      fn,
-      in_shardings=in_shardings,
-      out_shardings=out_shardings,
-    )
-    
-    @functools.wraps(fn)
-    def wrapped(*args, **kwargs):
-      with M(mesh.devices, mesh.axis_names):
-        return jitted(*args, **kwargs)
-    return wrapped
-      
-  return mesh, get_partition_spec, pjit_all_gather, pjit_reduce_scatter, pjit_compile
-
-if __name__ == "__main__":
-  # test get_model_partition_spec
-  from flax import linen as nn
-  class TestModel(nn.Module):
-    @nn.compact
-    def __call__(self, x):
-      x = nn.Dense(32, name="blocks_0_w1")(x)
-      x = nn.Dense(32, name="blocks_0_w2")(x)
-      x = nn.Dense(32, name="blocks_0_w3")(x)
-      x = nn.Dense(32, name="other_dense")(x)
-      return x
-  model = TestModel()
-  x = jnp.ones((32, 512))
-  variables = model.init(jax.random.PRNGKey(0), x)
-  params = variables['params']
-  mesh = get_mesh()
-  pspec = get_spec_dict(params, mesh, MeshMode.MODEL, 'fsdp')
-  print(pspec)
+    return jax.tree_util.tree_map(to_global_array, cpu_tree, sharding_tree)

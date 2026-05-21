@@ -4,6 +4,7 @@ from utils.logging_util import log_for_0, print0, Emoji
 import os
 import re
 import gcsfs
+import contextlib
 
 FS = gcsfs.GCSFileSystem()
 _CHECKPOINT_RE = re.compile(r"^checkpoint_(\d+)$")
@@ -86,28 +87,43 @@ def save_checkpoint(state, workdir):
     """
     Saves the model state to a checkpoint in the specified working directory.
     """
-    # Save only one copy from device 0.
     assert not workdir.startswith('gs://'), f'workdir {workdir} must not start with gs://'
-    state = jax.device_get(jax.tree_util.tree_map(lambda x: x[0], state))
-    step = int(state.step)
+    # Do not index a leading replica axis here: jit/HSDP states are global
+    # sharded arrays. Flax/Orbax can save the sharded arrays directly.
+    step = int(jax.device_get(state.step))
     log_for_0("Saving checkpoint step %d.", step)
     gs_path = convert_to_gs(workdir)
-    checkpoints.save_checkpoint_multiprocess(gs_path, state, step, keep=3)
+    with _orbax_set_mesh_context_compat():
+        checkpoints.save_checkpoint_multiprocess(gs_path, state, step, keep=3)
     log_for_0("Checkpoint step %d saved to %s.", step, gs_path)
 
 
-# HSDP version
-# def save_checkpoint(state, workdir):
-#     step = int(state.step)
-#     print0(f'{Emoji.ROCKET} Saving checkpoint at step {step} ...')
-#     # state = jax.device_get(jax.tree.map(lambda x: x[0], state)) # no need in PJIT
-#     # from utils.pjit_util import _get_shape
-#     # log_for_0(f"before device_get, {_get_shape(state.params['net']['blocks']['layers_9']['mlp']['w1']['_flax_linear']['kernel'])}")
-#     state = jax.tree.map(lambda x: jax.device_get(x), state) # gather and put to cpu
-#     # log_for_0(f"after device_get, {_get_shape(state.params['net']['blocks']['layers_9']['mlp']['w1']['_flax_linear']['kernel'])}")
-#     step = int(state.step)
-#     checkpoints.save_checkpoint_multiprocess(convert_to_gs(workdir), state, step, keep=2)
-#     print0(f'{Emoji.GOOD} Checkpoint at step {step} saved.')
+@contextlib.contextmanager
+def _orbax_set_mesh_context_compat():
+    """
+    Orbax versions used by flax checkpointing may expect
+    ``jax.sharding.set_mesh`` to be a context manager. JAX 0.6.x returns the
+    previous mesh instead, so wrap it during checkpoint serialization only.
+    """
+    original_set_mesh = jax.sharding.set_mesh
+
+    @contextlib.contextmanager
+    def set_mesh_context(mesh):
+        previous_or_context = original_set_mesh(mesh)
+        if hasattr(previous_or_context, "__enter__"):
+            with previous_or_context as value:
+                yield value
+            return
+        try:
+            yield previous_or_context
+        finally:
+            original_set_mesh(previous_or_context)
+
+    jax.sharding.set_mesh = set_mesh_context
+    try:
+        yield
+    finally:
+        jax.sharding.set_mesh = original_set_mesh
 
 def convert_to_gs_by_zone(path: str, zone: str):
     if zone == 'us-central1':

@@ -64,6 +64,7 @@ def get_config():
     training.muon = muon = ml_collections.ConfigDict()
     muon.learning_rate = 5e-4
     muon.weight_decay = 0.0
+    muon.consistent_rms = True
     # Optional dedicated LR for the vision encoder param group.
     # If vision_encoder_learning_rate is set, it is used directly.
     # Otherwise we use (main_lr * vision_encoder_lr_scale).
@@ -84,6 +85,11 @@ def get_config():
     training.online_eval_tasks = []
     training.final_eval_tasks = []
     training.warmup_steps = 1
+    # Empty means legacy single-stage train. "llava15_two_stage" keeps one
+    # workdir/checkpoint stream and switches dataloaders/optimizer at stage1_steps.
+    training.curriculum = ""
+    training.stage1_steps = 0
+    training.stage2_steps = 0
 
     training.seed = 42
 
@@ -104,6 +110,9 @@ def get_config():
     # MeanFlow
     config.model = model = ml_collections.ConfigDict()
     model.lm_backbone_str = "gemma_dummy"
+    # PT by default for backward compatibility. LLaVA/Gemma sanity configs use
+    # IT because Vicuna-v1.5 is instruction-tuned.
+    model.lm_checkpoint_variant = "pt"
     model.mask_strategy = "diy"
     model.attn_logits_soft_cap = 0.0   # 0.0 = disabled; e.g. 50.0 for Gemma2-style
     model.final_logit_softcap = 0.0    # 0.0 = disabled; e.g. 30.0 for Gemma2-style
@@ -125,6 +134,18 @@ def get_config():
     eval.mme_cache_dir = '/kmh-nfs-ssd-us-mount/data/cached/zhh/mme_eval'
     eval.textvqa_root = 'gs://kmh-gcp-💣/data/textvqa/val/shard-000000.tar'
     eval.textvqa_cache_dir = "/kmh-nfs-ssd-us-mount/data/cached/zhh/textvqa_eval"
+    eval.gqa_root = 'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/gqa-balanced/testdev'
+    eval.gqa_num_samples = 12578
+    eval.gqa_cache_dir = "/kmh-nfs-ssd-us-mount/data/cached/zhh/gqa_eval"
+    eval.vizwiz_root = 'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/vizwiz-vqa/val'
+    eval.vizwiz_num_samples = 4319
+    eval.vizwiz_cache_dir = "/kmh-nfs-ssd-us-mount/data/cached/zhh/vizwiz_eval"
+    eval.scienceqa_img_root = 'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/scienceqa-img/test'
+    eval.scienceqa_img_num_samples = 2017
+    eval.scienceqa_img_cache_dir = "/kmh-nfs-ssd-us-mount/data/cached/zhh/scienceqa_img_eval"
+    eval.seed_bench_root = 'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/seed-bench-image'
+    eval.seed_bench_num_samples = 14233
+    eval.seed_bench_cache_dir = "/kmh-nfs-ssd-us-mount/data/cached/zhh/seed_bench_eval"
     eval.cider_cache_dir = "/kmh-nfs-ssd-us-mount/data/cached/zhh/coco_caption_eval"
     eval.pope_root = "/kmh-nfs-ssd-us-mount/code/xianbang/files/POPE/output/coco"
     eval.pope_dataset = "coco"
@@ -184,6 +205,9 @@ def get_config():
     config.load_from_pretrained = ''
     config.eval_all = False
     config.eval_only = False
+    # jit sharding mode: "ddp", "hsdp", or "fsdp". HSDP is the default
+    # production path; it shards model/optimizer states over the last mesh axis.
+    config.sharding = "hsdp"
     config.wandb_resume_id = ""
     config.local_debug = False
 

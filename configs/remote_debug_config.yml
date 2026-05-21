@@ -1,67 +1,106 @@
+# Minimal remote TPU smoke test for the current LLaVA/HSDP path.
+# It runs one training step and then evaluates every current image-only
+# LLaVA understanding benchmark wired in eval_vlm_benchmarks.py.
 model:
-    image_encoder_str: "b16"
+    arch: llava
     lm_backbone_str: "gemma3_270M"
-    projector_use_ln: True
+    lm_checkpoint_variant: "it"
+
+    vision_tower_str: "openai/clip-vit-large-patch14-336"
+    vision_feature_layer: -2
+    vision_select_feature: "patch"
+    clip_input_format: "minus_one_to_one"
+
+    projector_type: "mlp2x_gelu"
+    projector_use_ln: False
+
+    attn_logits_soft_cap: 0.0
+    final_logit_softcap: 0.0
+    txt_feature_layer: 0
+    recon_loss_weight: 0.0
 
 dataset:
-    image_size: 224
-    root:
-        - "gs://kmh-gcp-💣/data/laion-aesthetic/part-{00000..00127}-cad4a140-cebd-46fa-b874-e8968f93e32e-c000.snappy/{00000..00040}.tar" # data scale: 50M
-        - "gs://kmh-gcp-💣/data/cc12m/{00000..01096}.tar" # data scale: 12M
-        - "gs://kmh-gcp-💣/data/vqav2/vqav2_image_records_wds/train2014/shard-{000000..000008}.tar" # data scale: 400K=0.4M
-        # - "gs://kmh-gcp-💣/data/llava150k/shard_{000000..000015}/data.tar"
-    mix_weights: [50, 12, 0.4]
+    image_size: 336
+    max_txt_len: 64
+    resize_mode: stretch
+    num_workers: 1
+    prefetch_factor: 1
+    pin_memory: False
+    items:
+        - gqa-testdev
+    mix_weights: [1]
 
 training:
-    optimizer: 'adam'
+    curriculum: ""
+    num_steps: 1
+    batch_size: 16
+
+    # Keep debug cheap: random CLIP tower, pretrained small Gemma LM.
+    vision_tower_from_scratch: True
+    clip_from_pt: True
+    hf_cache_dir: /dev/shm/huggingface
+
+    freeze_lm: True
+    freeze_image_encoder: True
+    optimizer: adam
     adam:
-        learning_rate: 0.0002
-        adam_b2: 0.95
-    muon:
         learning_rate: 0.001
+        adam_b2: 0.999
+        weight_decay: 0.0
+    grad_clip_norm: 1.0
+    warmup_steps: 1
     lr_schedule: cos
 
     log_per_step: 1
-    checkpoint_per_step: 10
-    log_vis_per_step: 1
-
-    num_steps: 50000
-    batch_size: 1024
-    warmup_steps: 10000 # enabled in the original paper
-    siglip_warmup_steps: 100000
-
-    sample_on_training: True
-    sample_per_step: 1
-    cider_per_step: -1
-    vqav2_per_step: 50000
-    mme_per_step: 50000
-
+    checkpoint_per_step: -1
+    log_vis_per_step: -1
+    sample_per_step: -1
+    online_eval_per_step: -1
+    online_eval_tasks: []
+    final_eval_tasks:
+        - gqa
+        - vizwiz
+        - scienceqa_img
+        - seed_bench
     seed: 42
 
 sampling:
-    max_new_tokens: 64
+    max_new_tokens: 4
     beam_size: 1
 
 eval:
-    eval_vqav2: True
-    eval_mme: True
+    device_batch_size: 1
+    mmbench_max_new_tokens: 4
 
+    # Tiny eval schedules: just enough to compile and exercise each loader,
+    # generation path, result merging, and metric code.
+    gqa_num_samples: 2
+    vizwiz_num_samples: 2
+    scienceqa_img_num_samples: 2
+    seed_bench_num_samples: 2
+
+    gqa_max_txt_len: 64
+    vizwiz_max_txt_len: 64
+    scienceqa_img_max_txt_len: 64
+    seed_bench_max_txt_len: 64
+
+    gqa_cache_dir: /kmh-nfs-ssd-us-mount/data/cached/zhh/remote_debug/gqa_eval
+    vizwiz_cache_dir: /kmh-nfs-ssd-us-mount/data/cached/zhh/remote_debug/vizwiz_eval
+    scienceqa_img_cache_dir: /kmh-nfs-ssd-us-mount/data/cached/zhh/remote_debug/scienceqa_img_eval
+    seed_bench_cache_dir: /kmh-nfs-ssd-us-mount/data/cached/zhh/remote_debug/seed_bench_eval
+    eval_recon_tokens: []
+
+finetune: False
+sharding: hsdp
 load_from: ''
-
-# sharding: hsdp # ddp, hsdp, fsdp
+load_from_pretrained: ''
+eval_only: False
+local_debug: True
 
 logging:
     use_wandb: False
     use_tensorboard: False
-    wandb_project: 'paligemma-baseline' # change to your wandb project
-    wandb_entity: 'sqa24-massachusetts-institute-of-technology' # paste your wandb entity here
-    wandb_tags: # use your own tags
-        - hsdp
-    wandb_notes:
-
-load_from: /kmh-nfs-ssd-us-mount/logs/sqa/paligemma-baseline/20260214_001430_mzfo7i_VMNAME_kmh-tpuvm-v6e-64-spot-sqa7luldt_ZONE_us-central1-b # correct sampling. 300k steps, lr2e-5, LAION-aes, beam size 3
-# load_from: /kmh-nfs-ssd-us-mount/staging/siri/jit_wxb/launch_20251209_141232_git_434f3487/logs/log1_20251209_141256_VMkmh-tpuvm-v6e-64-kangyang-a81093_Zus-central1-b_c24e227a
-# load_from: /kmh-nfs-ssd-us-mount/staging/siri/jit/launch_20251102_051655_gitd454d69_b4e05bfd/logs/log18_20251102_153134_VMkmh-tpuvm-v5p-64-kangyang-166a5b_Zus-east5-a_d97bc772
-eval_only: True
-# eval_show_sample: True
-local_debug: True
+    wandb_project: "jax-llava"
+    wandb_entity: "sqa24-massachusetts-institute-of-technology"
+    wandb_tags: ["remote-debug", "llava", "hsdp"]
+    wandb_notes: "remote_debug: one-step LLaVA/HSDP smoke test with GQA, VisWiz, ScienceQA-IMG, SEED-Bench."

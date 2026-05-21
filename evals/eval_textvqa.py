@@ -11,8 +11,8 @@ Key differences from VQAv2:
   - image_id is an OpenImages hex string, not an integer
   - Dataset is small (val: 5000 Qs over 3166 images, 1 shard) so we cannot shard by tar file.
     Instead every process reads the full shard, but only runs inference on its own slice
-    (sample_index % num_processes == process_index). Dummy batches keep pmap calls in sync
-    across all processes for steps where a process has no real work. Each process writes its
+    (sample_index % num_processes == process_index). Dummy batches keep compiled calls
+    in sync across all processes for steps where a process has no real work. Each process writes its
     own results file; rank-0 merges and deduplicates by question_id before computing accuracy.
 """
 import json
@@ -249,7 +249,7 @@ def eval_textvqa(p_sample_step, run_p_sample_step, model, tokenizer, params, con
 
     Each process reads the full val shard but only runs inference on its assigned
     sample slice (sample_index % num_processes == process_rank). Dummy batches pad
-    out the fixed step budget so all processes execute the same number of pmap calls.
+    out the fixed step budget so all processes execute the same number of compiled calls.
     Rank-0 merges per-process result files, deduplicates by question_id, and computes
     the final VQA accuracy.
     """

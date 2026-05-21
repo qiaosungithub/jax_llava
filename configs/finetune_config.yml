@@ -44,7 +44,10 @@ dataset:
     root:
         - llava-ov-1.5-instruct # data scale: 22M
         - vqav2                 # data scale: 400K=0.4M
-    mix_weights: [22, 0.4]
+        - gqa-train             # data scale: 943K QA over 72K train images
+        - textcaps-train        # data scale: 22K captions
+        - visual-genome         # data scale: ~1.7M QA
+    mix_weights: [22, 0.4, 0.94, 0.022, 1.7]
 
     num_workers: 32
     prefetch_factor: 4
@@ -63,6 +66,7 @@ training:
     muon:
         learning_rate: 0.0001
         weight_decay: 0.02
+        consistent_rms: true
         # learning_rate: 0.00005 # textvqa
         # weight_decay: 0.2
 
@@ -109,4 +113,4 @@ logging:
     wandb_tags:
         - sqa
         - finetune
-    wandb_notes: "[finetune llava-ov1.5 + vqav2] 15+3 freeze embed, encoder lr 5x baseline. muon 1e-4 wd0.02 cos decay 90000 steps"
+    wandb_notes: "[finetune llava-ov1.5 + vqav2 + gqa + textcaps] 15+3 freeze embed, encoder lr 5x baseline. muon 1e-4 wd0.02 cos decay 90000 steps"

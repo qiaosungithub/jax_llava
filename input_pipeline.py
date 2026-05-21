@@ -159,6 +159,7 @@ def _dataset_type_to_mask_category(dataset_type: str) -> str:
     if dataset_type in {
         "vqav2",
         "genome",
+        "gqa",
         "llava15",
         "llava150k",
         "llava_ov15",
@@ -588,7 +589,7 @@ def preprocess_fn(
         prefix = _sample_caption_prompt("rendered_text") + "\n"
         full_text = f"{prefix}{caption}"
         prefix_tokens = tokenizer.encode(prefix, add_bos=True, add_eos=False)
-    elif dataset_type == "vqav2":
+    elif dataset_type in {"vqav2", "gqa"}:
         question = (sample.get("question", "") or "").strip()
         if not question:
             log_for_0(f'question is empty')
@@ -902,6 +903,7 @@ def expand_genome_gcap_sample(sample, region_lookup: dict) -> list:
 
 _EXPAND_FN = {
     "vqav2":   expand_vqa_sample,
+    "gqa":     expand_vqa_sample,
     "textvqa": expand_vqa_sample,
     "tallyqa": expand_vqa_sample,
     "dvqa":    expand_vqa_sample,
@@ -953,6 +955,28 @@ def _worker_seed(base_seed: int, rank: int, data_seed_offset: int = 0) -> int:
     return _fold_data_seed(base_seed, data_seed_offset) + int(rank) * 10007 + worker_id * 1009
 
 
+def _shuffled_worker_urls(root_url, data_seed_offset: int, epoch: int):
+    urls = _expand_gcs_glob_if_needed(root_url)
+    urls = [urls] if isinstance(urls, str) else list(urls)
+    if not urls:
+        return []
+
+    worker = get_worker_info()
+    worker_id = 0 if worker is None else int(worker.id)
+    num_workers = 1 if worker is None else int(worker.num_workers)
+    rank = jax.process_index()
+    world = jax.process_count()
+    stream_id = rank * num_workers + worker_id
+    num_streams = max(1, world * num_workers)
+
+    rng = random.Random(_fold_data_seed(7919 + int(epoch), data_seed_offset))
+    rng.shuffle(urls)
+    selected = urls[stream_id::num_streams]
+    if not selected:
+        selected = [urls[stream_id % len(urls)]]
+    return selected
+
+
 class VQAv2IterableDataset(IterableDataset):
     """IterableDataset over VQA-style WebDataset shards.
     Expands (image, qas) -> (image, qa) per question, then performs strong item-level shuffling.
@@ -976,17 +1000,6 @@ class VQAv2IterableDataset(IterableDataset):
 
     def __iter__(self):
         rng = random.Random(_worker_seed(2027, self.shard_rank, self.data_seed_offset))
-
-        ds = (
-            wds.WebDataset(
-                _expand_gcs_glob_if_needed(self.root_url),
-                resampled=True,
-                shardshuffle=1000,  # stronger shard-level shuffle than just True
-                handler=make_stop_after_n_errors(500),
-            )
-            .select(lambda x: x is not None)
-        )
-
         expand_fn = _EXPAND_FN.get(self.dataset_type, expand_vqa_sample)
 
         # Strong item-level shuffle AFTER expand.
@@ -1003,34 +1016,51 @@ class VQAv2IterableDataset(IterableDataset):
             shuffle_sizes.get(self.dataset_type, 10000),
         )
 
-        for sample in ds:
-            items = expand_fn(sample)
-            if not items:
+        epoch = 0
+        while True:
+            urls = _shuffled_worker_urls(self.root_url, self.data_seed_offset, epoch)
+            epoch += 1
+            if not urls:
                 continue
 
-            # Optional: break local correlation within one image
-            rng.shuffle(items)
+            # Use the low-level pipeline so manually sharded workers are not
+            # split a second time by WebDataset's default worker splitter.
+            ds = wds.DataPipeline(
+                wds.SimpleShardList(urls),
+                wds.tarfile_to_samples(handler=make_stop_after_n_errors(500)),
+            )
 
-            for item in items:
-                shuffle_buf.append(item)
+            for sample in ds:
+                if sample is None:
+                    continue
 
-                if len(shuffle_buf) >= SHUFFLE_SIZE:
-                    # Randomly pop one item, keep buffer full
-                    idx = rng.randrange(len(shuffle_buf))
-                    chosen = shuffle_buf[idx]
-                    shuffle_buf[idx] = shuffle_buf[-1]
-                    shuffle_buf.pop()
+                items = expand_fn(sample)
+                if not items:
+                    continue
 
-                    out = preprocess_fn(
-                        chosen,
-                        self.transform,
-                        self.tokenizer,
-                        self.max_len,
-                        dataset_type=self.dataset_type,
-                        mask_token_category_probs=self.mask_token_category_probs,
-                    )
-                    if out is not None:
-                        yield out
+                # Optional: break local correlation within one image
+                rng.shuffle(items)
+
+                for item in items:
+                    shuffle_buf.append(item)
+
+                    if len(shuffle_buf) >= SHUFFLE_SIZE:
+                        # Randomly pop one item, keep buffer full
+                        idx = rng.randrange(len(shuffle_buf))
+                        chosen = shuffle_buf[idx]
+                        shuffle_buf[idx] = shuffle_buf[-1]
+                        shuffle_buf.pop()
+
+                        out = preprocess_fn(
+                            chosen,
+                            self.transform,
+                            self.tokenizer,
+                            self.max_len,
+                            dataset_type=self.dataset_type,
+                            mask_token_category_probs=self.mask_token_category_probs,
+                        )
+                        if out is not None:
+                            yield out
 
 
 class GenomeGCapIterableDataset(IterableDataset):
@@ -1176,10 +1206,10 @@ class GenomeDetIterableDataset(IterableDataset):
 def make_dataset(root, dataset_config, tokenizer, is_train=True, dataset_type="default", data_seed_offset=0):
     log_for_0(f"Making dataset for {dataset_type} with root {root}")
     assert dataset_type in [
-        "default", "laion_aes", "cc12m", "blip3o", "textcaps", "llava150k", "llava15", "llava_ov15", "vqav2", "textvqa", "tallyqa", "dvqa", "genome", "genome_gcap", "genome_det", "rendered_text"
+        "default", "laion_aes", "cc12m", "blip3o", "textcaps", "llava150k", "llava15", "llava_ov15", "vqav2", "gqa", "textvqa", "tallyqa", "dvqa", "genome", "genome_gcap", "genome_det", "rendered_text"
     ], f"Invalid dataset type: {dataset_type}"
 
-    if dataset_type in ["vqav2", "textvqa", "tallyqa", "dvqa", "genome", "llava15", "llava150k", "llava_ov15"]:
+    if dataset_type in ["vqav2", "gqa", "textvqa", "tallyqa", "dvqa", "genome", "llava15", "llava150k", "llava_ov15"]:
         ds = VQAv2IterableDataset(
             root,
             dataset_config,

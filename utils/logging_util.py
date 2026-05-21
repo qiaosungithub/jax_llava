@@ -106,7 +106,8 @@ class MetricsTracker:
         """
         # device_get blocks on the computation that produced x.
         a = np.asarray(jax.device_get(x))
-        # Under pmap, metrics often have shape [local_devices, ...].
+        # Under sharded multi-device execution, metrics may still carry local
+        # device axes depending on the caller.
         # If it's already scalar (0-D), leave unchanged.
         if a.ndim >= 1:  # treat leading axis as local device axis
             a = a.mean(axis=0)

@@ -21,18 +21,18 @@ seed).  Each process then takes a strided shard:
 This guarantees that the 128 selected images/class are **bit-identical**
 regardless of the number of processes.
 
-After extracting local features with a *local* ``pmap`` (no cross-process
-collectives inside), a ``process_allgather`` gathers all shards.
+After extracting local features with the same jit/HSDP sharding style as
+training, a ``process_allgather`` gathers all shards.
 Only ``process_index == 0`` then computes KNN and returns the accuracy.
 
 Padding notes
 -------------
 Two padding levels exist:
 
-1. **LDC padding** (within one batch): each DataLoader batch of real size *B*
-   is zero-padded at the *end* to the next multiple of ``LDC`` so that it can
-   be reshaped to ``(LDC, B_per_device, …)`` for ``pmap``.  The padded outputs
-   are discarded by slicing ``feats[:B]`` after ``pmap``.
+1. **local-device padding** (within one batch): each DataLoader batch of real
+   size *B* is zero-padded at the *end* to the next multiple of ``LDC`` so the
+   implied global batch is divisible by the full jit/HSDP mesh. The padded outputs
+   are discarded by slicing ``feats[:B]`` after inference.
 
 2. **Process padding** (for ``process_allgather``): shard sizes differ by at
    most 1 (strided split).  Before allgather each process zero-pads its local
@@ -71,6 +71,7 @@ from torchvision import transforms
 from PIL import Image
 
 from utils.logging_util import log_for_0, log_for_all
+from utils.pjit_util import MeshMode, prepare_pjit_funcs
 
 # ── JAX process / device info ────────────────────────────────────────────────
 LDC = jax.local_device_count()
@@ -234,28 +235,46 @@ def _knn_transform(image_size: int):
 
 # ── Feature extraction ────────────────────────────────────────────────────────
 
-def _make_p_encode(model):
-    """Build a local pmap'd encoder that mean-pools over learnable tokens.
+def _make_p_encode(model, state_params, config, global_batch_size):
+    """Build a jit/HSDP encoder that mean-pools image tokens."""
+    mesh, get_partition_spec, _, reduce_scatter, pjit_compile = prepare_pjit_funcs(
+        getattr(config, "sharding", "hsdp")
+    )
+    params_spec = get_partition_spec(state_params, MeshMode.MODEL)
+    image_spec = get_partition_spec(
+        jax.ShapeDtypeStruct(
+            (global_batch_size, config.dataset.image_size, config.dataset.image_size, 3),
+            jnp.float32,
+        ),
+        MeshMode.DATA,
+    )
+    output_spec = get_partition_spec(
+        jax.ShapeDtypeStruct((global_batch_size, 1), jnp.float32),
+        MeshMode.DATA,
+    )
 
-    Purely local – no cross-process collectives → safe to call independently
-    on each process.  Uses ``devices=jax.local_devices()`` to be explicit.
-    """
     def _encode(params, images):
-        # params: unreplicated on this device (shape without leading LDC dim)
-        # images: (B_local, H, W, 3) float32 in [-1, 1]
         tokens = model.apply(
             {"params": params},
             images,
             method=model.encode_image,
-        )  # (B_local, K, D)
-        return tokens.mean(axis=1)  # (B_local, D)
+        )
+        return tokens.mean(axis=1)
 
-    return jax.pmap(_encode, devices=jax.local_devices())
+    p_encode = pjit_compile(
+        _encode,
+        in_shardings=(params_spec, image_spec),
+        out_shardings=output_spec,
+    )
+    p_encode._mesh = mesh
+    p_encode._image_spec = image_spec
+    p_encode._reduce_scatter = reduce_scatter
+    return p_encode
 
 
 def _extract_features_local(
     p_encode,
-    state_params,          # replicated params (LDC, ...)
+    state_params,
     dataset: ImageNetSubset,
     image_size: int,
     batch_size: int = 256,
@@ -263,17 +282,16 @@ def _extract_features_local(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Extract features for this process's local shard.
 
-    LDC padding strategy
+    jit/HSDP padding strategy
     --------------------
     For a DataLoader batch of *B* real images:
 
         pad  = (LDC - B % LDC) % LDC
-        x_np shape after pad: (B + pad, H, W, 3)   ← zeros at the END
+        x_np shape after pad: (B + pad, H, W, 3)
 
-    Reshape to ``(LDC, (B+pad)//LDC, H, W, 3)`` and feed to pmap.
-    After pmap, flatten to ``(B + pad, D)`` and keep only ``[:B]``:
-
-        feats_np = np.array(feats).reshape(-1, D)[:B]   # (B, D)
+    The local padded batch is converted into a globally sharded JAX array.
+    After jit/HSDP inference, the host-local output is trimmed back to the real
+    batch size.
 
     The zero-padded inputs produce garbage features that are simply discarded.
 
@@ -301,7 +319,7 @@ def _extract_features_local(
         # (B, 3, H, W) → (B, H, W, 3) float32
         x_np = imgs.permute(0, 2, 3, 1).numpy().astype(np.float32)
 
-        # ── LDC padding: zero-fill at the END ────────────────────────────────
+        # Pad local batch so the global jit/HSDP batch is divisible by all devices.
         pad = (LDC - B % LDC) % LDC
         if pad > 0:
             x_np = np.concatenate(
@@ -309,14 +327,16 @@ def _extract_features_local(
                 axis=0,
             )   # shape: (B + pad, H, W, 3)
 
-        # Reshape to (LDC, B_per_device, H, W, 3) for pmap
-        x_jax = jnp.array(x_np.reshape(LDC, -1, image_size, image_size, 3))
-        feats = p_encode(state_params, x_jax)   # (LDC, B_per_device, D)
+        global_shape = (x_np.shape[0] * PRC,) + x_np.shape[1:]
+        global_images = jax.make_array_from_process_local_data(
+            jax.sharding.NamedSharding(p_encode._mesh, p_encode._image_spec),
+            x_np,
+            global_shape,
+        )
+        feats = p_encode(state_params, global_images)
+        feats = p_encode._reduce_scatter(feats, MeshMode.DATA)
         D = feats.shape[-1]
-
-        # Flatten: (LDC * B_per_device, D) = (B + pad, D)
-        # Trim:    [:B]  → (B, D)  – discards the zero-padded tail exactly
-        feats_np = np.array(feats).reshape(-1, D)[:B]
+        feats_np = np.array(jax.device_get(feats)).reshape(-1, D)[:B]
 
         all_feats.append(feats_np)
         all_labels.append(labels.numpy().astype(np.int32))
@@ -468,7 +488,7 @@ def _knn_accuracy_jax(
 # ── Public eval function ──────────────────────────────────────────────────────
 
 def eval_imagenet_knn(
-    state_params,                       # replicated params (from jax_utils.replicate)
+    state_params,
     model,                              # PaliGemmaEncDec instance
     config,                             # training config (needs dataset.image_size)
     imagenet_root: str,                 # path with train/ and val/ sub-dirs
@@ -486,7 +506,7 @@ def eval_imagenet_knn(
     ``process_allgather`` and KNN is computed **only on process 0**.
 
     Args:
-        state_params:     replicated params from ``jax_utils.replicate(state).params``.
+        state_params:     sharded params from the jit/HSDP TrainState.
         model:            ``PaliGemmaEncDec`` instance (Flax module, not applied).
         config:           training config; uses ``config.dataset.image_size``.
         imagenet_root:    path whose children are ``train/`` and ``val/``.
@@ -510,8 +530,10 @@ def eval_imagenet_knn(
         f"processes={PRC}, LDC={LDC}"
     )
 
-    # Local pmap encoder – no cross-process ops inside, purely local
-    p_encode = _make_p_encode(model)
+    local_batch = int(batch_size)
+    if local_batch % LDC != 0:
+        local_batch = ((local_batch + LDC - 1) // LDC) * LDC
+    p_encode = _make_p_encode(model, state_params, config, local_batch * PRC)
 
     # ── Train features ────────────────────────────────────────────────────────
     train_ds = ImageNetSubset(
@@ -522,7 +544,7 @@ def eval_imagenet_knn(
     log_for_all(f"[KNN:{PRI}] Extracting train features ({len(train_ds):,} local samples) …")
     t0 = time.time()
     local_train_feats, local_train_labels = _extract_features_local(
-        p_encode, state_params, train_ds, image_size, batch_size, num_workers
+        p_encode, state_params, train_ds, image_size, local_batch, num_workers
     )
     log_for_all(
         f"[KNN:{PRI}] Train local feats {local_train_feats.shape} "
@@ -545,7 +567,7 @@ def eval_imagenet_knn(
     log_for_all(f"[KNN:{PRI}] Extracting val features ({len(val_ds):,} local samples) …")
     t0 = time.time()
     local_val_feats, local_val_labels = _extract_features_local(
-        p_encode, state_params, val_ds, image_size, batch_size, num_workers
+        p_encode, state_params, val_ds, image_size, local_batch, num_workers
     )
     log_for_all(
         f"[KNN:{PRI}] Val local feats {local_val_feats.shape} "

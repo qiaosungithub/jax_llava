@@ -89,7 +89,7 @@ class GCSImageDataset(Dataset):
         return self.preprocess_fn({"aux": {'question_id': q_id, 'path': img_path}, "jpg": img})
 
 # def collate_fn(batch):
-#     # 因为 pmap 通常需要固定的 batch 维度
+#     # 因为 multi-device compiled calls 通常需要固定的 batch 维度
 #     # 这里将 list of dicts 转换为 dict of lists 或 batched tensors
 #     return {
 #         "aux": [x["aux"] for x in batch],
@@ -218,7 +218,7 @@ def eval_cider(p_sample_step, run_p_sample_step, model, tokenizer, params, confi
     VIS_IMAGES = []
 
     for i,batch in enumerate(loader):
-        # 1. 准备数据 (假设你的 pmap 函数接收的是 numpy/jax 数组)
+        # 1. 准备数据 (假设 compiled sampling 函数接收的是 numpy/jax 数组)
         # images = prepare_for_jax(batch["images"]) 
         assert batch["pixel_values"].shape[0] <= config.eval.device_batch_size * jax.local_device_count(), f"Expected batch size {config.eval.device_batch_size * jax.local_device_count()}, but got {batch['pixel_values'].shape[0]}"
         if len(VIS_IMAGES) < 16:

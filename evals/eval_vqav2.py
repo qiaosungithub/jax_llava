@@ -215,7 +215,7 @@ def collate_fn(batch):
 
 
 def _make_dummy_vqav2_batch(batch_size, image_size, max_len):
-    """Create a full-size dummy batch so all ranks can keep pmap calls in sync."""
+    """Create a full-size dummy batch so all ranks keep compiled calls in sync."""
     return {
         "pixel_values": torch.zeros((batch_size, 3, image_size, image_size), dtype=torch.float32),
         "input_ids": torch.zeros((batch_size, max_len), dtype=torch.long),
@@ -359,7 +359,7 @@ def eval_vqav2(p_sample_step, run_p_sample_step, model, tokenizer, params, confi
                 log_for_0(f"Process {r} results file not found: {pf}")
                 raise FileNotFoundError(f"During VQAv2 evaluation, process {r} results file not found: {pf}")
 
-        # All ranks run the same eval stream for synchronized pmap calls, so
+        # All ranks run the same eval stream for synchronized compiled calls, so
         # merged outputs contain duplicates. Keep one prediction per question_id.
         dedup_by_qid = {}
         for o in all_results:

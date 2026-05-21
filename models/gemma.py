@@ -30,10 +30,19 @@ def load_gemma3_270M(attn_logits_soft_cap: float = 0.0, final_logit_softcap: flo
     return model, embed_dim
 
 
+def load_gemma3_1B(attn_logits_soft_cap: float = 0.0, final_logit_softcap: float = 0.0):
+    config = _apply_soft_caps(gm.nn.Gemma3_1B.config, attn_logits_soft_cap, final_logit_softcap)
+    model = gm.nn.Gemma3_1B(tokens="tokens", config=config)
+    embed_dim = 1152
+    return model, embed_dim
+
+
 def load_LM(model_str, attn_logits_soft_cap: float = 0.0, final_logit_softcap: float = 0.0):
     if model_str == 'gemma2_2B':
         return load_gemma2_2B(attn_logits_soft_cap, final_logit_softcap)
     elif model_str == 'gemma3_270M':
         return load_gemma3_270M(attn_logits_soft_cap, final_logit_softcap)
+    elif model_str == 'gemma3_1B':
+        return load_gemma3_1B(attn_logits_soft_cap, final_logit_softcap)
     else:
         raise ValueError(f"Unsupported model string: {model_str}")

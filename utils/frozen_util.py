@@ -82,7 +82,12 @@ def extract_trainable_parameters(
 _ALL_VLM_GROUPS = ("image_encoder", "lm_backbone", "projector")
 
 
-def get_trainable(params, freeze_lm: bool = False, txt_feature_layer: int = 0):
+def get_trainable(
+    params,
+    freeze_lm: bool = False,
+    txt_feature_layer: int = 0,
+    freeze_image_encoder: bool = False,
+):
   """Split VLM params into (trainable, frozen) according to flags.
 
   Args:
@@ -92,12 +97,14 @@ def get_trainable(params, freeze_lm: bool = False, txt_feature_layer: int = 0):
       the lm_backbone embedder and blocks 0..txt_feature_layer-1 are frozen
       (they act as a fixed text feature extractor).  When txt_feature_layer==0
       the entire lm_backbone is frozen (original behaviour).
+    freeze_image_encoder: if True, freeze the vision tower.  This matches the
+      standard LLaVA-1.5 projector/LM tuning setup.
 
   Returns:
     (trainable_params, frozen_params). When nothing is frozen,
     `frozen_params` is an empty dict.
   """
-  if not freeze_lm:
+  if not freeze_lm and not freeze_image_encoder:
     return params, {}
 
   flat_keys = list(flatten_state_dict(params).keys())
@@ -108,9 +115,16 @@ def get_trainable(params, freeze_lm: bool = False, txt_feature_layer: int = 0):
       f"expected subset of {_ALL_VLM_GROUPS}"
   )
 
-  if txt_feature_layer == 0:
+  frozen_prefixes = set()
+  if freeze_image_encoder:
+    frozen_prefixes.add("image_encoder")
+
+  if not freeze_lm:
+    trainable_prefixes = [g for g in _ALL_VLM_GROUPS if g not in frozen_prefixes]
+  elif txt_feature_layer == 0:
     # Original behaviour: freeze all of lm_backbone.
-    trainable_prefixes = [g for g in _ALL_VLM_GROUPS if g != "lm_backbone"]
+    frozen_prefixes.add("lm_backbone")
+    trainable_prefixes = [g for g in _ALL_VLM_GROUPS if g not in frozen_prefixes]
   else:
     # Freeze only lm_backbone/embedder + lm_backbone/layer_0..N-1.
     # Remaining LM layers (N..last) and final_norm stay trainable.
@@ -126,12 +140,12 @@ def get_trainable(params, freeze_lm: bool = False, txt_feature_layer: int = 0):
         if not any(k.startswith(fp + "/") or k == fp for fp in frozen_lm_prefixes)
     })
     trainable_prefixes = (
-        [g for g in _ALL_VLM_GROUPS if g != "lm_backbone"]
+        [g for g in _ALL_VLM_GROUPS if g not in (frozen_prefixes | {"lm_backbone"})]
         + trainable_lm_prefixes
     )
 
   trainable, frozen = extract_trainable_parameters(params, trainable_prefixes)
-  assert frozen, "freeze_lm=True but no params were frozen"
+  assert frozen, "freeze was requested but no params were frozen"
   return trainable, frozen
 
 
@@ -139,6 +153,7 @@ def label_trainable_frozen_params(
     params,
     freeze_lm: bool = False,
     txt_feature_layer: int = 0,
+    freeze_image_encoder: bool = False,
     image_prefix: str = "image_encoder",
 ):
   """Label params for optimizer partitioning.
@@ -152,7 +167,10 @@ def label_trainable_frozen_params(
   directly to optax.multi_transform.
   """
   _, frozen = get_trainable(
-      params, freeze_lm=freeze_lm, txt_feature_layer=txt_feature_layer
+      params,
+      freeze_lm=freeze_lm,
+      txt_feature_layer=txt_feature_layer,
+      freeze_image_encoder=freeze_image_encoder,
   )
   frozen_keys = set(flatten_state_dict(frozen).keys()) if frozen else set()
   flat_params = flatten_state_dict(params)

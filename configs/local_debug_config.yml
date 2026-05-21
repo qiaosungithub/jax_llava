@@ -12,6 +12,7 @@ training:
         learning_rate: 0.0002
     muon:
         learning_rate: 0.001
+        consistent_rms: true
 
     log_per_step: 1
     checkpoint_per_step: 10

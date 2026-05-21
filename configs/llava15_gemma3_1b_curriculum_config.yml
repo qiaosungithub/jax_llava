@@ -1,6 +1,8 @@
 model:
     arch: llava
     lm_backbone_str: "gemma3_1B"
+    # TODO(ablation): compare IT vs PT under the same LLaVA two-stage recipe.
+    # Vicuna-v1.5 is instruction-tuned, so IT is the closer Gemma substitute.
     lm_checkpoint_variant: "it"
 
     vision_tower_str: "openai/clip-vit-large-patch14-336"
@@ -18,18 +20,18 @@ model:
 
 dataset:
     image_size: 336
-    max_txt_len: 2048
+    max_txt_length: 2048
     resize_mode: stretch
     num_workers: 16
     prefetch_factor: 4
 
 training:
-    curriculum: llava15_two_stage # train 2 stages together.
+    curriculum: llava15_two_stage
 
-    # Global checkpoint stream in one workdir:
-    # stage-1 [0, 2180), stage-2 [2180, 7375).
-    stage1_steps: 2180
-    stage2_steps: 5195
+    # Global checkpoint steps stay monotonic in one workdir:
+    # stage-1: [0, 2180), stage-2: [2180, 7375).
+    stage1_steps: 2180      # 2180 * 256 = 558080 samples
+    stage2_steps: 5195      # 5195 * 128 = 664960 samples
     num_steps: 7375
 
     vision_tower_from_scratch: False
@@ -38,8 +40,8 @@ training:
 
     optimizer: adam
     grad_clip_norm: 1.0
-    log_per_step: 100
-    checkpoint_per_step: 800
+    log_per_step: 20
+    checkpoint_per_step: 1000
     log_vis_per_step: -1
     online_eval_per_step: -1
     online_eval_tasks: []
@@ -49,40 +51,39 @@ training:
 
     stage1:
         name: "stage1_projector_pretrain"
-        dataset:
-            max_txt_len: 64
+        # LLaVA-Pretrain 558K target: short image-caption alignment.
+        # Current fallback is blip3o-short to match short-caption length/scale.
         dataset_items:
             - blip3o-short
         mix_weights: [1]
         batch_size: 256
         freeze_lm: True
         freeze_image_encoder: True
-        optimizer: adam # TODO: ablate muon
+        optimizer: adam
         adam:
             learning_rate: 0.001
             adam_b2: 0.95
             weight_decay: 0.0
         warmup_steps: 65
+        siglip_warmup_steps: 65
         lr_schedule: cos
         sample_per_step: -1
-        online_eval_per_step: 500
-        online_eval_tasks: [knn_partial]
-        final_eval_tasks: [knn_full, vqav2]
+        online_eval_per_step: -1
+        online_eval_tasks: []
+        final_eval_tasks: []
 
     stage2:
         name: "stage2_visual_instruction_sft"
-        dataset:
-            max_txt_len: 512
         dataset_items:
             - llava-ov-1.5-instruct
             - vqav2
             - gqa-train
             - textcaps-train
             - visual-genome
-        # Approximate current loader sample units in millions:
-        # LLaVA-OV1.5 22M, VQAv2 ~0.4M QA, GQA train ~0.94M QA,
-        # TextCaps ~0.022M captions, Visual Genome ~1.7M QA.
-        # TODO: implement LLaVA-1.5-style per-image QA conversation merging for exact 665K counts.
+        # Approximate current loader sample units in millions. This is not the
+        # exact LLaVA-1.5 665K recipe because our VQA/GQA loader expands QA pairs
+        # instead of merging each image's QA pairs into one conversation.
+        # Visual Genome is loaded as image QA pairs here, not VG grounding.
         mix_weights: [22, 0.4, 0.94, 0.022, 1.7]
         batch_size: 128
         freeze_lm: False
@@ -93,11 +94,12 @@ training:
             adam_b2: 0.95
             weight_decay: 0.0
         warmup_steps: 156
+        siglip_warmup_steps: 156
         lr_schedule: cos
         sample_per_step: 200
-        online_eval_per_step: 750
-        online_eval_tasks: [knn_partial, vqav2, mme, textvqa, pope, refcocog, pixelbench, gqa, vizwiz, scienceqa_img, seed_bench]
-        final_eval_tasks: [knn_full, vqav2, mme, textvqa, pope, refcocog, pixelbench, mmbench, gqa, vizwiz, scienceqa_img, seed_bench]
+        online_eval_per_step: -1
+        online_eval_tasks: []
+        final_eval_tasks: [gqa, vizwiz, scienceqa_img, seed_bench]
 
 sampling:
     max_new_tokens: 64
@@ -105,8 +107,6 @@ sampling:
 
 eval:
     eval_recon_tokens: []
-    device_batch_size: 32
-    mmbench_max_new_tokens: 8
 
 finetune: False
 sharding: hsdp
@@ -114,6 +114,5 @@ sharding: hsdp
 logging:
     use_wandb: True
     wandb_project: "jax-llava"
-    wandb_entity: "sqa24-massachusetts-institute-of-technology"
-    wandb_tags: ["llava1.5", "curriculum", "hsdp"]
-    wandb_notes: "[init] LLaVA-1.5 two-stage curriculum using jit/HSDP. Stage-1 blip3o-short, stage-2 LLaVA-OV-1.5-Instruct plus VQAv2/GQA/TextCaps/Visual Genome QA."
+    wandb_tags: ["llava15", "gemma3-1b", "curriculum", "clip-l14-336"]
+    wandb_notes: "Single-workdir LLaVA-style curriculum: blip3o-short projector pretrain then LLaVA-OV1.5 plus VQAv2/GQA/TextCaps/Visual Genome QA SFT."

@@ -31,6 +31,7 @@ from gemma.gm.text import _tokenizer
 from gemma.gm.typing import _common
 from gemma.gm.utils import _types
 import jax
+from jax.experimental import multihost_utils
 import jax.numpy as jnp
 from kauldron import kd
 from kauldron.typing import Array, Float, Int, PRNGKey, PRNGKeyLike, UInt8  # pylint: disable=g-multiple-import,g-importing-member
@@ -573,11 +574,8 @@ def _max_across_hosts(x: int) -> int:
   """Returns the maximum value across all hosts."""
   if jax.process_count() == 1:
     return x
-  x = jnp.asarray([x] * jax.local_device_count())
-  x = _max_across_hosts_pmap(x)
-  return x[0]
-
-
-@functools.partial(jax.pmap, axis_name='i')
-def _max_across_hosts_pmap(x: jax.Array) -> jax.Array:
-  return jax.lax.pmax(x, 'i')
+  gathered = multihost_utils.process_allgather(
+      np.asarray(x, dtype=np.int32),
+      tiled=False,
+  )
+  return int(np.max(np.asarray(gathered)))

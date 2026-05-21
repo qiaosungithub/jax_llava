@@ -10,7 +10,17 @@ dataset_name_to_path_dict = {
     'visual-genome-gcap':'gs://kmh-gcp-💣/data/visual_genome/wds/shard-{000000..000040}.tar',
     'visual-genome-det': 'gs://kmh-gcp-💣/data/visual_genome/wds/shard-{000000..000040}.tar',
     'vqav2':             'gs://kmh-gcp-💣/data/vqav2/vqav2_image_records_wds/train2014/shard-{000000..000008}.tar',
+    'gqa':               'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/gqa-balanced/train/shard-{000000..000036}.tar',
+    'gqa-train':         'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/gqa-balanced/train/shard-{000000..000036}.tar',
+    'gqa-val':           'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/gqa-balanced/val/shard-{000000..000005}.tar',
+    'gqa-testdev':       'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/gqa-balanced/testdev/shard-000000.tar',
     'textvqa':           'gs://kmh-gcp-💣/data/textvqa/train/shard-000000.tar',
+    'vizwiz-vqa-val':    'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/vizwiz-vqa/val/shard-{000000..000002}.tar',
+    'vizwiz-vqa-test':   'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/vizwiz-vqa/test/shard-{000000..000003}.tar',
+    'scienceqa-img-train':'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/scienceqa-img/train/shard-{000000..000003}.tar',
+    'scienceqa-img-val': 'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/scienceqa-img/validation/shard-{000000..000001}.tar',
+    'scienceqa-img-test':'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/scienceqa-img/test/shard-{000000..000001}.tar',
+    'seed-bench-image':  'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/seed-bench-image/shard-{000000..000002}.tar',
     'tallyqa':           'gs://kmh-gcp-💣/data/tallyqa/wds/shard-{000000..000067}.tar',
     'dvqa': [
         'gs://kmh-gcp-💣/data/dvqa/wds/train/shard-{000000..000099}.tar',
@@ -38,7 +48,17 @@ dataset_name_to_type_dict = {
     'visual-genome-gcap':'genome_gcap',
     'visual-genome-det': 'genome_det',
     'vqav2':             'vqav2',
+    'gqa':               'gqa',
+    'gqa-train':         'gqa',
+    'gqa-val':           'gqa',
+    'gqa-testdev':       'gqa',
     'textvqa':           'textvqa',
+    'vizwiz-vqa-val':    'vizwiz',
+    'vizwiz-vqa-test':   'vizwiz',
+    'scienceqa-img-train':'scienceqa_img',
+    'scienceqa-img-val': 'scienceqa_img',
+    'scienceqa-img-test':'scienceqa_img',
+    'seed-bench-image':  'seed_bench',
     'tallyqa':           'tallyqa',
     'dvqa':              'dvqa',
     'dvqa-train':        'dvqa',
@@ -106,12 +126,17 @@ def resolve_dataset_roots(config, zone):
                 dataset_name_to_type_dict.get(n, '') for n in roots
             ]
 
-    if config.eval.get('vqav2_root', False) and '💣' in config.eval.vqav2_root:
-        config.eval.vqav2_root = config.eval.vqav2_root.replace('💣', zone)
-    if config.eval.get('mme_root', False) and '💣' in config.eval.mme_root:
-        config.eval.mme_root = config.eval.mme_root.replace('💣', zone)
-    if config.eval.get('textvqa_root', False) and '💣' in config.eval.textvqa_root:
-        config.eval.textvqa_root = config.eval.textvqa_root.replace('💣', zone)
+    for _eval_root_key in [
+        'vqav2_root',
+        'mme_root',
+        'textvqa_root',
+        'gqa_root',
+        'vizwiz_root',
+        'scienceqa_img_root',
+        'seed_bench_root',
+    ]:
+        if config.eval.get(_eval_root_key, False) and '💣' in config.eval[_eval_root_key]:
+            config.eval[_eval_root_key] = config.eval[_eval_root_key].replace('💣', zone)
     if config.eval.get("pope_root", False) and "💣" in config.eval.pope_root:
         config.eval.pope_root = config.eval.pope_root.replace("💣", zone)
     if (

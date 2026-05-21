@@ -20,9 +20,13 @@ by Keller Jordan
 """
 
 
+import math
 from typing import Any, Callable, NamedTuple, Optional, Union
 
 import chex
+from flax.core import FrozenDict
+from flax.traverse_util import flatten_dict
+from flax.traverse_util import unflatten_dict
 import jax
 import jax.numpy as jnp
 
@@ -33,6 +37,14 @@ from optax._src import numerics
 from optax._src import transform
 from optax._src import utils
 import optax.tree
+
+
+_ADAM_LABEL = "adam"
+_MUON_MATRIX_LABEL = "muon_matrix"
+_MUON_PATCH_EMBED_LABEL = "muon_patch_embed"
+_MUON_DENSE_GENERAL_IN_LABEL = "muon_dense_general_in"
+_MUON_EINSUM_ATTENTION_IN_LABEL = "muon_einsum_attention_in"
+_MUON_DENSE_GENERAL_OUT_LABEL = "muon_dense_general_out"
 
 
 def orthogonalize_via_newton_schulz(
@@ -93,6 +105,216 @@ def orthogonalize_via_newton_schulz(
   return x
 
 
+def _to_matrix_batch(x: jax.Array, matrix_axis_policy: str) -> jax.Array:
+  """Views a Dense kernel as a batch of 2D matrices for Muon."""
+  if matrix_axis_policy == _MUON_MATRIX_LABEL:
+    if x.ndim < 2:
+      raise ValueError(f"Muon matrix params must be at least 2D, got {x.shape}")
+    matrix_shape = x.shape[-2:]
+    return jnp.reshape(x, (-1,) + matrix_shape)
+
+  if matrix_axis_policy == _MUON_PATCH_EMBED_LABEL:
+    # ViT patch embedding conv: (...scan, patch_h, patch_w, in_ch, out_dim)
+    # -> (...scan, patch_h * patch_w * in_ch, out_dim).
+    if x.ndim < 2:
+      raise ValueError(
+          f"Patch embedding params must be at least 2D, got {x.shape}"
+      )
+    matrix_shape = (math.prod(x.shape[:-1]), x.shape[-1])
+    return jnp.reshape(x, (-1,) + matrix_shape)
+
+  if matrix_axis_policy == _MUON_DENSE_GENERAL_IN_LABEL:
+    # DenseGeneral q/k/v kernel: (...scan, in_dim, heads, head_dim)
+    # -> (...scan, in_dim, heads * head_dim).
+    if x.ndim < 3:
+      raise ValueError(
+          "DenseGeneral input-projection params must be at least 3D, "
+          f"got {x.shape}"
+      )
+    matrix_shape = (x.shape[-3], math.prod(x.shape[-2:]))
+    return jnp.reshape(x, (-1,) + matrix_shape)
+
+  if matrix_axis_policy == _MUON_EINSUM_ATTENTION_IN_LABEL:
+    # Gemma q/qkv/kv einsum weights: (...batch, heads, in_dim, head_dim)
+    # -> (...batch, in_dim, heads * head_dim). The batch axis can be qkv/kv
+    # selector and/or a scanned layer axis.
+    if x.ndim < 3:
+      raise ValueError(
+          "Einsum attention input-projection params must be at least 3D, "
+          f"got {x.shape}"
+      )
+    x = jnp.moveaxis(x, -3, -2)
+    matrix_shape = (x.shape[-3], math.prod(x.shape[-2:]))
+    return jnp.reshape(x, (-1,) + matrix_shape)
+
+  if matrix_axis_policy == _MUON_DENSE_GENERAL_OUT_LABEL:
+    # DenseGeneral output kernel: (...scan, heads, head_dim, out_dim)
+    # -> (...scan, heads * head_dim, out_dim).
+    if x.ndim < 3:
+      raise ValueError(
+          "DenseGeneral output-projection params must be at least 3D, "
+          f"got {x.shape}"
+      )
+    matrix_shape = (math.prod(x.shape[-3:-1]), x.shape[-1])
+    return jnp.reshape(x, (-1,) + matrix_shape)
+
+  raise ValueError(f"Unknown Muon matrix-axis policy: {matrix_axis_policy}")
+
+
+def _from_matrix_batch(
+    matrices: jax.Array,
+    original_shape: tuple[int, ...],
+    matrix_axis_policy: str,
+) -> jax.Array:
+  if matrix_axis_policy == _MUON_EINSUM_ATTENTION_IN_LABEL:
+    moved_shape = original_shape[:-3] + (
+        original_shape[-2],
+        original_shape[-3],
+        original_shape[-1],
+    )
+    x = jnp.reshape(matrices, moved_shape)
+    return jnp.moveaxis(x, -2, -3)
+  return jnp.reshape(matrices, original_shape)
+
+
+def _orthogonalize_muon_update(
+    x: jax.Array,
+    ns_coeffs: jax.Array,
+    ns_steps: int,
+    eps: float,
+    matrix_axis_policy: str,
+    consistent_rms: bool,
+) -> jax.Array:
+  matrices = _to_matrix_batch(x, matrix_axis_policy)
+  updates = jax.vmap(
+      lambda matrix: orthogonalize_via_newton_schulz(
+          matrix, ns_coeffs, ns_steps, eps
+      )
+  )(matrices)
+
+  if consistent_rms:
+    rms = jnp.sqrt(jnp.mean(jnp.square(updates), axis=(-2, -1), keepdims=True))
+    updates = updates / (rms + eps)
+  else:
+    rows = matrices.shape[-2]
+    cols = matrices.shape[-1]
+    updates = jnp.sqrt(jnp.maximum(1, cols / rows)) * updates
+
+  return _from_matrix_batch(updates, x.shape, matrix_axis_policy)
+
+
+def _apply_muon_adaptive_scaling(
+    mu_hat: jax.Array,
+    updates: jax.Array,
+    matrix_axis_policy: str,
+) -> jax.Array:
+  mu_matrices = _to_matrix_batch(mu_hat, matrix_axis_policy)
+  update_matrices = _to_matrix_batch(updates, matrix_axis_policy)
+  dual_norm = jnp.sum(
+      mu_matrices * update_matrices, axis=(-2, -1), keepdims=True
+  )
+  update_matrices = dual_norm * update_matrices
+  return _from_matrix_batch(update_matrices, updates.shape, matrix_axis_policy)
+
+
+def _path_parts(path: tuple[Any, ...]) -> tuple[str, ...]:
+  return tuple(str(x).lower() for x in path)
+
+
+def _is_attention_path(parts: tuple[str, ...]) -> bool:
+  joined = "/".join(parts)
+  return (
+      "attention" in joined
+      or "attn" in joined
+      or "multiheaddotproductattention" in joined
+      or "cross_attn" in joined
+  )
+
+
+def _is_mlp_path(parts: tuple[str, ...]) -> bool:
+  joined = "/".join(parts)
+  return (
+      "mlp" in joined
+      or "ffn" in joined
+      or "feedforward" in joined
+      or "feed_forward" in joined
+  )
+
+
+def _is_patch_embedding_path(parts: tuple[str, ...]) -> bool:
+  joined = "/".join(parts)
+  return (
+      "patch_embed" in joined
+      or "patch_embedding" in joined
+      or "/embedding/kernel" in joined
+  )
+
+
+def _muon_label_for_param(path: tuple[Any, ...], param: Any) -> str:
+  """Labels only Attention/MLP Dense kernels for Muon.
+
+  The rule is intentionally path-based rather than apparent-rank-based because
+  scanned Flax modules prepend the layer axis to every parameter.
+  """
+  parts = _path_parts(path)
+  if not parts or getattr(param, "ndim", 0) < 2:
+    return _ADAM_LABEL
+
+  leaf_name = parts[-1]
+  parent = parts[-2] if len(parts) >= 2 else ""
+  grandparent = parts[-3] if len(parts) >= 3 else ""
+  is_attention = _is_attention_path(parts)
+  is_mlp = _is_mlp_path(parts)
+
+  if leaf_name == "kernel" and _is_patch_embedding_path(parts):
+    return _MUON_PATCH_EMBED_LABEL
+
+  if is_attention:
+    if leaf_name == "w" and parent in {"q_einsum", "qkv_einsum", "kv_einsum"}:
+      return _MUON_EINSUM_ATTENTION_IN_LABEL
+    if leaf_name == "w" and parent == "attn_vec_einsum":
+      return (
+          _MUON_DENSE_GENERAL_OUT_LABEL
+          if param.ndim >= 3
+          else _MUON_MATRIX_LABEL
+      )
+    if leaf_name != "kernel":
+      return _ADAM_LABEL
+    if parent in {"query", "key", "value", "q", "k", "v", "qkv"}:
+      return (
+          _MUON_DENSE_GENERAL_IN_LABEL
+          if param.ndim >= 3
+          else _MUON_MATRIX_LABEL
+      )
+    if parent in {"out", "out_proj", "proj", "o"}:
+      return (
+          _MUON_DENSE_GENERAL_OUT_LABEL
+          if param.ndim >= 3
+          else _MUON_MATRIX_LABEL
+      )
+    return _MUON_MATRIX_LABEL
+
+  if is_mlp or grandparent in {"mlp", "mlpblock"}:
+    if leaf_name not in {"kernel", "gating_einsum", "linear", "w"}:
+      return _ADAM_LABEL
+    return _MUON_MATRIX_LABEL
+
+  return _ADAM_LABEL
+
+
+def create_muon_param_labels(params: base.Params) -> base.Params:
+  """Creates the optimizer label pytree for Muon partitioning."""
+  is_frozen = isinstance(params, FrozenDict)
+  params_dict = params.unfreeze() if is_frozen else params
+  flat_params = flatten_dict(params_dict)
+  labels = {
+      path: _muon_label_for_param(path, param)
+      for path, param in flat_params.items()
+  }
+  labels = unflatten_dict(labels)
+  return FrozenDict(labels) if is_frozen else labels
+
+
 class MuonState(NamedTuple):
   """State for the Muon algorithm."""
   count: chex.Array  # shape=(), dtype=jnp.int32.
@@ -112,6 +334,8 @@ def scale_by_muon(
     *,
     nesterov: bool = True,
     adaptive: bool = False,
+    matrix_axis_policy: str = _MUON_MATRIX_LABEL,
+    consistent_rms: bool = False,
 ) -> base.GradientTransformation:
   r"""Rescale updates according to the Muon algorithm.
 
@@ -131,6 +355,10 @@ def scale_by_muon(
     nesterov: Whether to use Nesterov momentum.
     adaptive: Whether to scale the updates by the dual norm of the
       original updates. See <https://arxiv.org/abs/2409.20325>
+    matrix_axis_policy: How to view selected Dense kernels as matrices.
+    consistent_rms: If true, normalize the orthogonalized update to unit RMS
+      per matrix so the Muon learning rate is comparable to Adam's normalized
+      update scale.
 
   Returns:
     A `GradientTransformation` object.
@@ -171,10 +399,16 @@ def scale_by_muon(
       )
     else:
       mu_hat = optax.tree.bias_correction(mu, beta, count_inc)
-    # Apply Newton-schulz orthogonalization.
+    # Apply Newton-schulz orthogonalization. Scanned Dense kernels are treated
+    # as a batch of per-layer matrices.
     updates = jax.tree.map(
-        lambda x: orthogonalize_via_newton_schulz(
-            x, state.ns_coeffs, ns_steps, eps
+        lambda x: _orthogonalize_muon_update(
+            x,
+            state.ns_coeffs,
+            ns_steps,
+            eps,
+            matrix_axis_policy,
+            consistent_rms,
         ),
         mu_hat,
     )
@@ -182,12 +416,12 @@ def scale_by_muon(
       # Scale the orthogonalized updates by the dual norm of the original
       # updates. See https://arxiv.org/abs/2409.20325 for the derivation.
       updates = jax.tree.map(
-          lambda x, y: jnp.einsum('ij,ij,ab->ab', x, y, y), mu_hat, updates
+          lambda x, y: _apply_muon_adaptive_scaling(
+              x, y, matrix_axis_policy
+          ),
+          mu_hat,
+          updates,
       )
-    updates = jax.tree.map(
-        lambda x: jnp.sqrt(jnp.maximum(1, x.shape[-1] / x.shape[-2])) * x,
-        updates,
-    )
     mu = optax.tree.cast(mu, mu_dtype)
     return updates, MuonState(
         count=count_inc,
@@ -215,6 +449,7 @@ def muon(
     custom_adam = None,
     nesterov: bool = True,
     adaptive: bool = False,
+    consistent_rms: bool = True,
     adam_b1: float = 0.9,
     adam_b2: float = 0.999,
     adam_eps_root: float = 0.0,
@@ -228,9 +463,10 @@ def muon(
   p=infty, it is equivalent to Shampoo without accumulation, or steepest
   descent under the Spectral norm.
 
-  Note that Muon is currently only defined for 2D parameters, i.e. matrices.
-  This is because the Newton-Schulz iterator expects a matrix as input.
-  The non-2D parameters are instead passed through an Adam optimizer.
+  Muon is applied only to Dense kernels inside Attention/MLP modules. Scanned
+  Dense params and DenseGeneral attention params are reshaped into per-layer
+  matrices before the Newton-Schulz iteration. All other params are passed
+  through Adam.
 
   Args:
     learning_rate: A global scaling factor, either fixed or evolving along
@@ -253,6 +489,8 @@ def muon(
     nesterov: Whether to use Nesterov momentum.
     adaptive: Whether to scale the updates by the dual norm of the
       original updates. See <https://arxiv.org/abs/2409.20325>
+    consistent_rms: Normalize each Muon matrix update to unit RMS, matching the
+      scale expected by the Adam fallback learning rate.
     adam_b1: Exponential decay rate for Adam's first moment estimates.
     adam_b2: Exponential decay rate for Adam's second moment estimates.
     adam_eps_root: Epsilon to stabilize division in Adam, square root version.
@@ -278,24 +516,37 @@ def muon(
       mu_dtype=mu_dtype,
       nesterov=nesterov,
   )
+  def _muon_transform(matrix_axis_policy: str) -> base.GradientTransformation:
+    return combine.chain(
+        scale_by_muon(
+            ns_coeffs=ns_coeffs,
+            ns_steps=ns_steps,
+            beta=beta,
+            eps=eps,
+            mu_dtype=mu_dtype,
+            nesterov=nesterov,
+            adaptive=adaptive,
+            matrix_axis_policy=matrix_axis_policy,
+            consistent_rms=consistent_rms,
+        ),
+        transform.add_decayed_weights(weight_decay, weight_decay_mask),
+        transform.scale_by_learning_rate(learning_rate),
+    )
+
   return combine.partition(
       transforms={
-          'muon': combine.chain(
-              scale_by_muon(
-                  ns_coeffs=ns_coeffs,
-                  ns_steps=ns_steps,
-                  beta=beta,
-                  eps=eps,
-                  mu_dtype=mu_dtype,
-                  nesterov=nesterov,
-                  adaptive=adaptive,
-              ),
-              transform.add_decayed_weights(weight_decay, weight_decay_mask),
-              transform.scale_by_learning_rate(learning_rate),
+          _MUON_MATRIX_LABEL: _muon_transform(_MUON_MATRIX_LABEL),
+          _MUON_PATCH_EMBED_LABEL: _muon_transform(_MUON_PATCH_EMBED_LABEL),
+          _MUON_DENSE_GENERAL_IN_LABEL: _muon_transform(
+              _MUON_DENSE_GENERAL_IN_LABEL
           ),
-          'adam': adam,
+          _MUON_EINSUM_ATTENTION_IN_LABEL: _muon_transform(
+              _MUON_EINSUM_ATTENTION_IN_LABEL
+          ),
+          _MUON_DENSE_GENERAL_OUT_LABEL: _muon_transform(
+              _MUON_DENSE_GENERAL_OUT_LABEL
+          ),
+          _ADAM_LABEL: adam,
       },
-      param_labels=lambda params: jax.tree.map(
-          lambda x: 'muon' if x.ndim == 2 else 'adam', params
-      ),
+      param_labels=create_muon_param_labels,
   )

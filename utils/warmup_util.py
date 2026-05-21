@@ -279,11 +279,24 @@ def worker_main_fn(read_from, file_this_round):
         raise RuntimeError(f"[Rank {PRI}] Failed to receive {file_this_round} from Rank {read_from}")
 
 def get_matmul_fn():
-    from flax.jax_utils import replicate as R
+    from utils.pjit_util import MeshMode, prepare_pjit_funcs
     N = 1 << 15
-    key = R(jax.random.key(0))
-    x = jax.pmap(lambda key: jax.random.normal(key, (N, N)))(key)
-    mm = jax.pmap(lambda x: x@x.T / jnp.linalg.norm(x.T@x))
+    _, get_partition_spec, _, _, pjit_compile = prepare_pjit_funcs("ddp")
+    matrix_spec = get_partition_spec(
+        jax.ShapeDtypeStruct((N, N), jnp.float32),
+        MeshMode.DATA,
+    )
+    make_x = pjit_compile(
+        lambda key: jax.random.normal(key, (N, N), dtype=jnp.float32),
+        in_shardings=(None,),
+        out_shardings=matrix_spec,
+    )
+    mm = pjit_compile(
+        lambda x: x @ x.T / jnp.linalg.norm(x.T @ x),
+        in_shardings=(matrix_spec,),
+        out_shardings=matrix_spec,
+    )
+    x = make_x(jax.random.key(0))
     return x, mm
 
 def wait_run(fn, *args, max_retries: int = 5, restart_fn=None, timeout_s=None, **kwargs):

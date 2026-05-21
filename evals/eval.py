@@ -13,6 +13,12 @@ from evals.eval_mmbench import eval_mmbench
 from evals.eval_imagenet_knn import eval_imagenet_knn
 from evals.eval_refcocog import eval_refcocog
 from evals.eval_pixelbench import eval_pixelbench
+from evals.eval_vlm_benchmarks import (
+    eval_gqa,
+    eval_vizwiz,
+    eval_scienceqa_img,
+    eval_seed_bench,
+)
 from utils.logging_util import log_for_0
 from utils.eval_io_util import set_eval_result_context
 from utils import vis_util
@@ -183,6 +189,61 @@ def run_eval_tasks(
             if sample_outputs:
                 writer.write_texts(step, f"textvqa_samples{suffix}", sample_outputs)
             log_for_0("TextVQA evaluation finished.")
+            continue
+
+        if t == "gqa":
+            log_for_0(f"Evaluating GQA at step {step}...")
+            acc, sample_outputs, _ = eval_gqa(
+                p_sample_fn, run_p_sample_step, model, tokenizer, params, config
+            )
+            log_for_0(f"GQA accuracy: {acc:.2f}%")
+            writer.write_scalars(step, {f"gqa_acc{suffix}": acc, "step": step})
+            if sample_outputs:
+                writer.write_texts(step, f"gqa_samples{suffix}", sample_outputs)
+            log_for_0("GQA evaluation finished.")
+            continue
+
+        if t == "vizwiz":
+            log_for_0(f"Evaluating VisWiz at step {step}...")
+            acc, sample_outputs, metric_dict = eval_vizwiz(
+                p_sample_fn, run_p_sample_step, model, tokenizer, params, config
+            )
+            log_for_0(f"VisWiz accuracy: {acc:.2f}%")
+            scalar_dict = {f"vizwiz_acc{suffix}": acc, "step": step}
+            if metric_dict.get("num_without_gt", 0):
+                scalar_dict[f"vizwiz_num_without_gt{suffix}"] = float(metric_dict["num_without_gt"])
+            writer.write_scalars(step, scalar_dict)
+            if sample_outputs:
+                writer.write_texts(step, f"vizwiz_samples{suffix}", sample_outputs)
+            log_for_0("VisWiz evaluation finished.")
+            continue
+
+        if t in {"scienceqa", "scienceqa_img", "scienceqa-img", "sciqa", "sciqa_img"}:
+            log_for_0(f"Evaluating ScienceQA-IMG at step {step}...")
+            acc, sample_outputs, _ = eval_scienceqa_img(
+                p_sample_fn, run_p_sample_step, model, tokenizer, params, config
+            )
+            log_for_0(f"ScienceQA-IMG accuracy: {acc:.2f}%")
+            writer.write_scalars(step, {f"scienceqa_img_acc{suffix}": acc, "step": step})
+            if sample_outputs:
+                writer.write_texts(step, f"scienceqa_img_samples{suffix}", sample_outputs)
+            log_for_0("ScienceQA-IMG evaluation finished.")
+            continue
+
+        if t in {"seed", "seed_bench", "seed-bench", "seed_bench_image", "seed-bench-image"}:
+            log_for_0(f"Evaluating SEED-Bench at step {step}...")
+            acc, sample_outputs, metric_dict = eval_seed_bench(
+                p_sample_fn, run_p_sample_step, model, tokenizer, params, config
+            )
+            log_for_0(f"SEED-Bench accuracy: {acc:.2f}%")
+            scalar_dict = {f"seed_bench_acc{suffix}": acc, "step": step}
+            for qtype, metrics in metric_dict.get("by_question_type", {}).items():
+                safe = qtype.lower().replace(" ", "_").replace("/", "_")
+                scalar_dict[f"seed_bench_{safe}_acc{suffix}"] = float(metrics["accuracy"])
+            writer.write_scalars(step, scalar_dict)
+            if sample_outputs:
+                writer.write_texts(step, f"seed_bench_samples{suffix}", sample_outputs)
+            log_for_0("SEED-Bench evaluation finished.")
             continue
 
         if t == "pope":
