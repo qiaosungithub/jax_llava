@@ -6,13 +6,29 @@ implementation for both parameter loading and forward execution.
 """
 from __future__ import annotations
 
+import contextlib
+
 from typing import Any, Optional
 
 import jax.numpy as jnp
 import flax.linen as nn
 from flax.core import unfreeze
 from transformers import CLIPImageProcessor, CLIPVisionConfig, FlaxCLIPVisionModel
-from transformers.models.clip.modeling_flax_clip import FlaxCLIPVisionModule
+from transformers import logging as hf_logging
+from transformers.models.clip.modeling_flax_clip import FlaxCLIPVisionTransformer
+
+
+@contextlib.contextmanager
+def _silence_hf_from_pretrained_warnings():
+    """Temporarily silence HF's noisy 'Some weights ... were not used' /
+    'This IS expected ...' messages emitted by from_pretrained when loading
+    a vision-only subset out of a full CLIP checkpoint."""
+    prev = hf_logging.get_verbosity()
+    hf_logging.set_verbosity_error()
+    try:
+        yield
+    finally:
+        hf_logging.set_verbosity(prev)
 
 
 CLIP_L14_336 = "openai/clip-vit-large-patch14-336"
@@ -65,7 +81,8 @@ def load_clip_vision_params(
     if cache_dir:
         kwargs["cache_dir"] = cache_dir
 
-    model = FlaxCLIPVisionModel.from_pretrained(model_name, **kwargs)
+    with _silence_hf_from_pretrained_warnings():
+        model = FlaxCLIPVisionModel.from_pretrained(model_name, **kwargs)
     params = unfreeze(model.params)
     if "vision_model" not in params:
         raise KeyError(
@@ -84,7 +101,8 @@ def load_clip_image_processor(
     kwargs = {}
     if cache_dir:
         kwargs["cache_dir"] = cache_dir
-    return CLIPImageProcessor.from_pretrained(model_name, **kwargs)
+    with _silence_hf_from_pretrained_warnings():
+        return CLIPImageProcessor.from_pretrained(model_name, **kwargs)
 
 
 class CLIPVisionTower(nn.Module):
@@ -105,7 +123,14 @@ class CLIPVisionTower(nn.Module):
 
     def setup(self) -> None:
         self.config_obj = clip_vision_config(self.model_name)
-        self.vision_model = FlaxCLIPVisionModule(
+        # Use FlaxCLIPVisionTransformer directly (not FlaxCLIPVisionModule) to
+        # avoid an extra 'vision_model/' nesting level. HuggingFace's
+        # FlaxCLIPVisionModel.params already collapses the outer module name,
+        # so its layout is {'vision_model': {'embeddings', 'pre_layrnorm',
+        # 'encoder', 'post_layernorm'}}. Wrapping FlaxCLIPVisionModule here
+        # would produce {'vision_model': {'vision_model': {...}}} and break
+        # tree_map against the loaded checkpoint.
+        self.vision_model = FlaxCLIPVisionTransformer(
             config=self.config_obj,
             dtype=self.dtype,
         )

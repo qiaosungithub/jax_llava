@@ -20,12 +20,21 @@ def get_config():
     dataset.root  = ['/kmh-nfs-ssd-us-mount/data/imagenet']
     # Populated automatically by resolve_dataset_roots(); do not set manually.
     dataset.types = []
+    dataset.mix_weights = []
 
     dataset.num_workers = 8
     dataset.prefetch_factor = 4
     dataset.pin_memory = False
     # Base offset added to the checkpoint step when seeding dataloader shuffles.
     dataset.data_seed_offset = 0
+    # Regular WebDataset loaders fill this buffer before yielding. Keep the
+    # production default large, but allow remote smoke tests to lower it.
+    dataset.webdataset_shuffle_size = 10000
+    # Keep custom QA/region loaders from reading huge buffers before first yield.
+    dataset.item_shuffle_size = ml_collections.ConfigDict()
+    dataset.item_shuffle_size.default = 512
+    # 0 keeps PyTorch's default; remote configs can set this to fail fast.
+    dataset.dataloader_timeout = 0
 
     dataset.image_size = 224
     # Image geometry before normalization:
@@ -90,16 +99,28 @@ def get_config():
     training.curriculum = ""
     training.stage1_steps = 0
     training.stage2_steps = 0
+    training.curriculum_stage_name = ""
+    training.curriculum_stage_key = ""
+    training.curriculum_stage_index = 0
+    training.curriculum_stage_start_step = 0
+    training.curriculum_stage_end_step = 0
+    training.curriculum_global_num_steps = 0
 
     training.seed = 42
 
     # training.ema_val = [0.9999]
 
+    training.optimizer = "adam"
     training.lr_schedule = "cos"
+    training.siglip_warmup_steps = 0
 
     # Whether to freeze the LM backbone params during training (only the
     # image encoder + projector receive gradients).
     training.freeze_lm = False
+    training.freeze_image_encoder = False
+    training.vision_tower_from_scratch = False
+    training.clip_from_pt = True
+    training.hf_cache_dir = None
     # If enabled, only load pretrained Gemma embedder + first N transformer
     # layers into lm_backbone; later multimodal layers stay randomly initialized.
     # When lm_init_pretrained_num_layers is None, model.txt_feature_layer is used.

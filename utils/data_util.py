@@ -2,7 +2,18 @@
 dataset_name_to_path_dict = {
     'laion-aes':         'gs://kmh-gcp-💣/data/laion-aesthetic/part-{00000..00127}-cad4a140-cebd-46fa-b874-e8968f93e32e-c000.snappy/{00000..00040}.tar',
     'cc12m':             'gs://kmh-gcp-💣/data/cc12m/{00000..01096}.tar',
-    'blip3o-short':      'gs://kmh-gcp-💣/data/BLIP3o-Pretrain-Short-Caption/{00000..01832}.tar',
+    # NOTE: shards 00842.tar and 01812.tar are missing from the upstream
+    # HuggingFace dataset (and therefore from our mirrors). Use webdataset's
+    # '::' separator (split before braceexpand in wds.expand_urls) to chain
+    # three brace ranges that skip the holes. Full valid range is
+    # 00000..01832 minus {842, 1812} -> 1831 shards.
+    # NB: must stay a single str (not a list) -- expand_urls only does
+    # braceexpand when it gets a str input.
+    'blip3o-short':      (
+        'gs://kmh-gcp-💣/data/BLIP3o-Pretrain-Short-Caption/{00000..00841}.tar'
+        '::gs://kmh-gcp-💣/data/BLIP3o-Pretrain-Short-Caption/{00843..01811}.tar'
+        '::gs://kmh-gcp-💣/data/BLIP3o-Pretrain-Short-Caption/{01813..01832}.tar'
+    ),
     'textcaps-train':    'gs://kmh-gcp-💣/data/textcaps/train/shard-{000000..000002}.tar',
     'textcaps-val':      'gs://kmh-gcp-💣/data/textcaps/val/shard-000000.tar',
     'rendered-text-512': 'gs://kmh-gcp-💣/data/rendered-text-512/{000000..009979}.tar',

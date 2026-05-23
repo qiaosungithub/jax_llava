@@ -31,6 +31,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 _REGION_DESC_LOCAL = "/dev/shm/vg_region_descriptions.json"
 _DATA_SEED_STRIDE = 1_000_003
+_GCS_GLOB_CACHE = {}
 
 
 def _region_desc_gcs_from_root(root_url: str) -> str:
@@ -254,18 +255,51 @@ def _decode_image_if_needed(image):
     return image
 
 
-def make_stop_after_n_errors(max_errors=50):
+_FATAL_WDS_ERROR_MARKERS = (
+    "no such file",
+    "not found",
+    "404",
+    "403",
+    "forbidden",
+    "permission denied",
+    "access denied",
+    "unauthorized",
+    "bucket not found",
+    "does not exist",
+)
+
+
+def _is_fatal_wds_error(exn):
+    if isinstance(exn, (FileNotFoundError, PermissionError)):
+        return True
+    text = " ".join(
+        str(arg) for arg in getattr(exn, "args", ()) if arg is not None
+    ).lower()
+    return any(marker in text for marker in _FATAL_WDS_ERROR_MARKERS)
+
+
+def make_stop_after_n_errors(max_errors=50, fatal_on_missing=True):
     """Skip sporadic bad samples; stop after too many errors."""
     count = [0]
 
     def handler(exn):
-        count[0] += 1
-        if count[0] >= max_errors:
+        if fatal_on_missing and _is_fatal_wds_error(exn):
             raise exn
-        warnings.warn(f"Ignoring error ({count[0]}/{max_errors}): {exn}", UserWarning, stacklevel=2)
+        count[0] += 1
+        if count[0] >= max_errors or max_errors <= 0:
+            raise exn
+        warnings.warn(
+            f"Ignoring error ({count[0]}/{max_errors}): {exn}",
+            UserWarning,
+            stacklevel=2,
+        )
         return True
 
     return handler
+
+
+def _max_wds_errors(config):
+    return int(getattr(config, "max_wds_errors", 50))
 
 
 class LetterboxPadTransform:
@@ -928,10 +962,14 @@ def _expand_gcs_glob_if_needed(root):
     if not (isinstance(root, str) and root.startswith("gs://") and "*" in root):
         return root
 
+    if root in _GCS_GLOB_CACHE:
+        return list(_GCS_GLOB_CACHE[root])
+
     fs = fsspec.filesystem("gs")
     matches = sorted(fs.glob(root))
     assert len(matches) > 0, f"No GCS files matched dataset glob: {root}"
     urls = [m if str(m).startswith("gs://") else f"gs://{m}" for m in matches]
+    _GCS_GLOB_CACHE[root] = tuple(urls)
     log_for_0(f"Expanded GCS glob to {len(urls)} shards: {root}")
     return urls
 
@@ -983,7 +1021,10 @@ class VQAv2IterableDataset(IterableDataset):
     """
 
     def __init__(self, root_url, config, tokenizer, num_shards=None, dataset_type="vqav2", data_seed_offset=0):
-        self.root_url = root_url.rstrip("/") if isinstance(root_url, str) else root_url
+        # Expand expensive GCS globs once in the parent process. Otherwise each
+        # DataLoader worker repeats the same bucket listing on first iteration.
+        expanded_root = _expand_gcs_glob_if_needed(root_url)
+        self.root_url = expanded_root.rstrip("/") if isinstance(expanded_root, str) else list(expanded_root)
         self.config = config
         self.tokenizer = tokenizer
         self.transform = get_transforms(
@@ -1017,6 +1058,7 @@ class VQAv2IterableDataset(IterableDataset):
         )
 
         epoch = 0
+        error_handler = make_stop_after_n_errors(_max_wds_errors(self.config))
         while True:
             urls = _shuffled_worker_urls(self.root_url, self.data_seed_offset, epoch)
             epoch += 1
@@ -1027,7 +1069,7 @@ class VQAv2IterableDataset(IterableDataset):
             # split a second time by WebDataset's default worker splitter.
             ds = wds.DataPipeline(
                 wds.SimpleShardList(urls),
-                wds.tarfile_to_samples(handler=make_stop_after_n_errors(500)),
+                wds.tarfile_to_samples(handler=error_handler),
             )
 
             for sample in ds:
@@ -1099,7 +1141,7 @@ class GenomeGCapIterableDataset(IterableDataset):
                 self.root_url,
                 resampled=True,
                 shardshuffle=1000,
-                handler=make_stop_after_n_errors(500),
+                handler=make_stop_after_n_errors(_max_wds_errors(self.config)),
             )
             .select(lambda x: x is not None)
         )
@@ -1169,7 +1211,7 @@ class GenomeDetIterableDataset(IterableDataset):
                 self.root_url,
                 resampled=True,
                 shardshuffle=1000,
-                handler=make_stop_after_n_errors(500),
+                handler=make_stop_after_n_errors(_max_wds_errors(self.config)),
             )
             .select(lambda x: x is not None)
         )
@@ -1243,10 +1285,13 @@ def make_dataset(root, dataset_config, tokenizer, is_train=True, dataset_type="d
         wds.WebDataset(
             _expand_gcs_glob_if_needed(root),
             resampled=True,
-            handler=make_stop_after_n_errors(500),
+            handler=make_stop_after_n_errors(_max_wds_errors(dataset_config)),
             shardshuffle=True,
         )
-        .shuffle(10000, rng=random.Random(_fold_data_seed(115 + rank * 514, data_seed_offset)))
+        .shuffle(
+            int(getattr(dataset_config, "webdataset_shuffle_size", 10000)),
+            rng=random.Random(_fold_data_seed(115 + rank * 514, data_seed_offset)),
+        )
         .decode("pil")
         .map(partial(
             preprocess_fn,
@@ -1340,6 +1385,7 @@ def create_split(config, batch_size, data_seed_offset=0):
     )
     if config.dataset.num_workers > 0:
         dl_kwargs["prefetch_factor"] = config.dataset.prefetch_factor
+        dl_kwargs["timeout"] = int(getattr(config.dataset, "dataloader_timeout", 0))
 
     loader = DataLoader(**dl_kwargs)
     return loader, tokenizer

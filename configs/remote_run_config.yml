@@ -22,6 +22,14 @@ dataset:
     resize_mode: stretch
     num_workers: 16
     prefetch_factor: 4
+    dataloader_timeout: 900
+    item_shuffle_size:
+        default: 512
+        llava_ov15: 512
+        vqav2: 512
+        gqa: 512
+        textvqa: 512
+        genome: 512
 
 training:
     curriculum: llava15_two_stage # train 2 stages together.

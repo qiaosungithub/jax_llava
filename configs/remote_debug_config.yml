@@ -1,6 +1,6 @@
-# Minimal remote TPU smoke test for the current LLaVA/HSDP path.
-# It runs one training step and then evaluates every current image-only
-# LLaVA understanding benchmark wired in eval_vlm_benchmarks.py.
+# One-card remote smoke test for the same pretrain dataset path as stage-1.
+# Keep this intentionally small so path/auth/GCS issues fail fast without
+# warming a large WebDataset shuffle buffer.
 model:
     arch: llava
     lm_backbone_str: "gemma3_270M"
@@ -25,9 +25,11 @@ dataset:
     resize_mode: stretch
     num_workers: 1
     prefetch_factor: 1
+    dataloader_timeout: 120
     pin_memory: False
+    webdataset_shuffle_size: 16
     items:
-        - gqa-testdev
+        - blip3o-short
     mix_weights: [1]
 
 training:
@@ -35,7 +37,6 @@ training:
     num_steps: 1
     batch_size: 16
 
-    # Keep debug cheap: random CLIP tower, pretrained small Gemma LM.
     vision_tower_from_scratch: True
     clip_from_pt: True
     hf_cache_dir: /dev/shm/huggingface
@@ -57,11 +58,7 @@ training:
     sample_per_step: -1
     online_eval_per_step: -1
     online_eval_tasks: []
-    final_eval_tasks:
-        - gqa
-        - vizwiz
-        - scienceqa_img
-        - seed_bench
+    final_eval_tasks: []
     seed: 42
 
 sampling:
@@ -70,24 +67,6 @@ sampling:
 
 eval:
     device_batch_size: 1
-    mmbench_max_new_tokens: 4
-
-    # Tiny eval schedules: just enough to compile and exercise each loader,
-    # generation path, result merging, and metric code.
-    gqa_num_samples: 2
-    vizwiz_num_samples: 2
-    scienceqa_img_num_samples: 2
-    seed_bench_num_samples: 2
-
-    gqa_max_txt_len: 64
-    vizwiz_max_txt_len: 64
-    scienceqa_img_max_txt_len: 64
-    seed_bench_max_txt_len: 64
-
-    gqa_cache_dir: /kmh-nfs-ssd-us-mount/data/cached/zhh/remote_debug/gqa_eval
-    vizwiz_cache_dir: /kmh-nfs-ssd-us-mount/data/cached/zhh/remote_debug/vizwiz_eval
-    scienceqa_img_cache_dir: /kmh-nfs-ssd-us-mount/data/cached/zhh/remote_debug/scienceqa_img_eval
-    seed_bench_cache_dir: /kmh-nfs-ssd-us-mount/data/cached/zhh/remote_debug/seed_bench_eval
     eval_recon_tokens: []
 
 finetune: False
@@ -95,12 +74,12 @@ sharding: hsdp
 load_from: ''
 load_from_pretrained: ''
 eval_only: False
-local_debug: True
+local_debug: False
 
 logging:
     use_wandb: False
     use_tensorboard: False
     wandb_project: "jax-llava"
     wandb_entity: "sqa24-massachusetts-institute-of-technology"
-    wandb_tags: ["remote-debug", "llava", "hsdp"]
-    wandb_notes: "remote_debug: one-step LLaVA/HSDP smoke test with GQA, VisWiz, ScienceQA-IMG, SEED-Bench."
+    wandb_tags: ["remote-debug", "llava", "blip3o-short"]
+    wandb_notes: "remote_debug: one-step small-model BLIP3o-short dataloader smoke test."
