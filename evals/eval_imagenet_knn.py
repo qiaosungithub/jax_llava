@@ -6,20 +6,19 @@ Two modes
              ~5 min wall-time; used for online eval during training.
   full     – all ~1.28 M train images; used for the final eval at the end.
 
-The eval always queries against the full val set (50 k images).
+The eval queries against the full val set (50 k images) unless the caller sets
+``val_examples`` for a small remote data-path smoke test.
 
 Distributed feature extraction
 -------------------------------
 All processes participate in feature extraction in parallel.
 
-``ImageNetSubset`` first builds the **complete** sample list identically on
-every process (identical class-sort → same ``random.sample`` with the same
-seed).  Each process then takes a strided shard:
-
-    local_samples = all_samples[process_index :: total_processes]
-
-This guarantees that the 128 selected images/class are **bit-identical**
-regardless of the number of processes.
+The ImageNet data is read directly from TFDS.  Each JAX process uses TFDS
+input-context sharding, so hosts read disjoint TFRecord shards from the
+zone-local bucket instead of first copying ImageNet into local tmpfs.  For
+partial KNN eval, each process keeps its own quota per class; the combined
+quota is exactly ``images_per_class`` when every process shard has enough
+examples for every class.
 
 After extracting local features with the same jit/HSDP sharding style as
 training, a ``process_allgather`` gathers all shards.
@@ -29,46 +28,41 @@ Padding notes
 -------------
 Two padding levels exist:
 
-1. **local-device padding** (within one batch): each DataLoader batch of real
+1. **local-device padding** (within one batch): each TFDS batch of real
    size *B* is zero-padded at the *end* to the next multiple of ``LDC`` so the
    implied global batch is divisible by the full jit/HSDP mesh. The padded outputs
    are discarded by slicing ``feats[:B]`` after inference.
 
-2. **Process padding** (for ``process_allgather``): shard sizes differ by at
-   most 1 (strided split).  Before allgather each process zero-pads its local
-   feature array to ``ceil(n_total / PRC)``.  After allgather the padding is
-   stripped using the exact shard-size formula
-   ``n_i = n_total // PRC + (1 if i < n_total % PRC else 0)``.
+2. **Process padding** (for ``process_allgather``): TFDS shard sizes can differ
+   across processes.  Before allgather each process shares its local count and
+   zero-pads to the maximum local count.  After allgather the padding is
+   stripped using the gathered per-process counts.
 
 Data access
 -----------
 On remote TPUs call ``ensure_imagenet_available(zone)`` *once* before the
-first eval call.  On a local debug machine pass ``local_debug=True`` to use
-the NFS path directly.
+first eval call.  It returns the zone-local TFDS data directory and does not
+download or copy ImageNet.  On a local debug machine pass ``local_debug=True``
+to use the local TFDS path or ``TFDS_DATA_DIR``.
 
 Public API
 ----------
-    imagenet_root = ensure_imagenet_available(zone, local_debug=False)
-    acc = eval_imagenet_knn(state_params, model, config, imagenet_root,
-                            images_per_class=128, seed=42, k=20)
+    imagenet_data_dir = ensure_imagenet_available(zone, local_debug=False)
+    acc = eval_imagenet_knn(state_params, model, config, imagenet_data_dir,
+                            images_per_class=128, seed=42, k=20,
+                            val_examples=None)
 """
 
 from __future__ import annotations
 
 import os
-import random
 import time
-from pathlib import Path
 from typing import Optional
 
 import jax
 import jax.numpy as jnp
 from jax.experimental import multihost_utils as mu
 import numpy as np
-import torch
-from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
-from PIL import Image
 
 from utils.logging_util import log_for_0, log_for_all
 from utils.pjit_util import MeshMode, prepare_pjit_funcs
@@ -78,159 +72,263 @@ LDC = jax.local_device_count()
 PRI = jax.process_index()
 PRC = jax.process_count()
 
-# ── GCS paths per zone (mirrors jax_dev_v6_base WARMUP_ARGS) ────────────────
-_KNN_WARMUP_ARGS: dict[str, tuple] = {
-    "us-central1": (
-        "gs://kmh-gcp-us-central1/data/imagenet/imagenet",
-        "/mnt/zhhm/zhh/imagenet", "JPEG", 1_281_167,
-        "/mnt/zhhm/zhh/imagenet/imagenet/train",
-    ),
-    "us-east5": (
-        "gs://kmh-gcp-us-east5/data/imagenet/imagenet",
-        "/mnt/zhhm/zhh/imagenet", "JPEG", 1_281_167,
-        "/mnt/zhhm/zhh/imagenet/imagenet/train",
-    ),
-    "asia-northeast1-b": (
-        "gs://kmh-gcp-asia-northeast1-b/data/imagenet/imagenet",
-        "/mnt/zhhm/zhh/imagenet", "JPEG", 1_281_167,
-        "/mnt/zhhm/zhh/imagenet/imagenet/train",
-    ),
-    "europe-west4": (
-        "gs://kmh-gcp/data/imagenet/imagenet",
-        "/mnt/zhhm/zhh/imagenet", "JPEG", 1_281_167,
-        "/mnt/zhhm/zhh/imagenet/imagenet/train",
-    ),
+# ── Zone-local TFDS paths ────────────────────────────────────────────────────
+_KNN_TFDS_DATA_DIRS: dict[str, str] = {
+    "us-central1": "gs://kmh-gcp-us-central1/tensorflow_datasets",
+    "us-east5": "gs://kmh-gcp-us-east5/tensorflow_datasets",
+    "asia-northeast1-b": "gs://kmh-gcp-asia-northeast1-b/tensorflow_datasets",
+    "europe-west4": "gs://kmh-gcp/tensorflow_datasets",
 }
 
-_NFS_IMAGENET_ROOT = "/kmh-nfs-ssd-us-mount/data/imagenet"
-_imagenet_root_cache: Optional[str] = None
+_LOCAL_TFDS_DATA_DIR = "/kmh-nfs-ssd-us-mount/data/tensorflow_datasets"
+_imagenet_data_dir_cache: Optional[str] = None
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return (int(a) + int(b) - 1) // int(b)
+
+
+def _process_split_count(total: int, process_index: int, process_count: int) -> int:
+    """Deterministically split a global example budget across JAX processes."""
+    total = max(int(total), 0)
+    process_index = int(process_index)
+    process_count = max(int(process_count), 1)
+    base = total // process_count
+    extra = total % process_count
+    return base + (1 if process_index < extra else 0)
+
+
+def _tfds_modules():
+    """Import TensorFlow/TFDS lazily so non-KNN runs do not need the dependency."""
+    import tensorflow as tf  # noqa: PLC0415
+    import tensorflow_datasets as tfds  # noqa: PLC0415
+
+    return tf, tfds
+
+
+def _normalize_zone(zone: str) -> str:
+    """Map a full zone or region-ish string to the TFDS bucket key."""
+    if zone in _KNN_TFDS_DATA_DIRS:
+        return zone
+    if zone.startswith("us-central1"):
+        return "us-central1"
+    if zone.startswith("us-east5"):
+        return "us-east5"
+    if zone.startswith("asia-northeast1"):
+        return "asia-northeast1-b"
+    if zone.startswith("europe-west4"):
+        return "europe-west4"
+    return zone
 
 
 def ensure_imagenet_available(zone: str, local_debug: bool = False) -> str:
-    """Download ImageNet from GCS to tmpfs on first call; return the root path.
+    """Return the TFDS ImageNet data_dir for this run; never copy ImageNet.
 
-    The returned path contains ``train/`` and ``val/`` sub-directories with
-    the standard WordNet-id folder structure.  Subsequent calls return the
-    cached path immediately (no re-download).
+    The historical implementation copied a torchvision-style ImageNet tree
+    into ``/mnt/zhhm`` before KNN eval.  ImageNet is now prepared as TFDS in the
+    zone-local GCS buckets, so KNN eval should read TFDS directly.
     """
-    global _imagenet_root_cache
+    global _imagenet_data_dir_cache
 
-    if _imagenet_root_cache is not None:
-        train_dir = os.path.join(_imagenet_root_cache, "train")
-        if os.path.isdir(train_dir) and len(os.listdir(train_dir)) == 1000:
-            log_for_0(f"[KNN] Using cached imagenet at {_imagenet_root_cache}")
-            return _imagenet_root_cache
+    if _imagenet_data_dir_cache is not None:
+        log_for_0(f"[KNN] Using cached TFDS ImageNet data_dir={_imagenet_data_dir_cache}")
+        return _imagenet_data_dir_cache
 
     if local_debug:
-        log_for_0(f"[KNN] local_debug=True – using NFS imagenet at {_NFS_IMAGENET_ROOT}")
-        _imagenet_root_cache = _NFS_IMAGENET_ROOT
-        return _NFS_IMAGENET_ROOT
+        data_dir = (
+            os.environ.get("KNN_TFDS_DATA_DIR")
+            or os.environ.get("TFDS_DATA_DIR")
+            or _LOCAL_TFDS_DATA_DIR
+        )
+    else:
+        data_dir = os.environ.get("KNN_TFDS_DATA_DIR")
+        if not data_dir:
+            zone_key = _normalize_zone(zone)
+            if zone_key not in _KNN_TFDS_DATA_DIRS:
+                raise ValueError(
+                    f"[KNN] Unknown zone '{zone}'. Supported: {list(_KNN_TFDS_DATA_DIRS.keys())}"
+                )
+            data_dir = _KNN_TFDS_DATA_DIRS[zone_key]
 
-    if zone not in _KNN_WARMUP_ARGS:
+    # Metadata-only builder creation is a cheap early sanity check and gives a
+    # clearer failure than discovering a missing TFDS dependency inside eval.
+    _, tfds = _tfds_modules()
+    builder = tfds.builder("imagenet2012", data_dir=data_dir)
+    if "train" not in builder.info.splits or "validation" not in builder.info.splits:
         raise ValueError(
-            f"[KNN] Unknown zone '{zone}'. Supported: {list(_KNN_WARMUP_ARGS.keys())}"
+            f"[KNN] imagenet2012 TFDS at {data_dir} is missing train/validation splits"
         )
 
-    gs_root, shm_dest, suffix, num, new_root = _KNN_WARMUP_ARGS[zone]
-
-    if os.path.isdir(new_root) and len(os.listdir(new_root)) == 1000:
-        log_for_0(f"[KNN] ImageNet already present at {new_root}, skipping download.")
-        imagenet_root = str(Path(new_root).parent)
-        _imagenet_root_cache = imagenet_root
-        return imagenet_root
-
-    log_for_0(f"[KNN] Downloading ImageNet from {gs_root} → {shm_dest} …")
-    # Lazy import: warmup_util does a process_allgather at import time.
-    # Importing it here ensures all processes are active when it fires.
-    from utils.warmup_util import run_warmup_main  # noqa: PLC0415
-    run_warmup_main(gs_root, shm_dest, suffix, num, new_root)
-
-    imagenet_root = str(Path(new_root).parent)   # has train/ and val/
-    _imagenet_root_cache = imagenet_root
-    log_for_0(f"[KNN] ImageNet ready at {imagenet_root}")
-    return imagenet_root
+    _imagenet_data_dir_cache = data_dir
+    log_for_0(f"[KNN] Using TFDS ImageNet data_dir={data_dir}")
+    return data_dir
 
 
-# ── ImageNet subset dataset ───────────────────────────────────────────────────
+# ── TFDS ImageNet input ───────────────────────────────────────────────────────
 
-class ImageNetSubset(Dataset):
-    """ImageNet split with optional per-class image-count cap.
+def _preprocess_imagenet_example(example, image_size: int, tf):
+    """Resize shorter side, center-crop, and normalize image to [-1, 1]."""
+    image = tf.image.convert_image_dtype(example["image"], tf.float32)
+    shape = tf.shape(image)
+    height = tf.cast(shape[0], tf.float32)
+    width = tf.cast(shape[1], tf.float32)
+    scale = tf.cast(image_size, tf.float32) / tf.minimum(height, width)
+    new_height = tf.cast(tf.round(height * scale), tf.int32)
+    new_width = tf.cast(tf.round(width * scale), tf.int32)
 
-    The full sample list is built **identically on every process** (same seed,
-    same alphabetical class order, same ``random.sample`` call).  Each process
-    then takes a strided shard so that the selected images are consistent
-    regardless of process count:
+    image = tf.image.resize(
+        image, [new_height, new_width], method="bicubic", antialias=True
+    )
+    offset_height = tf.maximum((new_height - image_size) // 2, 0)
+    offset_width = tf.maximum((new_width - image_size) // 2, 0)
+    image = tf.image.crop_to_bounding_box(
+        image, offset_height, offset_width, image_size, image_size
+    )
+    image = tf.clip_by_value(image, 0.0, 1.0)
+    image = image * 2.0 - 1.0
+    label = tf.cast(example["label"], tf.int32)
+    return image, label
 
-        local_samples = all_samples[process_index :: total_processes]
 
-    Attributes:
-        n_total: total sample count across ALL processes (used for allgather).
-    """
+class TFDSImageNetSplit:
+    """Process-local TFDS ImageNet split used by KNN feature extraction."""
 
     def __init__(
         self,
-        root: str,
-        split: str = "train",
-        images_per_class: Optional[int] = 128,
-        seed: int = 42,
-        transform=None,
-        process_index: int = 0,
-        total_processes: int = 1,
+        data_dir: str,
+        split: str,
+        image_size: int,
+        images_per_class: Optional[int],
+        seed: int,
+        process_index: int,
+        total_processes: int,
+        num_parallel_calls: int,
+        max_examples: Optional[int] = None,
     ):
-        self.transform = transform
-        split_dir = Path(root) / split
+        self.tf, self.tfds = _tfds_modules()
+        self.data_dir = data_dir
+        self.split = split
+        self.image_size = int(image_size)
+        self.images_per_class = images_per_class
+        self.seed = int(seed)
+        self.process_index = int(process_index)
+        self.total_processes = int(total_processes)
+        self.num_parallel_calls = max(int(num_parallel_calls), 1)
 
-        # Sort classes for bit-identical ordering across machines
-        classes = sorted(d.name for d in split_dir.iterdir() if d.is_dir())
-        self.class_to_idx = {cls: idx for idx, cls in enumerate(classes)}
+        builder = self.tfds.builder("imagenet2012", data_dir=data_dir)
+        split_info = builder.info.splits["validation" if split == "validation" else split]
+        self.global_num_examples = int(split_info.num_examples)
 
-        # Build the complete list with a shared seed – SAME on all processes
-        rng = random.Random(seed)
-        all_samples: list[tuple[str, int]] = []
-
-        for cls_name in classes:
-            cls_dir = split_dir / cls_name
-            imgs = sorted(
-                f for f in os.listdir(cls_dir)
-                if f.lower().endswith((".jpeg", ".jpg", ".png"))
+        if split == "train" and images_per_class is not None:
+            base = int(images_per_class) // self.total_processes
+            extra = int(images_per_class) % self.total_processes
+            self.local_quota_per_class = base + (1 if self.process_index < extra else 0)
+            self.local_max_examples = None
+            self.local_target_examples = 1000 * self.local_quota_per_class
+            self.max_target_examples = 1000 * _ceil_div(int(images_per_class), self.total_processes)
+        else:
+            self.local_quota_per_class = None
+            target_global_examples = self.global_num_examples
+            if max_examples is not None:
+                target_global_examples = min(max(int(max_examples), 0), self.global_num_examples)
+            self.local_max_examples = _process_split_count(
+                target_global_examples,
+                self.process_index,
+                self.total_processes,
             )
-            if images_per_class is not None and len(imgs) > images_per_class:
-                imgs = rng.sample(imgs, images_per_class)
-            label = self.class_to_idx[cls_name]
-            for img_name in imgs:
-                all_samples.append((str(cls_dir / img_name), label))
+            self.local_target_examples = self.local_max_examples
+            self.max_target_examples = _ceil_div(target_global_examples, self.total_processes)
 
-        # Strided shard: process i gets indices i, i+PRC, i+2*PRC, …
-        self.n_total: int = len(all_samples)
-        self.samples: list[tuple[str, int]] = (
-            all_samples[process_index::total_processes]
+        log_for_all(
+            f"[KNN:{self.process_index}] TFDS {split}: data_dir={data_dir}, "
+            f"global_examples={self.global_num_examples:,}, "
+            f"local_quota_per_class={self.local_quota_per_class}, "
+            f"local_target_examples={self.local_target_examples}, "
+            f"max_target_examples={self.max_target_examples}"
         )
 
-        log_for_0(
-            f"[KNN Dataset] {split}: images_per_class={images_per_class}, "
-            f"seed={seed} → total={self.n_total:,}  "
-            f"(process {process_index}/{total_processes}: {len(self.samples):,} local)"
+    def synchronized_num_steps(self, batch_size: int) -> int:
+        """Return the same fixed step count on every host for HSDP eval."""
+        return _ceil_div(self.max_target_examples, int(batch_size))
+
+    def _make_dataset(self):
+        input_context = self.tf.distribute.InputContext(
+            num_input_pipelines=self.total_processes,
+            input_pipeline_id=self.process_index,
+            num_replicas_in_sync=self.total_processes,
         )
+        read_config = self.tfds.ReadConfig(
+            input_context=input_context,
+            shuffle_seed=self.seed,
+        )
+        shuffle_files = self.split == "train" and self.local_quota_per_class is not None
+        ds = self.tfds.load(
+            "imagenet2012",
+            split=self.split,
+            data_dir=self.data_dir,
+            download=False,
+            shuffle_files=shuffle_files,
+            read_config=read_config,
+        )
+        options = self.tf.data.Options()
+        options.experimental_deterministic = True
+        ds = ds.with_options(options)
+        if shuffle_files:
+            ds = ds.shuffle(
+                8192,
+                seed=self.seed + self.process_index,
+                reshuffle_each_iteration=False,
+            )
+        ds = ds.map(
+            lambda x: _preprocess_imagenet_example(x, self.image_size, self.tf),
+            num_parallel_calls=self.num_parallel_calls,
+        )
+        if self.local_max_examples is not None:
+            # Apply the debug cap after TFDS process sharding so every host reads
+            # a small disjoint slice from the zone-local TFDS files.
+            ds = ds.take(self.local_max_examples)
+        return ds
 
-    def __len__(self) -> int:
-        return len(self.samples)
+    def iter_batches(self, batch_size: int):
+        ds = self._make_dataset()
+        if self.local_quota_per_class is None:
+            ds = ds.batch(batch_size, drop_remainder=False).prefetch(self.tf.data.AUTOTUNE)
+            for images, labels in ds.as_numpy_iterator():
+                yield images.astype(np.float32), labels.astype(np.int32)
+            return
 
-    def __getitem__(self, idx: int):
-        path, label = self.samples[idx]
-        img = Image.open(path).convert("RGB")
-        if self.transform is not None:
-            img = self.transform(img)
-        return img, label
+        counts = np.zeros((1000,), dtype=np.int32)
+        images_batch: list[np.ndarray] = []
+        labels_batch: list[int] = []
+        finished_classes = 0
 
+        for image, label in ds.as_numpy_iterator():
+            label = int(label)
+            if counts[label] >= self.local_quota_per_class:
+                continue
+            if counts[label] == self.local_quota_per_class - 1:
+                finished_classes += 1
+            counts[label] += 1
+            images_batch.append(image.astype(np.float32))
+            labels_batch.append(label)
 
-def _knn_transform(image_size: int):
-    """Val-time transform: resize → center-crop → tensor → normalise to [-1, 1]."""
-    return transforms.Compose([
-        transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(image_size),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-    ])
+            if len(images_batch) == batch_size:
+                yield np.stack(images_batch, axis=0), np.asarray(labels_batch, dtype=np.int32)
+                images_batch.clear()
+                labels_batch.clear()
+
+            if finished_classes == 1000:
+                break
+
+        if images_batch:
+            yield np.stack(images_batch, axis=0), np.asarray(labels_batch, dtype=np.int32)
+
+        if finished_classes < 1000:
+            missing = int(1000 - finished_classes)
+            log_for_all(
+                f"[KNN:{self.process_index}] Warning: TFDS shard only satisfied "
+                f"{finished_classes}/1000 class quotas; missing={missing}"
+            )
 
 
 # ── Feature extraction ────────────────────────────────────────────────────────
@@ -275,16 +373,14 @@ def _make_p_encode(model, state_params, config, global_batch_size):
 def _extract_features_local(
     p_encode,
     state_params,
-    dataset: ImageNetSubset,
-    image_size: int,
+    dataset: TFDSImageNetSplit,
     batch_size: int = 256,
-    num_workers: int = 4,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Extract features for this process's local shard.
 
     jit/HSDP padding strategy
     --------------------
-    For a DataLoader batch of *B* real images:
+    For a TFDS batch of *B* real images:
 
         pad  = (LDC - B % LDC) % LDC
         x_np shape after pad: (B + pad, H, W, 3)
@@ -300,34 +396,48 @@ def _extract_features_local(
     local_feats:  ``(N_local, D)`` float32
     local_labels: ``(N_local,)``  int32
     """
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=False,
-        drop_last=False,
-    )
-
     all_feats:  list[np.ndarray] = []
     all_labels: list[np.ndarray] = []
+    iterator = iter(dataset.iter_batches(batch_size))
+    num_steps = dataset.synchronized_num_steps(batch_size)
+    seen_examples = 0
+    feature_dim = None
+    exhausted_early = False
     t0 = time.time()
 
-    for batch_idx, (imgs, labels) in enumerate(loader):
-        B = imgs.shape[0]
+    log_for_all(
+        f"[KNN:{PRI}] HSDP fixed-shape extraction: steps={num_steps}, "
+        f"local_batch={batch_size}, target_local={dataset.local_target_examples}"
+    )
 
-        # (B, 3, H, W) → (B, H, W, 3) float32
-        x_np = imgs.permute(0, 2, 3, 1).numpy().astype(np.float32)
+    for batch_idx in range(num_steps):
+        B = 0
+        labels = np.zeros((0,), dtype=np.int32)
+        x_np = np.zeros(
+            (batch_size, dataset.image_size, dataset.image_size, 3),
+            dtype=np.float32,
+        )
 
-        # Pad local batch so the global jit/HSDP batch is divisible by all devices.
-        pad = (LDC - B % LDC) % LDC
-        if pad > 0:
-            x_np = np.concatenate(
-                [x_np, np.zeros((pad,) + x_np.shape[1:], dtype=np.float32)],
-                axis=0,
-            )   # shape: (B + pad, H, W, 3)
+        if seen_examples < dataset.local_target_examples:
+            try:
+                batch_images, batch_labels = next(iterator)
+            except StopIteration:
+                if not exhausted_early:
+                    log_for_all(
+                        f"[KNN:{PRI}] TFDS shard exhausted after "
+                        f"{seen_examples}/{dataset.local_target_examples} examples; "
+                        "padding remaining synchronized HSDP steps."
+                    )
+                    exhausted_early = True
+            else:
+                remaining = dataset.local_target_examples - seen_examples
+                B = min(int(batch_images.shape[0]), int(remaining), int(batch_size))
+                if B > 0:
+                    x_np[:B] = batch_images[:B].astype(np.float32)
+                    labels = batch_labels[:B].astype(np.int32)
+                    seen_examples += B
 
-        global_shape = (x_np.shape[0] * PRC,) + x_np.shape[1:]
+        global_shape = (batch_size * PRC,) + x_np.shape[1:]
         global_images = jax.make_array_from_process_local_data(
             jax.sharding.NamedSharding(p_encode._mesh, p_encode._image_spec),
             x_np,
@@ -336,63 +446,59 @@ def _extract_features_local(
         feats = p_encode(state_params, global_images)
         feats = p_encode._reduce_scatter(feats, MeshMode.DATA)
         D = feats.shape[-1]
+        feature_dim = D
         feats_np = np.array(jax.device_get(feats)).reshape(-1, D)[:B]
 
-        all_feats.append(feats_np)
-        all_labels.append(labels.numpy().astype(np.int32))
+        if B > 0:
+            all_feats.append(feats_np)
+            all_labels.append(labels.astype(np.int32))
 
-        if (batch_idx + 1) % 50 == 0 or (batch_idx + 1) == len(loader):
+        if (batch_idx + 1) % 50 == 0 or (batch_idx + 1) == num_steps:
             done = sum(f.shape[0] for f in all_feats)
             log_for_all(
-                f"  [KNN:{PRI}] [{batch_idx+1}/{len(loader)}] "
-                f"{done:,}/{len(dataset):,}  elapsed {time.time()-t0:.1f}s"
+                f"  [KNN:{PRI}] [{batch_idx+1} batches] "
+                f"{done:,} local examples  elapsed {time.time()-t0:.1f}s"
             )
 
-    local_feats  = np.concatenate(all_feats,  axis=0).astype(np.float32)
+    if not all_feats:
+        local_feats = np.zeros((0, int(feature_dim or 1)), dtype=np.float32)
+        local_labels = np.zeros((0,), dtype=np.int32)
+        return local_feats, local_labels
+
+    local_feats = np.concatenate(all_feats, axis=0).astype(np.float32)
     local_labels = np.concatenate(all_labels, axis=0).astype(np.int32)
     return local_feats, local_labels
 
 
 # ── Distributed all-gather of features ───────────────────────────────────────
 
-def _shard_size(n_total: int, proc_idx: int, n_procs: int) -> int:
-    """Exact local-shard size for a strided split.
-
-    For a strided split ``all[proc_idx::n_procs]`` on a list of length
-    ``n_total``, the number of elements owned by ``proc_idx`` is:
-
-        n_total // n_procs  +  (1 if proc_idx < n_total % n_procs else 0)
-    """
-    return n_total // n_procs + (1 if proc_idx < n_total % n_procs else 0)
-
-
 def _allgather_feats(
     local_feats:  np.ndarray,   # (N_local, D)
     local_labels: np.ndarray,   # (N_local,)
-    n_total:      int,          # total samples across ALL processes
 ) -> tuple[np.ndarray, np.ndarray]:
-    """All-gather (feature, label) pairs from all processes.
+    """All-gather variable-size (feature, label) pairs from all processes.
 
     Steps
-    -----
-    1. Compute the maximum shard size: ``n_max = ceil(n_total / PRC)``.
+     -----
+    1. Gather local example counts and compute ``n_max``.
     2. Each process pads its arrays to ``n_max`` with zeros / -1 labels.
     3. ``process_allgather`` collects all shards:
            gathered_feats  shape: (PRC, n_max, D)
            gathered_labels shape: (PRC, n_max)
-    4. For each process ``i``, trim to the exact shard size
-       ``n_i = n_total // PRC + (1 if i < n_total % PRC else 0)`` and
-       discard the padding.
+    4. For each process ``i``, trim to the gathered local count.
     5. Concatenate across processes (order: proc-0 shard, proc-1 shard, …).
 
     Returns
     -------
-    all_feats:  ``(n_total, D)`` float32
-    all_labels: ``(n_total,)``  int32
+    all_feats:  ``(sum(N_local_i), D)`` float32
+    all_labels: ``(sum(N_local_i),)``  int32
     """
     D = local_feats.shape[1]
-    n_max   = (n_total + PRC - 1) // PRC    # upper bound on any shard size
     n_local = local_feats.shape[0]
+    counts = np.asarray(
+        jax.device_get(mu.process_allgather(jnp.asarray([n_local], dtype=jnp.int32)))
+    ).reshape(-1)
+    n_max = int(counts.max()) if counts.size else 0
 
     # ── Pad to n_max (zeros / sentinel label -1 at the end) ──────────────────
     pad = n_max - n_local
@@ -417,18 +523,13 @@ def _allgather_feats(
     # ── Trim padding per process and concatenate ──────────────────────────────
     result_feats:  list[np.ndarray] = []
     result_labels: list[np.ndarray] = []
-    for proc_idx in range(PRC):
-        n_i = _shard_size(n_total, proc_idx, PRC)
+    for proc_idx, n_i in enumerate(counts):
+        n_i = int(n_i)
         result_feats.append(gathered_feats[proc_idx, :n_i])
         result_labels.append(gathered_labels[proc_idx, :n_i])
 
     all_feats  = np.concatenate(result_feats,  axis=0).astype(np.float32)
     all_labels = np.concatenate(result_labels, axis=0).astype(np.int32)
-
-    # Sanity check
-    assert all_feats.shape[0] == n_total, (
-        f"Gathered {all_feats.shape[0]} features but expected {n_total}"
-    )
     return all_feats, all_labels
 
 
@@ -491,43 +592,63 @@ def eval_imagenet_knn(
     state_params,
     model,                              # PaliGemmaEncDec instance
     config,                             # training config (needs dataset.image_size)
-    imagenet_root: str,                 # path with train/ and val/ sub-dirs
+    imagenet_data_dir: str,             # TFDS data_dir containing imagenet2012
     images_per_class: Optional[int] = 128,
     seed: int = 42,
     k: int = 20,
     temperature: float = 0.07,
     batch_size: int = 256,
     num_workers: int = 4,
+    val_examples: Optional[int] = None,
 ) -> float:
     """Evaluate KNN accuracy on (partial or full) ImageNet.
 
-    All processes participate in feature extraction (each handles a strided
-    shard, so the work is evenly distributed).  Features are gathered via
+    All processes participate in feature extraction (each handles a TFDS
+    input-context shard, so the work is distributed).  Features are gathered via
     ``process_allgather`` and KNN is computed **only on process 0**.
 
     Args:
         state_params:     sharded params from the jit/HSDP TrainState.
         model:            ``PaliGemmaEncDec`` instance (Flax module, not applied).
         config:           training config; uses ``config.dataset.image_size``.
-        imagenet_root:    path whose children are ``train/`` and ``val/``.
+        imagenet_data_dir: TFDS data_dir containing prepared ``imagenet2012``.
         images_per_class: train images per class (128 for partial eval;
                           ``None`` for full eval).
         seed:             RNG seed for reproducible partial sampling.
         k:                number of nearest neighbours.
         temperature:      softmax temperature for weighted voting.
         batch_size:       images per encode batch (per process).
-        num_workers:      DataLoader workers per process.
+        num_workers:      TFDS map parallelism per process.
+        val_examples:     optional global cap for validation examples; useful
+                          for remote path/debug checks that should not scan all
+                          50 k validation images.
 
     Returns:
         KNN top-1 accuracy in percent (0–100) on process 0; ``0.0`` elsewhere.
     """
     image_size = config.dataset.image_size
-    transform  = _knn_transform(image_size)
+    if images_per_class is not None and int(images_per_class) < PRC:
+        log_for_0(
+            f"[KNN] Raising images_per_class from {images_per_class} to "
+            f"process_count={PRC} so every process has work."
+        )
+        images_per_class = PRC
+    if val_examples is not None:
+        val_examples = int(val_examples)
+        if val_examples <= 0:
+            val_examples = None
+        elif val_examples < PRC:
+            log_for_0(
+                f"[KNN] Raising val_examples from {val_examples} to "
+                f"process_count={PRC} so every process has work."
+            )
+            val_examples = PRC
 
     log_for_0(
         f"[KNN] Starting eval: images_per_class={images_per_class}, "
         f"seed={seed}, k={k}, T={temperature}, image_size={image_size}, "
-        f"processes={PRC}, LDC={LDC}"
+        f"processes={PRC}, LDC={LDC}, val_examples={val_examples}, "
+        f"tfds_data_dir={imagenet_data_dir}"
     )
 
     local_batch = int(batch_size)
@@ -536,15 +657,20 @@ def eval_imagenet_knn(
     p_encode = _make_p_encode(model, state_params, config, local_batch * PRC)
 
     # ── Train features ────────────────────────────────────────────────────────
-    train_ds = ImageNetSubset(
-        imagenet_root, split="train",
-        images_per_class=images_per_class, seed=seed, transform=transform,
-        process_index=PRI, total_processes=PRC,
+    train_ds = TFDSImageNetSplit(
+        imagenet_data_dir,
+        split="train",
+        image_size=image_size,
+        images_per_class=images_per_class,
+        seed=seed,
+        process_index=PRI,
+        total_processes=PRC,
+        num_parallel_calls=num_workers,
     )
-    log_for_all(f"[KNN:{PRI}] Extracting train features ({len(train_ds):,} local samples) …")
+    log_for_all(f"[KNN:{PRI}] Extracting train features from TFDS …")
     t0 = time.time()
     local_train_feats, local_train_labels = _extract_features_local(
-        p_encode, state_params, train_ds, image_size, local_batch, num_workers
+        p_encode, state_params, train_ds, local_batch
     )
     log_for_all(
         f"[KNN:{PRI}] Train local feats {local_train_feats.shape} "
@@ -553,21 +679,27 @@ def eval_imagenet_knn(
 
     log_for_0("[KNN] All-gathering train features …")
     train_feats, train_labels = _allgather_feats(
-        local_train_feats, local_train_labels, train_ds.n_total
+        local_train_feats, local_train_labels
     )
     log_for_0(f"[KNN] Train feats gathered: {train_feats.shape}")
+    mu.sync_global_devices("knn_train_features_gathered")
 
     # ── Val features ──────────────────────────────────────────────────────────
-    val_ds = ImageNetSubset(
-        imagenet_root, split="val",
-        images_per_class=None,   # always use all 50 k val images
-        seed=seed, transform=transform,
-        process_index=PRI, total_processes=PRC,
+    val_ds = TFDSImageNetSplit(
+        imagenet_data_dir,
+        split="validation",
+        image_size=image_size,
+        images_per_class=None,
+        seed=seed,
+        process_index=PRI,
+        total_processes=PRC,
+        num_parallel_calls=num_workers,
+        max_examples=val_examples,
     )
-    log_for_all(f"[KNN:{PRI}] Extracting val features ({len(val_ds):,} local samples) …")
+    log_for_all(f"[KNN:{PRI}] Extracting val features from TFDS …")
     t0 = time.time()
     local_val_feats, local_val_labels = _extract_features_local(
-        p_encode, state_params, val_ds, image_size, local_batch, num_workers
+        p_encode, state_params, val_ds, local_batch
     )
     log_for_all(
         f"[KNN:{PRI}] Val local feats {local_val_feats.shape} "
@@ -576,22 +708,26 @@ def eval_imagenet_knn(
 
     log_for_0("[KNN] All-gathering val features …")
     val_feats, val_labels = _allgather_feats(
-        local_val_feats, local_val_labels, val_ds.n_total
+        local_val_feats, local_val_labels
     )
     log_for_0(f"[KNN] Val feats gathered: {val_feats.shape}")
+    mu.sync_global_devices("knn_val_features_gathered")
 
-    # ── KNN (process 0 only) ──────────────────────────────────────────────────
-    # Other processes have already done their share of the work (feature
-    # extraction + allgather) and can return immediately.
-    if PRI != 0:
-        return 0.0
-
-    log_for_0(f"[KNN] Running KNN-{k} on process 0 …")
+    # Every host runs the same JAX KNN program.  Running JAX only on process 0
+    # can desynchronize multi-controller TPU programs after HSDP feature
+    # extraction, even if the input arrays are already fully gathered.
+    log_for_0(f"[KNN] Running replicated KNN-{k} on every process …")
     t0 = time.time()
     acc = _knn_accuracy_jax(
         train_feats, train_labels,
         val_feats,   val_labels,
         k=k, temperature=temperature,
     )
+    accs = np.asarray(
+        jax.device_get(mu.process_allgather(jnp.asarray([acc], dtype=jnp.float32)))
+    ).reshape(-1)
+    if PRI == 0 and accs.size and float(accs.max() - accs.min()) > 1e-3:
+        log_for_0(f"[KNN] Warning: replicated KNN accuracies differ across hosts: {accs}")
+    acc = float(accs[0]) if accs.size else float(acc)
     log_for_0(f"[KNN] Done in {time.time()-t0:.1f}s  →  acc = {acc:.2f}%")
     return acc

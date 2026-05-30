@@ -65,7 +65,6 @@ training:
             adam_b2: 0.95
             weight_decay: 0.0
         warmup_steps: 65
-        siglip_warmup_steps: 65
         lr_schedule: cos
         sample_per_step: -1
         online_eval_per_step: -1
@@ -94,7 +93,6 @@ training:
             adam_b2: 0.95
             weight_decay: 0.0
         warmup_steps: 156
-        siglip_warmup_steps: 156
         lr_schedule: cos
         sample_per_step: 200
         online_eval_per_step: -1

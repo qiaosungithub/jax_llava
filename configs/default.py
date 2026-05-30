@@ -112,7 +112,6 @@ def get_config():
 
     training.optimizer = "adam"
     training.lr_schedule = "cos"
-    training.siglip_warmup_steps = 0
 
     # Whether to freeze the LM backbone params during training (only the
     # image encoder + projector receive gradients).
@@ -189,7 +188,12 @@ def get_config():
     eval.mmbench_cache_dir = "/kmh-nfs-ssd-us-mount/data/cached/zhh/mmbench_eval"
     eval.mmbench_data_cache_dir = "/kmh-nfs-ssd-us-mount/data/cached/zhh/mmbench_data"
     eval.mmbench_export_test = False
+    eval.short_answer_max_new_tokens = 8
     eval.mmbench_max_new_tokens = 8
+    # Online VQAv2 is too expensive at full val scale; final eval still uses
+    # eval.vqav2_num_samples unless explicitly overridden.
+    eval.online_vqav2_sample_fraction = 0.1
+    eval.online_vqav2_num_samples = None
     eval.pope_num_workers = 0
     eval.mme_num_workers = 0
     eval.current_eval_step = -1
@@ -207,6 +211,8 @@ def get_config():
     eval.knn_temperature = 0.07
     eval.knn_seed = 42
     eval.knn_images_per_class = 128   # for partial eval
+    # Optional remote debug cap.  None/0 keeps the full 50 k ImageNet val set.
+    eval.knn_val_examples = None
     eval.knn_batch_size = 256
     eval.knn_num_workers = 4
 

@@ -73,9 +73,10 @@ training:
         warmup_steps: 65
         lr_schedule: cos
         sample_per_step: -1
-        online_eval_per_step: 500
-        online_eval_tasks: [knn_partial]
-        final_eval_tasks: [knn_full, vqav2]
+        # CLIP is frozen in stage 1, so ImageNet kNN cannot track training progress.
+        online_eval_per_step: -1
+        online_eval_tasks: []
+        final_eval_tasks: [vqav2]
 
     stage2:
         name: "stage2_visual_instruction_sft"
@@ -104,8 +105,8 @@ training:
         lr_schedule: cos
         sample_per_step: 200
         online_eval_per_step: 750
-        online_eval_tasks: [knn_partial, vqav2, mme, textvqa, pope, refcocog, pixelbench, gqa, vizwiz, scienceqa_img, seed_bench]
-        final_eval_tasks: [knn_full, vqav2, mme, textvqa, pope, refcocog, pixelbench, mmbench, gqa, vizwiz, scienceqa_img, seed_bench]
+        online_eval_tasks: [vqav2, mme, textvqa, pope, refcocog, pixelbench, gqa, vizwiz, scienceqa_img, seed_bench]
+        final_eval_tasks: [vqav2, mme, textvqa, pope, refcocog, pixelbench, mmbench, gqa, vizwiz, scienceqa_img, seed_bench]
 
 sampling:
     max_new_tokens: 64
@@ -114,10 +115,17 @@ sampling:
 eval:
     eval_recon_tokens: []
     device_batch_size: 32
+    short_answer_max_new_tokens: 8
     mmbench_max_new_tokens: 8
+    online_vqav2_sample_fraction: 0.1
 
 finetune: False
 sharding: hsdp
+
+# Continue the original LLaVA curriculum run from the last complete checkpoint
+# before window 7034 hit the old topology-specific Orbax restore bug.
+load_from: /kmh-nfs-ssd-us-mount/logs/sqa/paligemma-baseline/20260530_031225_726dru_kmh-tpuvm-v5p-64-spot-keya-lax60d_us-central1-a__b_lr_ep_eval
+wandb_resume_id: q043krc3
 
 logging:
     use_wandb: True

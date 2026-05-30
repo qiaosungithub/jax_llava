@@ -5,6 +5,7 @@ import os
 import re
 import gcsfs
 import contextlib
+import orbax.checkpoint as ocp
 
 FS = gcsfs.GCSFileSystem()
 _CHECKPOINT_RE = re.compile(r"^checkpoint_(\d+)$")
@@ -62,15 +63,20 @@ def checkpoint_step(load_from, zone):
     """
     Returns the step encoded in a checkpoint path without restoring checkpoint arrays.
     """
+    gs_path = _resolve_checkpoint_path(load_from, zone)
+    match = _CHECKPOINT_RE.match(os.path.basename(gs_path))
+    assert match is not None, f'cannot infer checkpoint step from {gs_path}'
+    return int(match.group(1))
+
+def _resolve_checkpoint_path(load_from, zone):
+    """Returns the concrete checkpoint_N path for either a ckpt or workdir path."""
     gs_path = convert_to_gs(load_from, zone).rstrip('/')
     assert exist_general(gs_path), f'checkpoint {gs_path} does not exist'
     if not os.path.basename(gs_path).startswith('checkpoint_'):
         latest = checkpoints.latest_checkpoint(gs_path)
         assert latest is not None, f'no checkpoint found under {gs_path}'
         gs_path = latest.rstrip('/')
-    match = _CHECKPOINT_RE.match(os.path.basename(gs_path))
-    assert match is not None, f'cannot infer checkpoint step from {gs_path}'
-    return int(match.group(1))
+    return gs_path
 
 def restore_checkpoint(state, load_from, zone):
     """
@@ -83,19 +89,45 @@ def restore_checkpoint(state, load_from, zone):
     log_for_0("Restored from checkpoint at {}".format(load_from))
     return state
 
+def restore_checkpoint_params(params_target, load_from, zone):
+    """
+    Restores only the params subtree using the caller's current sharding target.
+
+    Passing a concrete target matters for jit/HSDP checkpoints: restoring with
+    target=None asks Orbax to reuse checkpoint-saved device sharding, which can
+    fail when a v6e checkpoint is resumed on v5p or any different topology.
+    """
+    gs_path = _resolve_checkpoint_path(load_from, zone)
+    checkpointer = ocp.Checkpointer(ocp.PyTreeCheckpointHandler())
+    restore_target = {'params': params_target}
+    restore_args = ocp.checkpoint_utils.construct_restore_args(restore_target)
+    restored = checkpointer.restore(
+        gs_path,
+        args=ocp.args.PyTreeRestore(
+            item=restore_target,
+            restore_args=restore_args,
+            partial_restore=True,
+        ),
+    )
+    params = restored['params'] if isinstance(restored, dict) else restored.params
+    log_for_0("Restored params from checkpoint at {}".format(load_from))
+    return params
+
 def save_checkpoint(state, workdir):
     """
     Saves the model state to a checkpoint in the specified working directory.
     """
     assert not workdir.startswith('gs://'), f'workdir {workdir} must not start with gs://'
-    # Do not index a leading replica axis here: jit/HSDP states are global
-    # sharded arrays. Flax/Orbax can save the sharded arrays directly.
-    step = int(jax.device_get(state.step))
-    log_for_0("Saving checkpoint step %d.", step)
+    # Save a host tree, matching the text-jit HSDP path. This avoids baking a
+    # TPU topology-specific sharding into checkpoints that may later be resumed
+    # on a different v5p/v6e layout.
+    state = jax.tree.map(lambda x: jax.device_get(x), state)
+    step = int(state.step)
+    print0(f'{Emoji.ROCKET} Saving checkpoint at step {step} ...')
     gs_path = convert_to_gs(workdir)
     with _orbax_set_mesh_context_compat():
         checkpoints.save_checkpoint_multiprocess(gs_path, state, step, keep=3)
-    log_for_0("Checkpoint step %d saved to %s.", step, gs_path)
+    print0(f'{Emoji.GOOD} Checkpoint at step {step} saved to {gs_path}.')
 
 
 @contextlib.contextmanager

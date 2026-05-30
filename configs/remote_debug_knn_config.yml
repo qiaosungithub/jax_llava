@@ -1,0 +1,69 @@
+# Remote eval-only KNN smoke test.
+#
+# This config only checks checkpoint restore, TFDS ImageNet access, feature
+# extraction, and KNN plumbing.  It intentionally reads a tiny train subset and
+# a capped validation subset from the zone-local TFDS bucket; it should not copy
+# ImageNet or touch the old torchvision-style ImageNet tree.
+model:
+    arch: llava
+    lm_backbone_str: "gemma3_1B"
+    lm_checkpoint_variant: "it"
+
+    vision_tower_str: "openai/clip-vit-large-patch14-336"
+    vision_feature_layer: -2
+    vision_select_feature: "patch"
+    clip_input_format: "minus_one_to_one"
+
+    projector_type: "mlp2x_gelu"
+    projector_use_ln: False
+
+    attn_logits_soft_cap: 0.0
+    final_logit_softcap: 0.0
+    txt_feature_layer: 0
+    recon_loss_weight: 0.0
+
+dataset:
+    image_size: 336
+    max_txt_len: 2048
+    resize_mode: stretch
+
+training:
+    curriculum: ""
+    num_steps: 0
+    batch_size: 16
+    optimizer: adam
+    grad_clip_norm: 0.0
+    warmup_steps: 1
+    lr_schedule: cos
+    online_eval_tasks: []
+    final_eval_tasks: [knn_partial]
+    seed: 42
+
+eval:
+    device_batch_size: 32
+    eval_recon_tokens: []
+    knn_k: 1
+    knn_temperature: 0.07
+    knn_seed: 42
+    knn_images_per_class: 32
+    knn_val_examples: 2048
+    knn_batch_size: 32
+    knn_num_workers: 2
+
+sampling:
+    max_new_tokens: 8
+
+finetune: False
+sharding: hsdp
+load_from: ''
+load_from_pretrained: ''
+eval_only: True
+local_debug: False
+
+logging:
+    use_wandb: False
+    use_tensorboard: False
+    wandb_project: "jax-llava"
+    wandb_entity: "sqa24-massachusetts-institute-of-technology"
+    wandb_tags: ["remote-debug", "knn", "tfds-imagenet"]
+    wandb_notes: "[remote debug] eval-only KNN TFDS ImageNet smoke test; no ImageNet copy."

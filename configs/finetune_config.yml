@@ -78,7 +78,6 @@ training:
 
     num_steps: 90000 # vqav2
     warmup_steps: 9000
-    siglip_warmup_steps: 9000
 
     lr_schedule: cos
     batch_size: 256

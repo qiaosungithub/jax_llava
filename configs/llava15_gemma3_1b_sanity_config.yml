@@ -55,7 +55,6 @@ training:
 
     num_steps: 1000
     warmup_steps: 30
-    siglip_warmup_steps: 30
     lr_schedule: cos
     batch_size: 128
     seed: 42

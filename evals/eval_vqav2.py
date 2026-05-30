@@ -84,9 +84,16 @@ def vqa_accuracy_one(answer: str, gt_answers: list) -> float:
     return float(np.mean(accs))
 
 
+def _format_vqa_prompt(question: str) -> str:
+    question = (question or "").strip()
+    if question and not question.endswith("?"):
+        question = question + "?"
+    return f"{question}\nAnswer the question using a single word or phrase.\n"
+
+
 def preprocess_vqa_sample(sample, transform, tokenizer, max_len):
     """Preprocess one (image, question) for VQA inference.
-    Prompt format: '{question}\\n' with BOS, no EOS, padded to max_len.
+    Prompt format matches the short-answer VQA evals in eval_vlm_benchmarks.py.
     prefix_len is the number of valid (non-pad) tokens in input_ids (clipped to max_len).
     """
     try:
@@ -101,10 +108,7 @@ def preprocess_vqa_sample(sample, transform, tokenizer, max_len):
     if not question:
         return None
 
-    # Match your sanity + common big_vision formatting
-    if not question.endswith("?"):
-        question = question + "?"
-    prompt = f"{question}\n"
+    prompt = _format_vqa_prompt(question)
     ids = tokenizer.encode(prompt, add_bos=True, add_eos=False)
 
     # Effective (clipped) length
@@ -230,6 +234,32 @@ def _make_dummy_vqav2_batch(batch_size, image_size, max_len):
     }
 
 
+def _resolve_vqav2_num_samples(config):
+    full_total = int(getattr(config.eval, "vqav2_num_samples", 214354))
+    eval_suffix = str(getattr(config.eval, "current_eval_suffix", "")).lower()
+    if eval_suffix != "online":
+        return full_total
+
+    explicit = getattr(config.eval, "online_vqav2_num_samples", None)
+    if explicit not in (None, ""):
+        online_total = int(explicit)
+    else:
+        fraction = float(
+            getattr(
+                config.eval,
+                "online_vqav2_sample_fraction",
+                getattr(config.eval, "online_eval_sample_fraction", 1.0),
+            )
+        )
+        online_total = int(np.ceil(full_total * fraction))
+    online_total = max(1, min(full_total, online_total))
+    log_for_0(
+        f"VQAv2 online sample cap: {online_total}/{full_total} "
+        f"({online_total / max(full_total, 1):.2%})"
+    )
+    return online_total
+
+
 def eval_vqav2(p_sample_step, run_p_sample_step, model, tokenizer, params, config):
     """
     Run VQAv2 evaluation.
@@ -252,7 +282,7 @@ def eval_vqav2(p_sample_step, run_p_sample_step, model, tokenizer, params, confi
     loader_iter = iter(loader)
 
     # Force all ranks to execute the same number of sampling steps.
-    total_vqav2_samples = int(getattr(config.eval, "vqav2_num_samples", 214354))
+    total_vqav2_samples = _resolve_vqav2_num_samples(config)
     samples_per_process = (total_vqav2_samples + jax.process_count() - 1) // jax.process_count()
     fixed_num_steps = (samples_per_process + batch_size - 1) // batch_size
     log_for_0(

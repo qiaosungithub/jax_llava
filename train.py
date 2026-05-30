@@ -23,7 +23,13 @@ from models.clip_vit import load_clip_vision_params
 from models.llava import LlavaGemma
 from models.paligemma_enc_dec import PaliGemmaEncDec
 from utils import vis_util
-from utils.ckpt_util import checkpoint_step, infer_zone_card, restore_checkpoint, save_checkpoint
+from utils.ckpt_util import (
+    checkpoint_step,
+    infer_zone_card,
+    restore_checkpoint,
+    restore_checkpoint_params,
+    save_checkpoint,
+)
 from utils.data_util import resolve_dataset_roots
 from utils.frozen_util import get_trainable, merge_params
 from utils.llm_util import create_tokenizer, init_loc_token_embeddings
@@ -337,15 +343,23 @@ def _build_pjit_fns(config, model, state, mesh_bundle):
     )
     _attach_sample_metadata(p_sample_step, mesh, batch_spec, reduce_scatter)
 
-    mmbench_tokens = int(getattr(config.eval, 'mmbench_max_new_tokens', 8))
-    mmbench_out_spec = get_partition_spec(
-        jax.ShapeDtypeStruct((int(config.training.batch_size), mmbench_tokens), jnp.int32),
+    # One shared short-answer sampler avoids compiling separate 8-token
+    # executables for VQA, yes/no, and multiple-choice evals.
+    short_answer_tokens = int(
+        getattr(
+            config.eval,
+            'short_answer_max_new_tokens',
+            getattr(config.eval, 'mmbench_max_new_tokens', 8),
+        )
+    )
+    short_answer_out_spec = get_partition_spec(
+        jax.ShapeDtypeStruct((int(config.training.batch_size), short_answer_tokens), jnp.int32),
         MeshMode.DATA,
     )
     p_sample_step_mmbench = pjit_compile(
-        partial(sample_step, model=model, max_new_tokens=mmbench_tokens, beam_size=1),
+        partial(sample_step, model=model, max_new_tokens=short_answer_tokens, beam_size=1),
         in_shardings=(state_spec.params, batch_spec['pixel_values'], batch_spec['input_ids'], batch_spec['prefix_len']),
-        out_shardings=mmbench_out_spec,
+        out_shardings=short_answer_out_spec,
     )
     _attach_sample_metadata(p_sample_step_mmbench, mesh, batch_spec, reduce_scatter)
 
@@ -389,10 +403,10 @@ def run_eval_recon_psnr(p_recon_steps, state_params, eval_images, patch_size, im
 
 def _prepare_knn_if_needed(config, zone, tasks):
     if any(t in {"knn_partial", "knn_full"} for t in tasks):
-        log_for_0('[KNN] Preparing ImageNet dataset ...')
-        root = ensure_imagenet_available(zone, local_debug=config.local_debug)
-        log_for_0(f'[KNN] ImageNet root: {root}')
-        return root
+        log_for_0('[KNN] Resolving TFDS ImageNet data_dir ...')
+        data_dir = ensure_imagenet_available(zone, local_debug=config.local_debug)
+        log_for_0(f'[KNN] ImageNet TFDS data_dir: {data_dir}')
+        return data_dir
     return None
 
 
@@ -475,8 +489,7 @@ def _load_initial_pretrained_params(state, config, mesh, state_spec, step_offset
 
 def _restore_params_only(state, params_source, zone, mesh, state_spec, current_step):
     if isinstance(params_source, str):
-        restored_state = restore_checkpoint(None, params_source, zone=zone)
-        params = restored_state['params'] if isinstance(restored_state, dict) else restored_state.params
+        params = restore_checkpoint_params(state.params, params_source, zone=zone)
     else:
         params = params_source
     if 'image_encoder' in params and isinstance(params['image_encoder'], dict) and 'decoder' in params['image_encoder']:
@@ -522,7 +535,7 @@ def _build_curriculum_stage_config(config, stage_key, *, stage_start_step, stage
         'batch_size', 'freeze_lm', 'freeze_image_encoder', 'vision_tower_from_scratch',
         'clip_from_pt', 'hf_cache_dir', 'optimizer', 'grad_clip_norm', 'log_per_step',
         'checkpoint_per_step', 'log_vis_per_step', 'sample_per_step', 'online_eval_per_step',
-        'online_eval_tasks', 'final_eval_tasks', 'warmup_steps', 'siglip_warmup_steps',
+        'online_eval_tasks', 'final_eval_tasks', 'warmup_steps',
         'lr_schedule', 'seed', 'vision_encoder_learning_rate', 'vision_encoder_lr_scale',
         'exclude_bias_norm_from_weight_decay',
     ]
@@ -578,7 +591,7 @@ def _run_train_phase(
 
     online_eval_tasks = list(config.training.get('online_eval_tasks', []) or [])
     final_eval_tasks = list(config.training.get('final_eval_tasks', []) or [])
-    knn_root = _prepare_knn_if_needed(config, zone, online_eval_tasks + final_eval_tasks)
+    knn_data_dir = _prepare_knn_if_needed(config, zone, online_eval_tasks + final_eval_tasks)
 
     mesh, get_partition_spec, _, _, _ = mesh_bundle
     model = _create_model(config, finetune_mode=finetune_mode)
@@ -700,7 +713,9 @@ def _run_train_phase(
         ):
             with timer.skip():
                 log_for_0(f'[{stage_name}] Saving checkpoint at global step {step + 1}...')
-                save_checkpoint(state, workdir)
+                host_state = mu.process_allgather(state, tiled=True)
+                save_checkpoint(host_state, workdir)
+                del host_state
                 mu.sync_global_devices('ckpt')
 
         online_eval_per_step = int(config.training.get('online_eval_per_step', -1))
@@ -717,8 +732,10 @@ def _run_train_phase(
                     config=config,
                     writer=writer,
                     p_sample_step_mmbench=p_sample_step_mmbench,
+                    is_online_eval=True,
                     extra_args={
-                        'knn_imagenet_root': knn_root,
+                        'knn_imagenet_data_dir': knn_data_dir,
+                        'knn_imagenet_root': knn_data_dir,
                         'p_recon_steps': {},
                         'vis_batch': vis_batch,
                         'patch_size': _model_patch_size(config),
@@ -742,7 +759,8 @@ def _run_train_phase(
             p_sample_step_mmbench=p_sample_step_mmbench,
             task_suffix=f'_{stage_key}_final' if stage_key.startswith('stage') else '_final',
             extra_args={
-                'knn_imagenet_root': knn_root,
+                'knn_imagenet_data_dir': knn_data_dir,
+                'knn_imagenet_root': knn_data_dir,
                 'p_recon_steps': {},
                 'vis_batch': vis_batch,
                 'patch_size': _model_patch_size(config),
@@ -920,14 +938,19 @@ def just_evaluate(config: ml_collections.ConfigDict, workdir: str):
     tokenizer = create_tokenizer(config.model.lm_backbone_str)
     model = _create_model(config)
     state, _, _ = create_train_state(rng, config, model, mesh_bundle=mesh_bundle)
-    assert config.load_from
-    state = restore_checkpoint(state, config.load_from, zone=zone)
+    if config.load_from:
+        state = restore_checkpoint(state, config.load_from, zone=zone)
+    else:
+        mesh, get_partition_spec, _, _, _ = mesh_bundle
+        state_spec = get_partition_spec(state, MeshMode.MODEL)
+        log_for_0('Eval-only run has no load_from; initializing pretrained params.')
+        state = _load_initial_pretrained_params(state, config, mesh, state_spec, step_offset=0)
     step = _state_step(state)
     state_spec, batch_spec, _, p_sample_step, p_sample_step_mmbench = _build_pjit_fns(config, model, state, mesh_bundle)
     del state_spec, batch_spec
 
     final_eval_tasks = list(config.training.get('final_eval_tasks', []) or [])
-    knn_root = _prepare_knn_if_needed(config, zone, final_eval_tasks)
+    knn_data_dir = _prepare_knn_if_needed(config, zone, final_eval_tasks)
     if final_eval_tasks:
         run_eval_tasks(
             state,
@@ -941,7 +964,7 @@ def just_evaluate(config: ml_collections.ConfigDict, workdir: str):
             writer=writer,
             p_sample_step_mmbench=p_sample_step_mmbench,
             task_suffix='_final',
-            extra_args={'knn_imagenet_root': knn_root},
+            extra_args={'knn_imagenet_data_dir': knn_data_dir, 'knn_imagenet_root': knn_data_dir},
         )
     if config.eval.get('mmbench_export_test', False):
         export_mmbench_test_xlsx(p_sample_step_mmbench, run_p_sample_step, model, tokenizer, state.params, config)

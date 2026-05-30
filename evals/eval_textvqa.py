@@ -5,7 +5,7 @@ Format: each sample = {image_id}.jpg + {image_id}.json with
   {"image_id", "split", "qas": [{"question_id", "question", "answers": [...10 strings...], ...}, ...]}
 
 Key differences from VQAv2:
-  - Prefix: "{question}\\n" (TextVQA requires reading scene text)
+  - Prompt asks for a short answer while still requiring scene-text reading.
   - answers: list of 10 plain strings (no dict wrapping)
   - No answer_type field
   - image_id is an OpenImages hex string, not an integer
@@ -94,9 +94,16 @@ def vqa_accuracy_one(answer: str, gt_answers: list) -> float:
     return float(np.mean(accs))
 
 
+def _format_vqa_prompt(question: str) -> str:
+    question = (question or "").strip()
+    if question and not question.endswith("?"):
+        question = question + "?"
+    return f"{question}\nAnswer the question using a single word or phrase.\n"
+
+
 def preprocess_textvqa_sample(sample, transform, tokenizer, max_len):
     """Preprocess one (image, question) for TextVQA inference.
-    Prompt format: '{question}\\n' with BOS, no EOS, padded to max_len.
+    Prompt format matches the short-answer VQA evals in eval_vlm_benchmarks.py.
     """
     try:
         image = sample.get("jpg") or sample.get("png")
@@ -110,9 +117,7 @@ def preprocess_textvqa_sample(sample, transform, tokenizer, max_len):
     if not question:
         return None
 
-    if not question.endswith("?"):
-        question = question + "?"
-    prompt = f"{question}\n"
+    prompt = _format_vqa_prompt(question)
     ids = tokenizer.encode(prompt, add_bos=True, add_eos=False)
 
     eff_len = min(len(ids), max_len)

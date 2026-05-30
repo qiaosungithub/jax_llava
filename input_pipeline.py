@@ -3,6 +3,7 @@ import io
 import json
 import math
 import os
+import re
 import subprocess
 import warnings
 
@@ -32,6 +33,7 @@ except ImportError:
 _REGION_DESC_LOCAL = "/dev/shm/vg_region_descriptions.json"
 _DATA_SEED_STRIDE = 1_000_003
 _GCS_GLOB_CACHE = {}
+_NUMERIC_BRACE_RE = re.compile(r"\{(\d+)\.\.(\d+)(?:\.\.(\d+))?\}")
 
 
 def _region_desc_gcs_from_root(root_url: str) -> str:
@@ -959,19 +961,57 @@ def _expand_gcs_glob_if_needed(root):
             else:
                 urls.append(expanded)
         return urls
-    if not (isinstance(root, str) and root.startswith("gs://") and "*" in root):
+    if not isinstance(root, str):
         return root
 
     if root in _GCS_GLOB_CACHE:
         return list(_GCS_GLOB_CACHE[root])
 
-    fs = fsspec.filesystem("gs")
-    matches = sorted(fs.glob(root))
-    assert len(matches) > 0, f"No GCS files matched dataset glob: {root}"
-    urls = [m if str(m).startswith("gs://") else f"gs://{m}" for m in matches]
+    urls = []
+    for part in root.split("::"):
+        for expanded_part in _expand_numeric_braces(part):
+            if expanded_part.startswith("gs://") and "*" in expanded_part:
+                fs = fsspec.filesystem("gs")
+                matches = sorted(fs.glob(expanded_part))
+                assert len(matches) > 0, f"No GCS files matched dataset glob: {expanded_part}"
+                urls.extend(
+                    m if str(m).startswith("gs://") else f"gs://{m}"
+                    for m in matches
+                )
+            else:
+                urls.append(expanded_part)
+
+    if len(urls) == 1 and urls[0] == root:
+        return root
+
     _GCS_GLOB_CACHE[root] = tuple(urls)
-    log_for_0(f"Expanded GCS glob to {len(urls)} shards: {root}")
+    log_for_0(f"Expanded dataset URL pattern to {len(urls)} shards: {root}")
     return urls
+
+
+def _expand_numeric_braces(url):
+    """Expand numeric shard ranges like shard-{000000..000040}.tar."""
+    match = _NUMERIC_BRACE_RE.search(url)
+    if match is None:
+        return [url]
+
+    start_s, end_s, step_s = match.groups()
+    start = int(start_s)
+    end = int(end_s)
+    step = int(step_s or 1)
+    if step <= 0:
+        raise ValueError(f"Invalid non-positive brace step in URL pattern: {url}")
+
+    width = max(len(start_s), len(end_s))
+    stop = end + 1 if start <= end else end - 1
+    signed_step = step if start <= end else -step
+
+    expanded = []
+    for value in range(start, stop, signed_step):
+        replacement = f"{value:0{width}d}"
+        next_url = url[:match.start()] + replacement + url[match.end():]
+        expanded.extend(_expand_numeric_braces(next_url))
+    return expanded
 
 
 def expand_genome_det_sample(sample, region_lookup: dict) -> list:

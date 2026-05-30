@@ -25,6 +25,31 @@ from utils import vis_util
 
 
 _RUN_ID_BUF_SIZE = 128
+SHORT_ANSWER_TASKS = {
+    "vqav2",
+    "mme",
+    "textvqa",
+    "gqa",
+    "vizwiz",
+    "scienceqa",
+    "scienceqa_img",
+    "scienceqa-img",
+    "sciqa",
+    "sciqa_img",
+    "seed",
+    "seed_bench",
+    "seed-bench",
+    "seed_bench_image",
+    "seed-bench-image",
+    "pope",
+    "mmbench",
+    "refcocog",
+    "mmvp",
+    "v*",
+    "vstar",
+    "countbench",
+    "countbenchqa",
+}
 
 
 def _broadcast_string_from_source(value, is_source):
@@ -53,6 +78,7 @@ def run_eval_tasks(
     writer,
     p_sample_step_mmbench=None,
     task_suffix="",
+    is_online_eval=False,
     extra_args=None,
 ):
     """Run eval tasks sequentially and log each task immediately."""
@@ -64,50 +90,62 @@ def run_eval_tasks(
     source = jax.process_index() == 0
     local_run_id = f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}" if source else ""
     eval_run_id = _broadcast_string_from_source(local_run_id, source)
-    set_eval_result_context(config, int(step), eval_run_id, suffix or "main")
+    result_suffix = "online" if is_online_eval and not suffix else (suffix or "main")
+    set_eval_result_context(config, int(step), eval_run_id, result_suffix)
 
     for task in eval_tasks:
         t = str(task).strip().lower()
         if not t:
             continue
+        short_sample_fn = (
+            p_sample_step_mmbench
+            if p_sample_step_mmbench is not None and t in SHORT_ANSWER_TASKS
+            else p_sample_fn
+        )
 
         if t == "knn_partial":
-            knn_root = extra_args.get("knn_imagenet_root") if extra_args else None
-            if knn_root is None:
-                log_for_0("Skip knn_partial: ImageNet root unavailable")
+            knn_data_dir = None
+            if extra_args:
+                knn_data_dir = extra_args.get("knn_imagenet_data_dir") or extra_args.get("knn_imagenet_root")
+            if knn_data_dir is None:
+                log_for_0("Skip knn_partial: ImageNet TFDS data_dir unavailable")
                 continue
             knn_acc = eval_imagenet_knn(
                 params,
                 model,
                 config,
-                knn_root,
+                knn_data_dir,
                 images_per_class=config.eval.get("knn_images_per_class", 128),
                 seed=config.eval.get("knn_seed", 42),
                 k=config.eval.get("knn_k", 20),
                 temperature=config.eval.get("knn_temperature", 0.07),
                 batch_size=config.eval.get("knn_batch_size", 256),
                 num_workers=config.eval.get("knn_num_workers", 4),
+                val_examples=config.eval.get("knn_val_examples", None),
             )
             writer.write_scalars(step, {f"knn_partial_acc{suffix}": knn_acc, "step": step})
             mu.sync_global_devices("knn_partial")
             continue
 
         if t == "knn_full":
-            knn_root = extra_args.get("knn_imagenet_root") if extra_args else None
-            if knn_root is None:
-                log_for_0("Skip knn_full: ImageNet root unavailable")
+            knn_data_dir = None
+            if extra_args:
+                knn_data_dir = extra_args.get("knn_imagenet_data_dir") or extra_args.get("knn_imagenet_root")
+            if knn_data_dir is None:
+                log_for_0("Skip knn_full: ImageNet TFDS data_dir unavailable")
                 continue
             knn_acc = eval_imagenet_knn(
                 params,
                 model,
                 config,
-                knn_root,
+                knn_data_dir,
                 images_per_class=None,
                 seed=config.eval.get("knn_seed", 42),
                 k=config.eval.get("knn_k", 20),
                 temperature=config.eval.get("knn_temperature", 0.07),
                 batch_size=config.eval.get("knn_batch_size", 256),
                 num_workers=config.eval.get("knn_num_workers", 4),
+                val_examples=config.eval.get("knn_val_examples", None),
             )
             writer.write_scalars(step, {f"knn_full_acc{suffix}": knn_acc, "step": step})
             mu.sync_global_devices("knn_full")
@@ -150,7 +188,7 @@ def run_eval_tasks(
         if t == "vqav2":
             log_for_0(f"Evaluating VQAv2 at step {step}...")
             acc, sample_outputs, _ = eval_vqav2(
-                p_sample_fn, run_p_sample_step, model, tokenizer, params, config
+                short_sample_fn, run_p_sample_step, model, tokenizer, params, config
             )
             log_for_0(f"VQAv2 accuracy: {acc:.2f}%")
             writer.write_scalars(step, {f"vqav2_acc{suffix}": acc, "step": step})
@@ -162,7 +200,7 @@ def run_eval_tasks(
         if t == "mme":
             log_for_0(f"Evaluating MME at step {step}...")
             mme_p, mme_s, sample_outputs, _ = eval_mme(
-                p_sample_fn, run_p_sample_step, model, tokenizer, params, config
+                short_sample_fn, run_p_sample_step, model, tokenizer, params, config
             )
             log_for_0(f"MME-P: {mme_p:.2f}")
             log_for_0(f"MME-S: {mme_s:.2f}")
@@ -182,7 +220,7 @@ def run_eval_tasks(
         if t == "textvqa":
             log_for_0(f"Evaluating TextVQA at step {step}...")
             acc, sample_outputs, _ = eval_textvqa(
-                p_sample_fn, run_p_sample_step, model, tokenizer, params, config
+                short_sample_fn, run_p_sample_step, model, tokenizer, params, config
             )
             log_for_0(f"TextVQA accuracy: {acc:.2f}%")
             writer.write_scalars(step, {f"textvqa_acc{suffix}": acc, "step": step})
@@ -194,7 +232,7 @@ def run_eval_tasks(
         if t == "gqa":
             log_for_0(f"Evaluating GQA at step {step}...")
             acc, sample_outputs, _ = eval_gqa(
-                p_sample_fn, run_p_sample_step, model, tokenizer, params, config
+                short_sample_fn, run_p_sample_step, model, tokenizer, params, config
             )
             log_for_0(f"GQA accuracy: {acc:.2f}%")
             writer.write_scalars(step, {f"gqa_acc{suffix}": acc, "step": step})
@@ -206,7 +244,7 @@ def run_eval_tasks(
         if t == "vizwiz":
             log_for_0(f"Evaluating VisWiz at step {step}...")
             acc, sample_outputs, metric_dict = eval_vizwiz(
-                p_sample_fn, run_p_sample_step, model, tokenizer, params, config
+                short_sample_fn, run_p_sample_step, model, tokenizer, params, config
             )
             log_for_0(f"VisWiz accuracy: {acc:.2f}%")
             scalar_dict = {f"vizwiz_acc{suffix}": acc, "step": step}
@@ -221,7 +259,7 @@ def run_eval_tasks(
         if t in {"scienceqa", "scienceqa_img", "scienceqa-img", "sciqa", "sciqa_img"}:
             log_for_0(f"Evaluating ScienceQA-IMG at step {step}...")
             acc, sample_outputs, _ = eval_scienceqa_img(
-                p_sample_fn, run_p_sample_step, model, tokenizer, params, config
+                short_sample_fn, run_p_sample_step, model, tokenizer, params, config
             )
             log_for_0(f"ScienceQA-IMG accuracy: {acc:.2f}%")
             writer.write_scalars(step, {f"scienceqa_img_acc{suffix}": acc, "step": step})
@@ -233,7 +271,7 @@ def run_eval_tasks(
         if t in {"seed", "seed_bench", "seed-bench", "seed_bench_image", "seed-bench-image"}:
             log_for_0(f"Evaluating SEED-Bench at step {step}...")
             acc, sample_outputs, metric_dict = eval_seed_bench(
-                p_sample_fn, run_p_sample_step, model, tokenizer, params, config
+                short_sample_fn, run_p_sample_step, model, tokenizer, params, config
             )
             log_for_0(f"SEED-Bench accuracy: {acc:.2f}%")
             scalar_dict = {f"seed_bench_acc{suffix}": acc, "step": step}
@@ -249,7 +287,7 @@ def run_eval_tasks(
         if t == "pope":
             log_for_0(f"Evaluating POPE at step {step}...")
             pope_f1, sample_outputs, metric_dict = eval_pope(
-                p_sample_fn, run_p_sample_step, model, tokenizer, params, config
+                short_sample_fn, run_p_sample_step, model, tokenizer, params, config
             )
             log_for_0(f"POPE macro F1: {pope_f1:.2f}%")
             split_metrics = metric_dict.get("splits", {})
@@ -288,7 +326,7 @@ def run_eval_tasks(
         if t == "refcocog":
             log_for_0(f"Evaluating RefCOCOg at step {step}...")
             acc, sample_outputs, metric_dict = eval_refcocog(
-                p_sample_fn, run_p_sample_step, model, tokenizer, params, config
+                short_sample_fn, run_p_sample_step, model, tokenizer, params, config
             )
             scalar_dict = {f"refcocog_acc{suffix}": acc, "step": step}
             if isinstance(metric_dict, dict) and "miou" in metric_dict:
@@ -313,7 +351,7 @@ def run_eval_tasks(
             benchmarks = None if t == "pixelbench" else [pixelbench_aliases[t]]
             log_for_0(f"Evaluating PixelBench task '{t}' at step {step}...")
             acc, sample_outputs, metric_dict = eval_pixelbench(
-                p_sample_fn,
+                short_sample_fn,
                 run_p_sample_step,
                 model,
                 tokenizer,

@@ -15,14 +15,15 @@ from utils.pjit_util import MeshMode
 
 
 def create_lr_schedule(training_config: ml_collections.ConfigDict, base_lr):
+  warmup_steps = int(training_config.warmup_steps)
   warmup_fn = optax.linear_schedule(
       init_value=1e-6,
       end_value=base_lr,
-      transition_steps=training_config.warmup_steps,
+      transition_steps=max(warmup_steps, 1),
   )
   if training_config.lr_schedule in ['cosine', 'cos']:
     total_steps = training_config.num_steps
-    cosine_steps = max(total_steps - training_config.warmup_steps, 1)
+    cosine_steps = max(total_steps - warmup_steps, 1)
     schedule_fn = optax.cosine_decay_schedule(
         init_value=base_lr,
         decay_steps=cosine_steps,
@@ -33,26 +34,20 @@ def create_lr_schedule(training_config: ml_collections.ConfigDict, base_lr):
   elif training_config.lr_schedule == 'zero_const':
     warmup_fn = optax.constant_schedule(value=0.0)
     schedule_fn = optax.constant_schedule(value=base_lr)
+    if warmup_steps <= 0:
+      return schedule_fn
     return optax.join_schedules(
         schedules=[warmup_fn, schedule_fn],
-        boundaries=[training_config.warmup_steps],
+        boundaries=[warmup_steps],
     )
   else:
     raise NotImplementedError
+  if warmup_steps <= 0:
+    return schedule_fn
   return optax.join_schedules(
       schedules=[warmup_fn, schedule_fn],
-      boundaries=[training_config.warmup_steps],
+      boundaries=[warmup_steps],
   )
-
-
-def create_paligemma_style_slow_warmup_schedule(training_config, base_lr, lr_fn):
-  siglip_warmup_steps = int(training_config.get("siglip_warmup_steps", training_config.warmup_steps))
-
-  def new_lr_fn(step):
-    normal_lr = lr_fn(step)
-    warmup_lr = base_lr * (step / siglip_warmup_steps)
-    return jnp.minimum(normal_lr, warmup_lr)
-  return new_lr_fn
 
 
 def _init_params_raw(key, image_size, model, text_len):
@@ -158,10 +153,7 @@ def _build_optimizer(config, params):
     vision_base_lr = float(base_lr) * vision_lr_scale
 
   normal_lr_fn = create_lr_schedule(config.training, base_lr)
-  vision_normal_lr_fn = create_lr_schedule(config.training, vision_base_lr)
-  siglip_lr_fn = create_paligemma_style_slow_warmup_schedule(
-      config.training, vision_base_lr, vision_normal_lr_fn
-  )
+  siglip_lr_fn = create_lr_schedule(config.training, vision_base_lr)
 
   weight_decay = _get_weight_decay(config)
   exclude_bias_norm = bool(config.training.get("exclude_bias_norm_from_weight_decay", True))
