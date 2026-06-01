@@ -1,6 +1,9 @@
 import glob
+import io
 import json
 import os
+import tarfile
+import time
 from functools import partial
 
 import fsspec
@@ -46,6 +49,32 @@ def _path_exists(path: str) -> bool:
 
 def _join_path(root: str, leaf: str) -> str:
     return f"{root.rstrip('/')}/{leaf.lstrip('/')}"
+
+
+def _is_json_annotation_path(path: str) -> bool:
+    return path.rstrip("/").endswith((".json", ".jsonl"))
+
+
+def _maybe_add_gs_scheme(path: str) -> str:
+    if path.startswith("gs://"):
+        return path
+    return f"gs://{path}"
+
+
+def _glob_tar_shards(root: str):
+    root = root.rstrip("/")
+    if root.endswith(".tar"):
+        return [root] if _path_exists(root) else []
+    if root.startswith("gs://"):
+        fs, fs_path = fsspec.core.url_to_fs(root)
+        matched = sorted(fs.glob(f"{fs_path}/shard-*.tar"))
+        if not matched:
+            matched = sorted(fs.glob(f"{fs_path}/*.tar"))
+        return [_maybe_add_gs_scheme(p) for p in matched]
+    matched = sorted(glob.glob(os.path.join(root, "shard-*.tar")))
+    if not matched:
+        matched = sorted(glob.glob(os.path.join(root, "*.tar")))
+    return matched
 
 
 def resolve_pope_split_file(pope_root: str, split: str, dataset: str) -> str:
@@ -140,6 +169,72 @@ def load_pope_questions(path: str, split: str):
     return rows
 
 
+def load_pope_image_record_rows(root: str, splits):
+    wanted_splits = set(splits)
+    tar_paths = _glob_tar_shards(root)
+    if not tar_paths:
+        raise FileNotFoundError(f"No POPE tar shards found under: {root}")
+
+    start = time.time()
+    rows = []
+    image_records = 0
+    for tar_path in tar_paths:
+        with fsspec.open(tar_path, "rb").open() as f:
+            with tarfile.open(fileobj=f, mode="r:*") as tar:
+                members = {m.name: m for m in tar.getmembers() if m.isfile()}
+                json_names = sorted(n for n in members if n.endswith(".json"))
+                for json_name in json_names:
+                    meta_f = tar.extractfile(members[json_name])
+                    if meta_f is None:
+                        continue
+                    record = json.loads(meta_f.read().decode("utf-8"))
+                    key = os.path.splitext(json_name)[0]
+                    image_member = None
+                    for ext in (".jpg", ".jpeg", ".png"):
+                        candidate = f"{key}{ext}"
+                        if candidate in members:
+                            image_member = members[candidate]
+                            break
+                    if image_member is None:
+                        continue
+
+                    image_ref = {
+                        "tar_path": tar_path,
+                        "member": image_member.name,
+                        "offset": int(image_member.offset_data),
+                        "size": int(image_member.size),
+                    }
+                    image_records += 1
+                    for i, q in enumerate(record.get("questions", [])):
+                        split = str(q.get("split", "")).strip()
+                        if split not in wanted_splits:
+                            continue
+                        question = str(q.get("question", "")).strip()
+                        image = str(record.get("image", "")).strip()
+                        label = str(q.get("label", "")).strip().lower()
+                        if not question or not image or label not in {"yes", "no"}:
+                            continue
+                        rows.append(
+                            {
+                                "split": split,
+                                "sample_uid": q.get("sample_uid", f"{split}:{len(rows)}"),
+                                "question_id": q.get("question_id", i + 1),
+                                "question": question,
+                                "image": image,
+                                "label": label,
+                                "_image_record": image_ref,
+                            }
+                        )
+
+    if not rows:
+        raise ValueError(f"No valid POPE rows found in image-record root: {root}")
+    log_for_0(
+        f"POPE image-record rows loaded: {len(rows)} questions, "
+        f"{image_records} images from {len(tar_paths)} shards in {time.time() - start:.1f}s"
+    )
+    return rows
+
+
 def resolve_image_path(image_name: str, image_root: str) -> str:
     if "://" in image_name:
         return image_name
@@ -204,6 +299,7 @@ class POPEDataset(Dataset):
     def __init__(self, rows, config, tokenizer, image_root, prompt_template):
         self.rows = rows
         self.image_root = image_root
+        self._image_record_streams = {}
         self.preprocess_fn = partial(
             preprocess_pope_sample,
             transform=get_transforms(
@@ -219,12 +315,25 @@ class POPEDataset(Dataset):
     def __len__(self):
         return len(self.rows)
 
+    def _load_image_record(self, image_ref):
+        tar_path = image_ref["tar_path"]
+        stream = self._image_record_streams.get(tar_path)
+        if stream is None:
+            stream = fsspec.open(tar_path, "rb").open()
+            self._image_record_streams[tar_path] = stream
+        stream.seek(int(image_ref["offset"]))
+        payload = stream.read(int(image_ref["size"]))
+        return Image.open(io.BytesIO(payload)).convert("RGB")
+
     def __getitem__(self, idx):
         row = self.rows[idx]
-        image_path = resolve_image_path(row["image"], self.image_root)
         try:
-            with fsspec.open(image_path, "rb").open() as f:
-                image = Image.open(f).convert("RGB")
+            if "_image_record" in row:
+                image = self._load_image_record(row["_image_record"])
+            else:
+                image_path = resolve_image_path(row["image"], self.image_root)
+                with fsspec.open(image_path, "rb").open() as f:
+                    image = Image.open(f).convert("RGB")
         except Exception:
             return None
 
@@ -370,10 +479,30 @@ def eval_pope(p_sample_step, run_p_sample_step, model, tokenizer, params, config
 
     all_outs = []
     sample_outputs = []
+    image_record_rows = None
+    image_record_shards = [] if _is_json_annotation_path(pope_root) else _glob_tar_shards(pope_root)
+    if image_record_shards:
+        image_record_rows = load_pope_image_record_rows(pope_root, splits)
+        log_for_0(
+            f"POPE eval using image-record tar package with "
+            f"{len(image_record_shards)} shards"
+        )
 
     for split in splits:
-        split_file = resolve_pope_split_file(pope_root, split, dataset_name)
-        rows = load_pope_questions(split_file, split)
+        if image_record_rows is not None:
+            split_file = pope_root
+            rows = [r for r in image_record_rows if r["split"] == split]
+        else:
+            split_file = resolve_pope_split_file(pope_root, split, dataset_name)
+            rows = load_pope_questions(split_file, split)
+        max_samples = int(
+            getattr(config.eval, "pope_max_samples_per_split", 0)
+            or getattr(config.eval, "debug_max_samples", 0)
+            or 0
+        )
+        if max_samples > 0 and len(rows) > max_samples:
+            rows = rows[:max_samples]
+            log_for_0(f"POPE/{split}: capped to {len(rows)} samples")
         log_for_0(f"POPE/{split}: loaded {len(rows)} rows from {split_file}")
 
         dataset = POPEDataset(

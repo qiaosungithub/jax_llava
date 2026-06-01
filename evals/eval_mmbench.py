@@ -419,6 +419,14 @@ def _run_mmbench_predictions(p_sample_step, run_p_sample_step, model, tokenizer,
     cache_dir = getattr(config.eval, "mmbench_data_cache_dir", "/kmh-nfs-ssd-us-mount/data/cached/zhh/mmbench_data")
     tsv_path = _resolve_tsv_path(root, cache_dir, f"{split_name}.tsv")
     dataset = MMBenchDataset(tsv_path, config, tokenizer)
+    max_samples = int(
+        getattr(config.eval, "mmbench_max_samples", 0)
+        or getattr(config.eval, "debug_max_samples", 0)
+        or 0
+    )
+    if max_samples > 0 and len(dataset.data) > max_samples:
+        dataset.data = dataset.data.head(max_samples).reset_index(drop=True)
+        log_for_0(f"MMBench {split_name}: capped to {len(dataset.data)} rows")
     device_batch_size = int(getattr(config.eval, "mmbench_device_batch_size", config.eval.device_batch_size))
     batch_size = device_batch_size * jax.local_device_count()
     sampler = DistributedEvalSampler(dataset, num_replicas=jax.process_count(), rank=jax.process_index())

@@ -166,24 +166,37 @@ def ensure_imagenet_available(zone: str, local_debug: bool = False) -> str:
 
 # ── TFDS ImageNet input ───────────────────────────────────────────────────────
 
-def _preprocess_imagenet_example(example, image_size: int, tf):
-    """Resize shorter side, center-crop, and normalize image to [-1, 1]."""
+def _preprocess_imagenet_example(example, image_size: int, resize_mode: str, tf):
+    """Match train/eval image geometry: direct stretch or letterbox padding."""
     image = tf.image.convert_image_dtype(example["image"], tf.float32)
-    shape = tf.shape(image)
-    height = tf.cast(shape[0], tf.float32)
-    width = tf.cast(shape[1], tf.float32)
-    scale = tf.cast(image_size, tf.float32) / tf.minimum(height, width)
-    new_height = tf.cast(tf.round(height * scale), tf.int32)
-    new_width = tf.cast(tf.round(width * scale), tf.int32)
+    resize_mode = str(resize_mode or "letterbox").lower()
 
-    image = tf.image.resize(
-        image, [new_height, new_width], method="bicubic", antialias=True
-    )
-    offset_height = tf.maximum((new_height - image_size) // 2, 0)
-    offset_width = tf.maximum((new_width - image_size) // 2, 0)
-    image = tf.image.crop_to_bounding_box(
-        image, offset_height, offset_width, image_size, image_size
-    )
+    if resize_mode in {"stretch", "direct_resize", "resize"}:
+        image = tf.image.resize(
+            image, [image_size, image_size], method="bicubic", antialias=True
+        )
+    elif resize_mode in {"letterbox", "letterbox_pad", "pad"}:
+        shape = tf.shape(image)
+        height = tf.cast(shape[0], tf.float32)
+        width = tf.cast(shape[1], tf.float32)
+        scale = tf.cast(image_size, tf.float32) / tf.maximum(height, width)
+        new_height = tf.cast(tf.round(height * scale), tf.int32)
+        new_width = tf.cast(tf.round(width * scale), tf.int32)
+        image = tf.image.resize(
+            image, [new_height, new_width], method="bicubic", antialias=True
+        )
+        pad_top = (image_size - new_height) // 2
+        pad_bottom = image_size - new_height - pad_top
+        pad_left = (image_size - new_width) // 2
+        pad_right = image_size - new_width - pad_left
+        image = tf.pad(
+            image,
+            [[pad_top, pad_bottom], [pad_left, pad_right], [0, 0]],
+            constant_values=127.0 / 255.0,
+        )
+    else:
+        raise ValueError(f"Unknown resize_mode: {resize_mode}")
+
     image = tf.clip_by_value(image, 0.0, 1.0)
     image = image * 2.0 - 1.0
     label = tf.cast(example["label"], tf.int32)
@@ -198,6 +211,7 @@ class TFDSImageNetSplit:
         data_dir: str,
         split: str,
         image_size: int,
+        resize_mode: str,
         images_per_class: Optional[int],
         seed: int,
         process_index: int,
@@ -209,6 +223,7 @@ class TFDSImageNetSplit:
         self.data_dir = data_dir
         self.split = split
         self.image_size = int(image_size)
+        self.resize_mode = str(resize_mode or "letterbox")
         self.images_per_class = images_per_class
         self.seed = int(seed)
         self.process_index = int(process_index)
@@ -241,6 +256,7 @@ class TFDSImageNetSplit:
 
         log_for_all(
             f"[KNN:{self.process_index}] TFDS {split}: data_dir={data_dir}, "
+            f"resize_mode={self.resize_mode}, "
             f"global_examples={self.global_num_examples:,}, "
             f"local_quota_per_class={self.local_quota_per_class}, "
             f"local_target_examples={self.local_target_examples}, "
@@ -280,7 +296,9 @@ class TFDSImageNetSplit:
                 reshuffle_each_iteration=False,
             )
         ds = ds.map(
-            lambda x: _preprocess_imagenet_example(x, self.image_size, self.tf),
+            lambda x: _preprocess_imagenet_example(
+                x, self.image_size, self.resize_mode, self.tf
+            ),
             num_parallel_calls=self.num_parallel_calls,
         )
         if self.local_max_examples is not None:
@@ -705,7 +723,7 @@ def eval_imagenet_knn(
     Args:
         state_params:     sharded params from the jit/HSDP TrainState.
         model:            ``PaliGemmaEncDec`` instance (Flax module, not applied).
-        config:           training config; uses ``config.dataset.image_size``.
+        config:           training config; uses dataset image size/resize mode.
         imagenet_data_dir: TFDS data_dir containing prepared ``imagenet2012``.
         images_per_class: train images per class (128 for partial eval;
                           ``None`` for full eval).
@@ -721,7 +739,8 @@ def eval_imagenet_knn(
     Returns:
         KNN top-1 accuracy in percent (0–100) on process 0; ``0.0`` elsewhere.
     """
-    image_size = config.dataset.image_size
+    image_size = int(config.dataset.image_size)
+    resize_mode = getattr(config.dataset, "resize_mode", "letterbox")
     if images_per_class is not None and int(images_per_class) < PRC:
         log_for_0(
             f"[KNN] Raising images_per_class from {images_per_class} to "
@@ -742,7 +761,7 @@ def eval_imagenet_knn(
     log_for_0(
         f"[KNN] Starting eval: images_per_class={images_per_class}, "
         f"seed={seed}, k={k}, T={temperature}, image_size={image_size}, "
-        f"processes={PRC}, LDC={LDC}, val_examples={val_examples}, "
+        f"resize_mode={resize_mode}, processes={PRC}, LDC={LDC}, val_examples={val_examples}, "
         f"tfds_data_dir={imagenet_data_dir}"
     )
 
@@ -756,6 +775,7 @@ def eval_imagenet_knn(
         imagenet_data_dir,
         split="train",
         image_size=image_size,
+        resize_mode=resize_mode,
         images_per_class=images_per_class,
         seed=seed,
         process_index=PRI,
@@ -784,6 +804,7 @@ def eval_imagenet_knn(
         imagenet_data_dir,
         split="validation",
         image_size=image_size,
+        resize_mode=resize_mode,
         images_per_class=None,
         seed=seed,
         process_index=PRI,

@@ -302,6 +302,14 @@ def eval_mme(p_sample_step, run_p_sample_step, model, tokenizer, params, config)
 
     log_for_0(f"MME eval: loading parquet files from {mme_root}")
     dataset = MMEDataset(mme_root, config, tokenizer)
+    max_samples = int(
+        getattr(config.eval, "mme_max_samples", 0)
+        or getattr(config.eval, "debug_max_samples", 0)
+        or 0
+    )
+    if max_samples > 0 and len(dataset.rows) > max_samples:
+        dataset.rows = dataset.rows[:max_samples]
+        log_for_0(f"MME eval capped to {len(dataset.rows)} samples.")
     batch_size = config.eval.device_batch_size * jax.local_device_count()
     sampler = DistributedEvalSampler(dataset, num_replicas=jax.process_count(), rank=jax.process_index())
     loader = DataLoader(

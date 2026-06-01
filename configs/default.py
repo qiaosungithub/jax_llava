@@ -174,9 +174,9 @@ def get_config():
     eval.seed_bench_num_samples = 14233
     eval.seed_bench_cache_dir = "/kmh-nfs-ssd-us-mount/data/cached/zhh/seed_bench_eval"
     eval.cider_cache_dir = "/kmh-nfs-ssd-us-mount/data/cached/zhh/coco_caption_eval"
-    eval.pope_root = "/kmh-nfs-ssd-us-mount/code/xianbang/files/POPE/output/coco"
+    eval.pope_root = "gs://kmh-gcp-💣/data/pope/coco_image_records_wds/val2014"
     eval.pope_dataset = "coco"
-    eval.pope_image_root = "/kmh-nfs-ssd-us-mount/code/hanhong/shared/COCO/val2014"
+    eval.pope_image_root = "unused_for_image_records_wds"
     eval.pope_splits = ["random", "popular", "adversarial"]
     eval.pope_prompt_template = "{question}\nPlease answer yes or no.\n"
     eval.mmbench_prompt_prefix = ""
@@ -206,6 +206,13 @@ def get_config():
     eval.online_vqav2_num_samples = None
     eval.pope_num_workers = 0
     eval.mme_num_workers = 0
+    # Optional smoke-test caps. 0/None keeps the full benchmark.
+    eval.debug_max_samples = 0
+    eval.mme_max_samples = 0
+    eval.pope_max_samples_per_split = 0
+    eval.refcocog_max_samples = 0
+    eval.pixelbench_max_samples = 0
+    eval.mmbench_max_samples = 0
     eval.current_eval_step = -1
     eval.current_eval_run_id = "manual"
     eval.current_eval_suffix = "main"

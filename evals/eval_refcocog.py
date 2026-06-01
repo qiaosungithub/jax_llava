@@ -64,15 +64,21 @@ def _glob_tar_shards(root: str):
     return out
 
 
+def _is_json_annotation_path(path: str):
+    return str(path).endswith(".json") or str(path).endswith(".jsonl")
+
+
 class TarShardImageResolver:
-    def __init__(self, tar_paths):
+    def __init__(self, tar_paths, wanted_names=None):
         self.tar_paths = list(tar_paths)
+        self.wanted_names = set(wanted_names or [])
         self.name_to_tar_member = {}
         self._tar_streams = {}
         self._build_index()
 
     def _build_index(self):
         t0 = time.time()
+        remaining = set(self.wanted_names)
         for tar_path in self.tar_paths:
             try:
                 with fsspec.open(tar_path, "rb").open() as f:
@@ -83,12 +89,18 @@ class TarShardImageResolver:
                             base = os.path.basename(m.name)
                             if not base:
                                 continue
+                            if self.wanted_names and base not in self.wanted_names:
+                                continue
                             if base not in self.name_to_tar_member:
                                 self.name_to_tar_member[base] = (tar_path, int(m.offset_data), int(m.size))
+                                remaining.discard(base)
             except Exception as e:
                 log_for_0(f"RefCOCOg tar index warning: skip {tar_path}, err={e}")
+            if self.wanted_names and not remaining:
+                break
+        requested = f"/{len(self.wanted_names)} requested" if self.wanted_names else ""
         log_for_0(
-            f"RefCOCOg tar index built: {len(self.name_to_tar_member)} files from {len(self.tar_paths)} shards "
+            f"RefCOCOg tar index built: {len(self.name_to_tar_member)} files{requested} from {len(self.tar_paths)} shards "
             f"in {time.time()-t0:.1f}s"
         )
 
@@ -171,6 +183,88 @@ def _xywh_to_xyxy(box):
         return None
     x, y, w, h = [float(v) for v in box]
     return [x, y, x + max(0.0, w), y + max(0.0, h)]
+
+
+def _choose_first_text(value):
+    if isinstance(value, list):
+        for v in value:
+            text = "" if v is None else str(v).strip()
+            if text:
+                return text
+        return ""
+    return "" if value is None else str(value).strip()
+
+
+def load_refcocog_image_record_rows(root):
+    tar_paths = _glob_tar_shards(root)
+    if not tar_paths:
+        raise FileNotFoundError(f"No RefCOCOg image-record tar shards under {root}")
+
+    rows = []
+    missing_images = 0
+    t0 = time.time()
+    for tar_path in tar_paths:
+        try:
+            with fsspec.open(tar_path, "rb").open() as f:
+                with tarfile.open(fileobj=f, mode="r:*") as tf:
+                    members = [m for m in tf.getmembers() if m.isfile()]
+                    member_meta = {m.name: (int(m.offset_data), int(m.size)) for m in members}
+                    for m in members:
+                        if not m.name.endswith(".json"):
+                            continue
+                        key = m.name[:-5]
+                        jpg_member = f"{key}.jpg"
+                        if jpg_member not in member_meta:
+                            missing_images += 1
+                            continue
+                        jf = tf.extractfile(m)
+                        if jf is None:
+                            continue
+                        record = json.loads(jf.read().decode("utf-8"))
+                        refs = record.get("refs", [])
+                        if not isinstance(refs, list):
+                            continue
+                        image_ref = {
+                            "tar_path": tar_path,
+                            "member": jpg_member,
+                            "offset": member_meta[jpg_member][0],
+                            "size": member_meta[jpg_member][1],
+                        }
+                        coco_filename = record.get("coco_filename") or os.path.basename(jpg_member)
+                        for j, ref in enumerate(refs):
+                            if not isinstance(ref, dict):
+                                continue
+                            phrase = _choose_first_text(ref.get("phrase")) or _choose_first_text(ref.get("answers"))
+                            if not phrase:
+                                continue
+                            gt = ref.get("bbox_xyxy")
+                            if gt is None:
+                                gt = _xywh_to_xyxy(ref.get("bbox_xywh"))
+                            else:
+                                gt = _normalize_bbox_xyxy(gt)
+                            if gt is None:
+                                continue
+                            sample_id = ref.get(
+                                "original_index",
+                                ref.get("id", ref.get("ann_id", ref.get("ref_id", ref.get("question_id", f"{key}_{j}")))),
+                            )
+                            rows.append({
+                                "id": str(sample_id),
+                                "image": str(ref.get("source_file_name") or coco_filename),
+                                "phrase": phrase,
+                                "gt_bbox_xyxy": gt,
+                                "_image_record": image_ref,
+                            })
+        except Exception as e:
+            log_for_0(f"RefCOCOg image-record warning: skip {tar_path}, err={e}")
+
+    if not rows:
+        raise ValueError(f"No valid RefCOCOg image-record rows from {root}")
+    log_for_0(
+        f"RefCOCOg image-record rows loaded: {len(rows)} refs from {len(tar_paths)} shards "
+        f"in {time.time()-t0:.1f}s, missing_image_records={missing_images}"
+    )
+    return rows
 
 
 def _parse_row(row, idx):
@@ -469,6 +563,7 @@ class RefCOCOgDataset(Dataset):
         self.rows = rows
         self.image_root = image_root
         self.tar_resolver = tar_resolver
+        self._image_record_streams = {}
         self.preprocess_fn = partial(
             preprocess_refcocog_sample,
             transform=get_transforms(
@@ -480,6 +575,21 @@ class RefCOCOgDataset(Dataset):
             max_len=config.dataset.max_txt_len,
         )
 
+    def _load_image_record(self, image_ref):
+        try:
+            tar_path = image_ref["tar_path"]
+            stream = self._image_record_streams.get(tar_path)
+            if stream is None:
+                stream = fsspec.open(tar_path, "rb").open()
+                self._image_record_streams[tar_path] = stream
+            stream.seek(int(image_ref["offset"]))
+            payload = stream.read(int(image_ref["size"]))
+            if not payload:
+                return None
+            return Image.open(io.BytesIO(payload)).convert("RGB")
+        except Exception:
+            return None
+
     def __len__(self):
         return len(self.rows)
 
@@ -488,7 +598,9 @@ class RefCOCOgDataset(Dataset):
         image_path = row["image"]
         image_name_candidates = _image_name_candidates(image_path)
         image = None
-        if self.tar_resolver is not None and image_name_candidates:
+        if row.get("_image_record") is not None:
+            image = self._load_image_record(row["_image_record"])
+        if image is None and self.tar_resolver is not None and image_name_candidates:
             image = self.tar_resolver.load_image(image_name_candidates)
         if image is None:
             candidate_paths = []
@@ -546,13 +658,36 @@ def eval_refcocog(p_sample_step, run_p_sample_step, model, tokenizer, params, co
     vis_cols = int(getattr(config.eval, "refcocog_vis_cols", 4))
     log_for_0(f"RefCOCOg eval: ann={ann_root}, image_root={image_root}, IoU@{iou_thr}")
 
-    rows = load_refcocog_rows(ann_root)
-    tar_shards = _glob_tar_shards(image_root)
-    tar_resolver = TarShardImageResolver(tar_shards) if tar_shards else None
+    image_record_shards = [] if _is_json_annotation_path(ann_root) else _glob_tar_shards(ann_root)
+    use_image_records = bool(image_record_shards)
+    if use_image_records:
+        rows = load_refcocog_image_record_rows(ann_root)
+    else:
+        rows = load_refcocog_rows(ann_root)
+    max_samples = int(
+        getattr(config.eval, "refcocog_max_samples", 0)
+        or getattr(config.eval, "debug_max_samples", 0)
+        or 0
+    )
+    if max_samples > 0 and len(rows) > max_samples:
+        rows = rows[:max_samples]
+        log_for_0(f"RefCOCOg eval capped to {len(rows)} samples.")
+    if use_image_records:
+        tar_resolver = None
+        log_for_0(f"RefCOCOg using image-record tar package: {len(image_record_shards)} shards")
+    else:
+        tar_shards = _glob_tar_shards(image_root)
+        wanted_names = set()
+        for r in rows:
+            wanted_names.update(_image_name_candidates(r["image"]))
+        tar_resolver = TarShardImageResolver(tar_shards, wanted_names=wanted_names) if tar_shards else None
     # Quick path sanity check to surface filename/root mismatches early.
     n_probe = min(64, len(rows))
     n_exist = 0
     for r in rows[:n_probe]:
+        if r.get("_image_record") is not None:
+            n_exist += 1
+            continue
         image_name = r["image"]
         name_cands = _image_name_candidates(image_name)
         ok = False

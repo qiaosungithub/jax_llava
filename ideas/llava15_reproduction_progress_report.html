@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLaVA-1.5 Reproduction Progress</title>
+<style>
+:root {
+  --paper: #1f6f5b;
+  --probe: #b46a2a;
+  --over: #174ea6;
+  --ink: #17211f;
+  --muted: #60706b;
+  --line: #d7dfdc;
+  --wash: #f4f1e8;
+  --panel: #fffdf7;
+  --bad: #a5362f;
+  --good: #12633f;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  color: var(--ink);
+  font-family: Georgia, 'Times New Roman', serif;
+  background:
+    radial-gradient(circle at top left, rgba(31,111,91,0.12), transparent 32rem),
+    linear-gradient(135deg, #fbf7ed 0%, #eef4f1 100%);
+}
+main { max-width: 1180px; margin: 0 auto; padding: 44px 28px 64px; }
+.hero { border-bottom: 2px solid var(--ink); padding-bottom: 22px; margin-bottom: 26px; }
+h1 { font-size: clamp(34px, 5vw, 58px); line-height: 0.95; margin: 0 0 14px; letter-spacing: -0.045em; }
+.subtitle { max-width: 960px; font-size: 18px; line-height: 1.55; color: #33413d; margin: 0; }
+.meta-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin: 28px 0; }
+.card { background: rgba(255,253,247,0.86); border: 1px solid var(--line); border-radius: 18px; padding: 16px; box-shadow: 0 14px 32px rgba(23,33,31,0.06); }
+.card h3 { margin: 0 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); font-family: ui-sans-serif, system-ui, sans-serif; }
+.card p { margin: 0; font-size: 17px; line-height: 1.35; }
+section { margin-top: 34px; }
+h2 { font-size: 25px; margin: 0 0 14px; letter-spacing: -0.02em; }
+.plot-wrap { background: var(--panel); border: 1px solid var(--line); border-radius: 22px; padding: 18px; overflow-x: auto; }
+.progress-chart { width: 100%; min-width: 900px; height: auto; display: block; }
+.metric-label { font: 14px ui-sans-serif, system-ui, sans-serif; fill: var(--ink); }
+.axis-label { font: 13px ui-sans-serif, system-ui, sans-serif; fill: var(--muted); }
+.bar-value { font: 13px ui-sans-serif, system-ui, sans-serif; fill: var(--ink); }
+.target-line { stroke: #17211f; stroke-width: 1.6; stroke-dasharray: 5 4; }
+.bar-bg { fill: #e8eeea; }
+.bar.paper { fill: var(--paper); }
+.bar.probe { fill: var(--probe); }
+.bar.over { fill: var(--over); }
+.legend { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 12px; color: var(--muted); font: 14px ui-sans-serif, system-ui, sans-serif; }
+.legend span::before { content: ''; display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 7px; vertical-align: -1px; }
+.legend .paper::before { background: var(--paper); }
+.legend .probe::before { background: var(--probe); }
+.legend .over::before { background: var(--over); }
+table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 18px; overflow: hidden; font-family: ui-sans-serif, system-ui, sans-serif; }
+th, td { padding: 11px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; font-size: 14px; line-height: 1.35; }
+th { background: #eaf0eb; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: #3e4f4a; }
+tr:last-child td { border-bottom: 0; }
+.probe-metric td:first-child { color: #7a4219; font-weight: 700; }
+.paper-metric td:first-child { color: #165844; font-weight: 700; }
+.negative { color: var(--bad); font-weight: 700; }
+.positive { color: var(--good); font-weight: 700; }
+ul { margin: 0; padding-left: 20px; }
+li { margin: 8px 0; line-height: 1.45; }
+.note { color: var(--muted); font-size: 14px; line-height: 1.55; }
+.callout { background: #fff8dc; border: 1px solid #e2d391; border-radius: 16px; padding: 14px 16px; font: 14px ui-sans-serif, system-ui, sans-serif; color: #4e4521; line-height: 1.5; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92em; }
+a { color: #174ea6; }
+@media (max-width: 820px) {
+  main { padding: 28px 16px 48px; }
+  .meta-grid { grid-template-columns: 1fr; }
+  table { display: block; overflow-x: auto; white-space: nowrap; }
+}
+</style>
+</head>
+<body>
+<main>
+  <div class="hero">
+    <h1>LLaVA-1.5 Reproduction Progress</h1>
+    <p class="subtitle">Updated June 1, 2026. Progress snapshot from spreadsheet gid <code>1146448969</code>, rows 146-148. Row 147 is the target line for LLaVA-1.5 7B-style reproduction; row 148 is the first init run using CLIP-L @ 336 plus Gemma3-1B. Deltas are current minus target.</p>
+  </div>
+
+  <div class="meta-grid">
+    <div class="card"><h3>Target Row</h3><p>Row 147, LLaVA-1.5 7B target</p></div>
+    <div class="card"><h3>Current Row</h3><p>Row 148, init run</p></div>
+    <div class="card"><h3>First Run</h3><p>exalted-haze-9, jax-llava</p></div>
+    <div class="card"><h3>Model</h3><p>CLIP-L @ 336 + Gemma3-1B</p></div>
+  </div>
+
+  <section>
+    <h2>First Run Pipeline And Data</h2>
+    <p class="note">This is the run reported in spreadsheet row 148: <code>exalted-haze-9</code>. It is a two-stage JAX/HSDP curriculum run with CLIP-L/14 @ 336, Gemma3-1B-IT, an MLP2x GELU projector, stretch resize, frozen CLIP in both stages, frozen LM only in stage 1, Adam, and global steps <code>0..2180</code> for stage 1 plus <code>2180..7375</code> for stage 2.</p>
+    <table>
+      <thead><tr><th>Phase</th><th>Dataset</th><th>Mix weight</th><th>Notes</th></tr></thead>
+      <tbody><tr><td>Stage 1: projector pretraining</td><td>blip3o-short</td><td>1.0</td><td>2180 steps x batch 256 = 558,080 samples; LM and CLIP frozen; Adam lr=1e-3; warmup=65; short-caption alignment replacement for LLaVA-Pretrain/LCS-558K.</td></tr><tr><td>Stage 2: SFT</td><td>LLaVA-OV1.5 Instruct</td><td>22</td><td>Large instruction pool; first run used the non-current llava-ov1.5 root in logs, not the current image-shuffled alias.</td></tr><tr><td>Stage 2: SFT</td><td>VQAv2 train2014 image records</td><td>0.4</td><td>Short-answer VQA.</td></tr><tr><td>Stage 2: SFT</td><td>GQA balanced train</td><td>0.94</td><td>Short-answer compositional VQA.</td></tr><tr><td>Stage 2: SFT</td><td>TextCaps train</td><td>0.022</td><td>OCR/text-rich image captioning.</td></tr><tr><td>Stage 2: SFT</td><td>Visual Genome QA</td><td>1.7</td><td>Image-level QA; no VG detection data in the first run.</td></tr></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Second / Current Config Additions</h2>
+    <p class="note">The current checked config is <code>/kmh-nfs-ssd-us-mount/code/qiao/work/jax_llava/configs/remote_run_config.yml</code>. I did not find a xibo-manager job tag matching <code>cc12m</code>, <code>OKVQA</code>, <code>A-OKVQA</code>, <code>OCRVQA</code>, or <code>RefCOCO</code> at update time, so this section describes the code/config being launched rather than a verified completed job.</p>
+    <table>
+      <thead><tr><th>Area</th><th>Change</th><th>Impact</th></tr></thead>
+      <tbody><tr><td>Stage 1 data</td><td>cc12m</td><td>Replaces first-run blip3o-short in remote_run_config.yml. Still a replacement for official LCS-558K, not exact LLaVA-Pretrain 558K.</td></tr><tr><td>Stage 2 data</td><td>llava-ov-1.5-instruct-image-shuffled-v1</td><td>Current alias uses the image-shuffled LLaVA-OV1.5 pool.</td></tr><tr><td>Stage 2 data</td><td>OKVQA train</td><td>Added missing open-knowledge short-answer VQA, weight 0.009M.</td></tr><tr><td>Stage 2 data</td><td>A-OKVQA train</td><td>Added multiple-choice/knowledge VQA, weight 0.068M after MC augmentation.</td></tr><tr><td>Stage 2 data</td><td>OCRVQA train</td><td>Added OCR-centric QA, sampled at LLaVA-1.5-like 0.08M weight rather than full uploaded size.</td></tr><tr><td>Stage 2 data</td><td>Visual Genome detection</td><td>Added phrase-to-box/grounded data, weight 0.86M after 10 regions per image.</td></tr><tr><td>Stage 2 data</td><td>RefCOCO train</td><td>Added referring-expression grounding, weight 0.048M.</td></tr><tr><td>Eval/config</td><td>Fuller final eval</td><td>Final eval now includes VQAv2, MME, TextVQA, POPE, RefCOCOg, PixelBench, MMBench, GQA, VisWiz, ScienceQA-IMG, and SEED-Bench.</td></tr><tr><td>Input/config</td><td>Longer practical shuffling and caps</td><td>LLaVA-OV item shuffle raised to 50k; stage max text length split into 64 for stage 1 and 512 for stage 2; dataloader timeout set to 900s.</td></tr></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Remaining Differences From LLaVA-1.5</h2>
+    <table>
+      <thead><tr><th>Axis</th><th>Current status</th></tr></thead>
+      <tbody><tr><td>LM size and initialization</td><td>Official LLaVA-1.5 7B target uses Vicuna-v1.5-7B. Our first/current reproduction uses Gemma3-1B-IT, so the language model is much smaller and instruction-tuned under a different tokenizer/chat distribution.</td></tr><tr><td>Vision tower</td><td>Both use CLIP-L/14 at 336px in spirit. Our implementation uses OpenAI CLIP-L/14-336 with feature layer -2, patch features, MLP2x GELU projector, and JAX/HSDP. Image preprocessing is not an exact official-code reproduction because we use stretch resize.</td></tr><tr><td>Stage-1 data</td><td>Official target is LLaVA-Pretrain/LCS-558K. First run used blip3o-short; current config uses cc12m. Both are replacement data, not exact data-level reproduction.</td></tr><tr><td>Stage-2 sample definition</td><td>Official LLaVA-1.5 reports a 665K SFT recipe. Our training also uses 5195 x 128 = 664,960 stage-2 samples, but samples from a much larger LLaVA-OV1.5 pool plus weighted academic datasets. It is recipe-scale-aligned, not exact sample-list-aligned.</td></tr><tr><td>First-run missing SFT categories</td><td>First run lacked OKVQA, A-OKVQA, OCRVQA, Visual Genome detection/grounded boxes, RefCOCO grounding, and ShareGPT text-only.</td></tr><tr><td>Current config remaining data gaps</td><td>Current config adds OKVQA/A-OKVQA/OCRVQA/VG detection/RefCOCO, but still does not use exact LLaVA-1.5 665K JSON/conversations and still omits ShareGPT text-only.</td></tr><tr><td>Extra/different data</td><td>LLaVA-OV1.5-Instruct is newer and much larger than LLaVA-1.5 665K. This may improve breadth but makes the result an ablation-style reproduction rather than a strict LLaVA-1.5 data reproduction.</td></tr><tr><td>Eval protocol</td><td>We track several official metrics. POPE is aligned to the adversarial split in the spreadsheet: final logs contain both macro F1 and adversarial F1, and row 148 records the adversarial F1. We do not yet track MMBench-CN, SEED all/video, LLaVA-Wild, or MM-Vet in row 148. We additionally track VStar/OCRBench/MMVP/CountBench/RefCOCOg/KNN, which are not original LLaVA-1.5 paper-table metrics.</td></tr></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>v5p-64 Throughput</h2>
+    <p class="note">Throughput is parsed from historical first-run logs containing <code>steps_per_second</code>. The parser filtered to xibo jobs whose TPU name contains <code>v5p-64</code>. The filtered median removes points below 2 steps/s to drop compile/resume artifacts.</p>
+    <table>
+      <thead><tr><th>Run slice</th><th>Log points</th><th>Median all</th><th>Filtered median</th><th>Notes</th></tr></thead>
+      <tbody><tr><td>First LLaVA-style curriculum, v5p-64, stage 1</td><td>20 log points</td><td>5.63 steps/s</td><td>5.69 steps/s</td><td>Filtered median drops points below 2 steps/s, which are usually compile/resume or checkpoint-adjacent artifacts. Global batch is 256.</td></tr><tr><td>First LLaVA-style curriculum, v5p-64, stage 2</td><td>68 log points</td><td>3.91 steps/s</td><td>3.94 steps/s</td><td>Global batch is 128. The final finished segment row 7097 has median 3.84 steps/s.</td></tr></tbody>
+    </table>
+    <p class="note">Reference final segment: <code>/kmh-nfs-ssd-us-mount/logs/sqa/paligemma-baseline/20260531_004908_ggu3cd_kmh-tpuvm-v5p-64-kangyang-03-594515ec_us-central1-a__b_lr_ep_eval/output.log</code>. That finished v5p-64 stage-2 segment reports 17 step/sec points with median 3.84 steps/s.</p>
+  </section>
+
+  <section>
+    <h2>Progress Plot</h2>
+    <div class="plot-wrap">
+      <svg class="progress-chart" viewBox="0 0 1120 541" role="img" aria-label="Current progress relative to target">
+<line x1="571.8" y1="18" x2="571.8" y2="517" class="target-line" />
+<text x="577.8" y="24" class="axis-label">100% target</text>
+<text x="0" y="54" class="metric-label">MME-P</text>
+<rect x="190" y="38" width="840" height="22" rx="5" class="bar-bg" />
+<rect x="190" y="38" width="260.0" height="22" rx="5" class="bar paper" />
+<text x="458.0" y="54" class="bar-value">68.1%</text>
+<text x="0" y="89" class="metric-label">VQAv2</text>
+<rect x="190" y="73" width="840" height="22" rx="5" class="bar-bg" />
+<rect x="190" y="73" width="201.4" height="22" rx="5" class="bar paper" />
+<text x="399.4" y="89" class="bar-value">52.7%</text>
+<text x="0" y="124" class="metric-label">TextVQA</text>
+<rect x="190" y="108" width="840" height="22" rx="5" class="bar-bg" />
+<rect x="190" y="108" width="223.6" height="22" rx="5" class="bar paper" />
+<text x="421.6" y="124" class="bar-value">58.6%</text>
+<text x="0" y="159" class="metric-label">MMBench</text>
+<rect x="190" y="143" width="840" height="22" rx="5" class="bar-bg" />
+<rect x="190" y="143" width="209.1" height="22" rx="5" class="bar paper" />
+<text x="407.1" y="159" class="bar-value">54.8%</text>
+<text x="0" y="194" class="metric-label">POPE</text>
+<rect x="190" y="178" width="840" height="22" rx="5" class="bar-bg" />
+<rect x="190" y="178" width="362.8" height="22" rx="5" class="bar paper" />
+<text x="560.8" y="194" class="bar-value">95.0%</text>
+<text x="0" y="229" class="metric-label">VisWiz</text>
+<rect x="190" y="213" width="840" height="22" rx="5" class="bar-bg" />
+<rect x="190" y="213" width="41.4" height="22" rx="5" class="bar paper" />
+<text x="239.4" y="229" class="bar-value">10.8%</text>
+<text x="0" y="264" class="metric-label">SEED-Bench image</text>
+<rect x="190" y="248" width="840" height="22" rx="5" class="bar-bg" />
+<rect x="190" y="248" width="290.1" height="22" rx="5" class="bar paper" />
+<text x="488.1" y="264" class="bar-value">76.0%</text>
+<text x="0" y="299" class="metric-label">ScienceQA-IMG</text>
+<rect x="190" y="283" width="840" height="22" rx="5" class="bar-bg" />
+<rect x="190" y="283" width="317.1" height="22" rx="5" class="bar paper" />
+<text x="515.1" y="299" class="bar-value">83.1%</text>
+<text x="0" y="334" class="metric-label">GQA</text>
+<rect x="190" y="318" width="840" height="22" rx="5" class="bar-bg" />
+<rect x="190" y="318" width="291.2" height="22" rx="5" class="bar paper" />
+<text x="489.2" y="334" class="bar-value">76.3%</text>
+<text x="0" y="369" class="metric-label">VStar</text>
+<rect x="190" y="353" width="840" height="22" rx="5" class="bar-bg" />
+<rect x="190" y="353" width="242.2" height="22" rx="5" class="bar probe" />
+<text x="440.2" y="369" class="bar-value">63.4%</text>
+<text x="0" y="404" class="metric-label">OCRBench</text>
+<rect x="190" y="388" width="840" height="22" rx="5" class="bar-bg" />
+<rect x="190" y="388" width="343.3" height="22" rx="5" class="bar probe" />
+<text x="541.3" y="404" class="bar-value">89.9%</text>
+<text x="0" y="439" class="metric-label">MMVP</text>
+<rect x="190" y="423" width="840" height="22" rx="5" class="bar-bg" />
+<rect x="190" y="423" width="824.4" height="22" rx="5" class="bar probe over" />
+<text x="1022.4" y="439" class="bar-value">215.9%</text>
+<text x="0" y="474" class="metric-label">CountBench</text>
+<rect x="190" y="458" width="840" height="22" rx="5" class="bar-bg" />
+<rect x="190" y="458" width="322.6" height="22" rx="5" class="bar probe" />
+<text x="520.6" y="474" class="bar-value">84.5%</text>
+</svg>
+      <div class="legend">
+        <span class="paper">Original LLaVA-1.5 paper metric</span>
+        <span class="probe">Additional probe, not in original paper table</span>
+        <span class="over">Current exceeds target</span>
+      </div>
+    </div>
+    <p class="note">The plot normalizes every metric by its target. This makes MME-P visually comparable to percentage-style scores, but the exact score deltas are in the table below.</p>
+  </section>
+
+  <section>
+    <h2>Metric Table</h2>
+    <table>
+      <thead><tr><th>Benchmark</th><th>Original paper?</th><th>Target</th><th>Current</th><th>Delta</th><th>Progress</th><th>Notes</th></tr></thead>
+      <tbody><tr class="paper-metric"><td>MME-P</td><td>Yes</td><td>1511</td><td>1029</td><td class="negative">-482</td><td>68.1%</td><td>Sheet target is the LLaVA-1.5 paper MME score. Current row also records MME-S=1249, but no MME-S target is recorded.</td></tr><tr class="paper-metric"><td>VQAv2</td><td>Yes</td><td>78.5</td><td>41.4</td><td class="negative">-37.1</td><td>52.7%</td><td>Original paper metric. The paper marks VQAv2 with training-image overlap.</td></tr><tr class="paper-metric"><td>TextVQA</td><td>Yes</td><td>58.2</td><td>34.08</td><td class="negative">-24.12</td><td>58.6%</td><td>Original paper metric for text-rich VQA.</td></tr><tr class="paper-metric"><td>MMBench</td><td>Yes</td><td>64.3</td><td>35.22</td><td class="negative">-29.08</td><td>54.8%</td><td>Original paper MMBench EN target.</td></tr><tr class="paper-metric"><td>POPE</td><td>Yes</td><td>84.2</td><td>80</td><td class="negative">-4.2</td><td>95.0%</td><td>Spreadsheet current value is the adversarial split F1, matching the paper-style adversarial target. The same eval also logs macro F1 separately, but row 148 intentionally uses adversarial F1.</td></tr><tr class="paper-metric"><td>VisWiz</td><td>Yes</td><td>50</td><td>5.42</td><td class="negative">-44.58</td><td>10.8%</td><td>Original paper metric. This is the largest percentage gap among paper metrics.</td></tr><tr class="paper-metric"><td>SEED-Bench image</td><td>Yes</td><td>66.1</td><td>50.23</td><td class="negative">-15.87</td><td>76.0%</td><td>Original paper Table 4 image-only SEED-Bench target.</td></tr><tr class="paper-metric"><td>ScienceQA-IMG</td><td>Yes</td><td>66.8</td><td>55.48</td><td class="negative">-11.32</td><td>83.1%</td><td>Original paper ScienceQA image-subset metric.</td></tr><tr class="paper-metric"><td>GQA</td><td>Yes</td><td>62</td><td>47.28</td><td class="negative">-14.72</td><td>76.3%</td><td>Original paper metric. The paper marks GQA with training-image overlap.</td></tr><tr class="probe-metric"><td>VStar</td><td>No</td><td>48.7</td><td>30.89</td><td class="negative">-17.81</td><td>63.4%</td><td>Additional fine-grained visual reasoning probe, not reported in the LLaVA-1.5 paper main tables. Target is approximate as recorded in the sheet.</td></tr><tr class="probe-metric"><td>OCRBench</td><td>No</td><td>29.7</td><td>26.7</td><td class="negative">-3</td><td>89.9%</td><td>Additional OCR-centric probe, not reported in the LLaVA-1.5 paper main tables.</td></tr><tr class="probe-metric"><td>MMVP</td><td>No</td><td>24.7</td><td>53.33</td><td class="positive">+28.63</td><td>215.9%</td><td>Additional visual perception probe, not reported in the LLaVA-1.5 paper main tables. Current exceeds the sheet target; verify protocol before interpreting this as a true win.</td></tr><tr class="probe-metric"><td>CountBench</td><td>No</td><td>47</td><td>39.71</td><td class="negative">-7.29</td><td>84.5%</td><td>Additional counting probe, not reported in the LLaVA-1.5 paper main tables. Target is approximate as recorded in the sheet.</td></tr></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Main Gaps</h2>
+    <ul>
+      <li><strong>MME-P</strong>: current 1029, target 1511, delta -482.</li>
+<li><strong>VisWiz</strong>: current 5.42, target 50, delta -44.58.</li>
+<li><strong>VQAv2</strong>: current 41.4, target 78.5, delta -37.1.</li>
+<li><strong>MMBench</strong>: current 35.22, target 64.3, delta -29.08.</li>
+<li><strong>TextVQA</strong>: current 34.08, target 58.2, delta -24.12.</li>
+      <li><strong>MMVP</strong> is above the spreadsheet target by +28.63, but it is not an original LLaVA-1.5 paper metric and should be protocol-checked before treating it as a reliable win.</li>
+      <li><strong>POPE</strong> is close to the spreadsheet target: row 148 records adversarial F1 80.00. The evaluator also logged macro F1 82.58, but that is not the spreadsheet value.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Current Run Details</h2>
+    <table>
+      <tbody>
+        <tr><th>Spreadsheet current row</th><td>Row 148</td></tr>
+        <tr><th>First-run config summary</th><td>blip-3o pretrain; SFT mix of LLaVA-OV1.5, VQAv2, GQA, TextCaps, and Visual Genome QA.</td></tr>
+        <tr><th>Non-target metrics in row 148</th><td>Training/eval acc 67.60%, loss 1.33, RefCOCOg 0, ImageNet KNN 51.71, MME-S 1249.</td></tr>
+        <tr><th>WandB</th><td>exalted-haze-9 | Sqa24's workspace | jax-llava</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Original Paper Coverage</h2>
+    <ul>
+      <li>Covered original-paper metrics in this progress row: VQAv2, GQA, VisWiz, ScienceQA-IMG, TextVQA, POPE, MME, MMBench EN, and SEED-Bench image.</li>
+      <li>Original-paper metrics not yet tracked in row 148: MMBench-CN, SEED-Bench all/video, LLaVA-Bench-in-the-Wild, and MM-Vet.</li>
+      <li>Additional non-original probes in this row: VStar, OCRBench, MMVP, CountBench, RefCOCOg, and ImageNet KNN.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Sources</h2>
+    <ul>
+      <li><a href="https://docs.google.com/spreadsheets/d/1FlcygQbGBTqHLJeiKdwxS0nP41SPMJrtX-kCJq8d7SQ/edit?gid=1146448969#gid=1146448969">Project spreadsheet, gid 1146448969</a>, rows 146-148.</li>
+      <li><a href="https://openaccess.thecvf.com/content/CVPR2024/papers/Liu_Improved_Baselines_with_Visual_Instruction_Tuning_CVPR_2024_paper.pdf">Liu et al., Improved Baselines with Visual Instruction Tuning, CVPR 2024</a>, Tables 3 and 4.</li>
+      <li><a href="https://github.com/haotian-liu/LLaVA/blob/main/docs/MODEL_ZOO.md">Official LLaVA model zoo</a>, LLaVA-1.5 model table.</li>
+      <li>Local config: <code>/kmh-nfs-ssd-us-mount/code/qiao/work/jax_llava/configs/remote_run_config.yml</code>.</li>
+      <li>Local first-run v5p-64 log: <code>/kmh-nfs-ssd-us-mount/logs/sqa/paligemma-baseline/20260531_004908_ggu3cd_kmh-tpuvm-v5p-64-kangyang-03-594515ec_us-central1-a__b_lr_ep_eval/output.log</code>.</li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

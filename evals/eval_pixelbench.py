@@ -411,6 +411,14 @@ def _run_one_benchmark(p_sample_step, run_p_sample_step, model, tokenizer, param
 
     log_for_0(f"PixelBench/{bench}: root={root}")
     dataset = PixelBenchDataset(root, bench, config, tokenizer)
+    max_samples = int(
+        getattr(config.eval, "pixelbench_max_samples", 0)
+        or getattr(config.eval, "debug_max_samples", 0)
+        or 0
+    )
+    if max_samples > 0 and len(dataset.rows) > max_samples:
+        dataset.rows = dataset.rows[:max_samples]
+        log_for_0(f"PixelBench/{bench}: capped to {len(dataset.rows)} samples")
     device_batch_size = int(getattr(config.eval, "pixelbench_device_batch_size", config.eval.device_batch_size))
     batch_size = device_batch_size * jax.local_device_count()
     sampler = DistributedEvalSampler(dataset, num_replicas=jax.process_count(), rank=jax.process_index())
