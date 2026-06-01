@@ -123,6 +123,9 @@ def get_config():
     # Whether to freeze the LM backbone params during training (only the
     # image encoder + projector receive gradients).
     training.freeze_lm = False
+    # If freeze_lm=True, keep the Gemma <loc0000>..<loc1023> embedding rows
+    # trainable while all original token embedding rows remain frozen.
+    training.train_loc_embeddings_when_lm_frozen = True
     training.freeze_image_encoder = False
     training.vision_tower_from_scratch = False
     training.clip_from_pt = True
@@ -232,8 +235,10 @@ def get_config():
     eval.knn_val_examples = None
     eval.knn_batch_size = 256
     eval.knn_num_workers = 4
-    # Fit PCA whitening on KNN train/reference features, apply to train+val,
-    # then run the usual L2-normalized cosine KNN.  0 keeps all feature dims.
+    # Extract KNN features once, then evaluate both raw cosine KNN and PCA-
+    # whitened cosine KNN. The legacy knn_*_acc metric name records raw KNN;
+    # knn_*_acc_pca_whitened records the whitened result. 0 keeps all dims.
+    eval.knn_eval_raw_and_pca_whitened = True
     eval.knn_pca_whitening = True
     eval.knn_pca_whitening_eps = 1e-5
     eval.knn_pca_whitening_dim = 0

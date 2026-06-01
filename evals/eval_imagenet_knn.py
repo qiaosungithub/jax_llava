@@ -48,9 +48,10 @@ to use the local TFDS path or ``TFDS_DATA_DIR``.
 Public API
 ----------
     imagenet_data_dir = ensure_imagenet_available(zone, local_debug=False)
-    acc = eval_imagenet_knn(state_params, model, config, imagenet_data_dir,
-                            images_per_class=128, seed=42, k=20,
-                            val_examples=None)
+    accs = eval_imagenet_knn(state_params, model, config, imagenet_data_dir,
+                             images_per_class=128, seed=42, k=20,
+                             val_examples=None)
+    # accs contains both raw cosine KNN and PCA-whitened cosine KNN by default.
 """
 
 from __future__ import annotations
@@ -648,6 +649,13 @@ def _maybe_apply_knn_feature_transform(
     )
 
 
+def _should_eval_both_knn_transforms(config) -> bool:
+    return _config_bool(
+        config.eval.get("knn_eval_raw_and_pca_whitened", True),
+        default=True,
+    )
+
+
 def _knn_accuracy_jax(
     train_feats:  np.ndarray,   # (N_train, D)
     train_labels: np.ndarray,   # (N_train,)
@@ -713,7 +721,7 @@ def eval_imagenet_knn(
     batch_size: int = 256,
     num_workers: int = 4,
     val_examples: Optional[int] = None,
-) -> float:
+) -> dict[str, float]:
     """Evaluate KNN accuracy on (partial or full) ImageNet.
 
     All processes participate in feature extraction (each handles a TFDS
@@ -737,7 +745,8 @@ def eval_imagenet_knn(
                           50 k validation images.
 
     Returns:
-        KNN top-1 accuracy in percent (0–100) on process 0; ``0.0`` elsewhere.
+        A dict of KNN top-1 accuracies in percent.  By default it contains both
+        ``raw`` and ``pca_whitened`` from the same extracted feature tensors.
     """
     image_size = int(config.dataset.image_size)
     resize_mode = getattr(config.dataset, "resize_mode", "letterbox")
@@ -829,28 +838,42 @@ def eval_imagenet_knn(
     log_for_0(f"[KNN] Val feats gathered: {val_feats.shape}")
     mu.sync_global_devices("knn_val_features_gathered")
 
-    train_feats, val_feats = _maybe_apply_knn_feature_transform(
-        train_feats,
-        val_feats,
-        config,
-    )
-    mu.sync_global_devices("knn_feature_transform_done")
-
     # Every host runs the same JAX KNN program.  Running JAX only on process 0
     # can desynchronize multi-controller TPU programs after HSDP feature
     # extraction, even if the input arrays are already fully gathered.
-    log_for_0(f"[KNN] Running replicated KNN-{k} on every process …")
-    t0 = time.time()
-    acc = _knn_accuracy_jax(
-        train_feats, train_labels,
-        val_feats,   val_labels,
-        k=k, temperature=temperature,
-    )
-    accs = np.asarray(
-        jax.device_get(mu.process_allgather(jnp.asarray([acc], dtype=jnp.float32)))
-    ).reshape(-1)
-    if PRI == 0 and accs.size and float(accs.max() - accs.min()) > 1e-3:
-        log_for_0(f"[KNN] Warning: replicated KNN accuracies differ across hosts: {accs}")
-    acc = float(accs[0]) if accs.size else float(acc)
-    log_for_0(f"[KNN] Done in {time.time()-t0:.1f}s  →  acc = {acc:.2f}%")
-    return acc
+    def _replicated_knn(name: str, feats_train: np.ndarray, feats_val: np.ndarray) -> float:
+        log_for_0(f"[KNN] Running replicated {name} KNN-{k} on every process ...")
+        t0 = time.time()
+        acc = _knn_accuracy_jax(
+            feats_train, train_labels,
+            feats_val,   val_labels,
+            k=k, temperature=temperature,
+        )
+        accs = np.asarray(
+            jax.device_get(mu.process_allgather(jnp.asarray([acc], dtype=jnp.float32)))
+        ).reshape(-1)
+        if PRI == 0 and accs.size and float(accs.max() - accs.min()) > 1e-3:
+            log_for_0(f"[KNN] Warning: replicated {name} KNN accuracies differ across hosts: {accs}")
+        acc = float(accs[0]) if accs.size else float(acc)
+        log_for_0(f"[KNN] {name} done in {time.time()-t0:.1f}s -> acc = {acc:.2f}%")
+        return acc
+
+    results: dict[str, float] = {}
+    if _should_eval_both_knn_transforms(config):
+        results["raw"] = _replicated_knn("raw", train_feats, val_feats)
+        train_w, val_w = _pca_whiten_features(
+            train_feats,
+            val_feats,
+            eps=float(config.eval.get("knn_pca_whitening_eps", 1e-5)),
+            keep_dim=config.eval.get("knn_pca_whitening_dim", 0),
+            batch_size=int(config.eval.get("knn_pca_whitening_batch_size", 65536)),
+        )
+        mu.sync_global_devices("knn_pca_whitening_done")
+        results["pca_whitened"] = _replicated_knn("pca_whitened", train_w, val_w)
+    else:
+        train_eval, val_eval = _maybe_apply_knn_feature_transform(train_feats, val_feats, config)
+        mu.sync_global_devices("knn_feature_transform_done")
+        key = "pca_whitened" if _config_bool(config.eval.get("knn_pca_whitening", True), default=True) else "raw"
+        results[key] = _replicated_knn(key, train_eval, val_eval)
+
+    return results

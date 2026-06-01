@@ -27,6 +27,22 @@ from utils import vis_util
 _RUN_ID_BUF_SIZE = 128
 
 
+def _knn_scalars(metric_name, result, suffix):
+    """Keep the legacy metric name as raw KNN and log whitened explicitly."""
+    if isinstance(result, dict):
+        scalars = {}
+        if "raw" in result:
+            scalars[f"{metric_name}{suffix}"] = result["raw"]
+            scalars[f"{metric_name}_raw{suffix}"] = result["raw"]
+        if "pca_whitened" in result:
+            scalars[f"{metric_name}_pca_whitened{suffix}"] = result["pca_whitened"]
+        if not scalars and result:
+            first_key = next(iter(result))
+            scalars[f"{metric_name}{suffix}"] = result[first_key]
+        return scalars
+    return {f"{metric_name}{suffix}": result}
+
+
 def _broadcast_string_from_source(value, is_source):
     data = value.encode("utf-8") if is_source else b""
     if len(data) >= _RUN_ID_BUF_SIZE:
@@ -84,7 +100,7 @@ def run_eval_tasks(
             if knn_data_dir is None:
                 log_for_0("Skip knn_partial: ImageNet TFDS data_dir unavailable")
                 continue
-            knn_acc = eval_imagenet_knn(
+            knn_result = eval_imagenet_knn(
                 params,
                 model,
                 config,
@@ -97,7 +113,7 @@ def run_eval_tasks(
                 num_workers=config.eval.get("knn_num_workers", 4),
                 val_examples=config.eval.get("knn_val_examples", None),
             )
-            writer.write_scalars(step, {f"knn_partial_acc{suffix}": knn_acc, "step": step})
+            writer.write_scalars(step, {**_knn_scalars("knn_partial_acc", knn_result, suffix), "step": step})
             mu.sync_global_devices("knn_partial")
             continue
 
@@ -108,7 +124,7 @@ def run_eval_tasks(
             if knn_data_dir is None:
                 log_for_0("Skip knn_full: ImageNet TFDS data_dir unavailable")
                 continue
-            knn_acc = eval_imagenet_knn(
+            knn_result = eval_imagenet_knn(
                 params,
                 model,
                 config,
@@ -121,7 +137,7 @@ def run_eval_tasks(
                 num_workers=config.eval.get("knn_num_workers", 4),
                 val_examples=config.eval.get("knn_val_examples", None),
             )
-            writer.write_scalars(step, {f"knn_full_acc{suffix}": knn_acc, "step": step})
+            writer.write_scalars(step, {**_knn_scalars("knn_full_acc", knn_result, suffix), "step": step})
             mu.sync_global_devices("knn_full")
             continue
 

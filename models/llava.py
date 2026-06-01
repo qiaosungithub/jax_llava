@@ -214,7 +214,15 @@ class LlavaGemma(nn.Module):
         T_prompt = prompt_ids.shape[1]
         prefix_len = jnp.asarray(prefix_len, dtype=jnp.int32)
 
-        K = (self.image_size // 14) ** 2 if images is not None else 0
+        token_embeds = self.lm_backbone.embedder.encode(prompt_ids)
+        if images is not None:
+            clip_tokens = self.encode_image(images, train=False)
+            img_embeds = self.projector(clip_tokens)
+            token_embeds = jnp.concatenate([img_embeds, token_embeds], axis=1)
+            K = img_embeds.shape[1]
+        else:
+            K = 0
+
         prefix_total = prefix_len + K
         step_pos_init = prefix_total[:, None]
         max_total_len = T_prompt + max_new_tokens + K
@@ -224,17 +232,29 @@ class LlavaGemma(nn.Module):
             dtype=jnp.bfloat16,
             cache_length=max_total_len,
         )
-        out_dict = self(
-            input_ids=prompt_ids,
-            images=images,
-            prefix_len=prefix_len,
-            cache=cache,
+        cache_dtype = cache[list(cache.keys())[0]]["v"].dtype
+        L = token_embeds.shape[1]
+        positions = jnp.broadcast_to(jnp.arange(L, dtype=jnp.int32)[None, :], (B, L))
+        prefill_inputs = _Inputs(
+            embeddings=token_embeds.astype(cache_dtype),
+            positions=positions,
+            attention_mask=self.make_causal_with_prefix_block(
+                L, prefix_total, cache_size=max_total_len
+            ),
+            inputs_mask=jnp.ones((B, L), dtype=jnp.int32),
         )
-        logits_at_last = jnp.take_along_axis(
-            out_dict["logits"],
+        prefill_out, prefill_cache = self.lm_backbone._apply_attention(
+            prefill_inputs, cache
+        )
+
+        # Decode only the last prompt hidden state. Decoding the whole prefill
+        # sequence materializes [B, T, vocab] logits and can OOM on v6e-64.
+        hidden_at_last = jnp.take_along_axis(
+            prefill_out,
             (prefix_total - 1)[:, None, None],
             axis=1,
         ).squeeze(1)
+        logits_at_last = self.lm_backbone.embedder.decode(hidden_at_last)
         first_token = jnp.argmax(logits_at_last, axis=-1, keepdims=True)
 
         tokens_out = jnp.zeros((B, max_new_tokens), dtype=jnp.int32)
@@ -265,7 +285,7 @@ class LlavaGemma(nn.Module):
                 step_inputs, curr_cache
             )
             next_tok = jnp.argmax(
-                self.lm_backbone.embedder.decode(lm_out)[:, -1, :],
+                self.lm_backbone.embedder.decode(lm_out[:, -1, :]),
                 axis=-1,
                 keepdims=True,
             )
@@ -279,7 +299,7 @@ class LlavaGemma(nn.Module):
         _, _, _, all_tokens = jax.lax.while_loop(
             cond_fn,
             body_fn,
-            (first_token, out_dict["cache"], 1, tokens_out),
+            (first_token, prefill_cache, 1, tokens_out),
         )
         return all_tokens
 

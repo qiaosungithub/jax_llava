@@ -31,7 +31,12 @@ from utils.ckpt_util import (
     save_checkpoint,
 )
 from utils.data_util import resolve_dataset_roots
-from utils.frozen_util import get_trainable, merge_params
+from utils.frozen_util import (
+    get_trainable,
+    merge_params,
+    merge_params_trainable_loc_embeddings,
+    zero_nonloc_embedding_rows,
+)
 from utils.llm_util import create_tokenizer, init_loc_token_embeddings
 from utils.logging_util import MetricsTracker, Timer, Writer, log_for_0
 from utils.pjit_util import MeshMode, prepare_pjit_funcs, shard_cpu_tree_to_mesh
@@ -84,16 +89,23 @@ def train_step(state, batch, rng_init, config):
 
     freeze_lm = bool(config.training.get('freeze_lm', False))
     freeze_image_encoder = bool(config.training.get('freeze_image_encoder', False))
+    train_loc_embeddings_when_lm_frozen = bool(config.training.get('train_loc_embeddings_when_lm_frozen', True))
     txt_feature_layer = int(config.model.get('txt_feature_layer', 0))
     trainable_params, frozen_params = get_trainable(
         state.params,
         freeze_lm=freeze_lm,
         txt_feature_layer=txt_feature_layer,
         freeze_image_encoder=freeze_image_encoder,
+        train_loc_embeddings_when_lm_frozen=train_loc_embeddings_when_lm_frozen,
     )
 
     def loss_fn(wrt_params):
-        params = merge_params(wrt_params, frozen_params) if frozen_params else wrt_params
+        params = merge_params_trainable_loc_embeddings(
+            wrt_params,
+            frozen_params,
+            state.params,
+            enable=freeze_lm and train_loc_embeddings_when_lm_frozen,
+        )
         outputs = state.apply_fn(
             {"params": params},
             input_ids=batch['input_ids'],
@@ -112,6 +124,8 @@ def train_step(state, batch, rng_init, config):
     if frozen_params:
         frozen_zero_grads = jax.tree.map(jnp.zeros_like, frozen_params)
         grads = merge_params(grads, frozen_zero_grads)
+    if freeze_lm and train_loc_embeddings_when_lm_frozen:
+        grads = zero_nonloc_embedding_rows(grads)
 
     grad_norm = optax.global_norm(grads)
     metrics = compute_metrics(log_dict)
@@ -357,7 +371,12 @@ def _build_pjit_fns(config, model, state, mesh_bundle):
         MeshMode.DATA,
     )
     p_sample_step_mmbench = pjit_compile(
-        partial(sample_step, model=model, max_new_tokens=mmbench_new_tokens, beam_size=1),
+        partial(
+            sample_step,
+            model=model,
+            max_new_tokens=mmbench_new_tokens,
+            beam_size=int(config.sampling.get('beam_size', 1)),
+        ),
         in_shardings=(
             state_spec.params,
             mmbench_batch_spec['pixel_values'],

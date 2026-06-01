@@ -68,7 +68,8 @@ training:
             max_txt_len: 64
         dataset_items:
             # - blip3o-short
-            - cc12m
+            # - cc12m
+            - laion-aes
         mix_weights: [1]
         batch_size: 256
         freeze_lm: True
@@ -148,4 +149,4 @@ logging:
     wandb_project: "jax-llava"
     wandb_entity: "sqa24-massachusetts-institute-of-technology"
     wandb_tags: ["llava1.5", "curriculum", "hsdp"]
-    wandb_notes: "[cc12m pretrain] LLaVA-1.5 reproduction two-stage curriculum using jit/HSDP. Stage-1 cc12m, stage-2 LLaVA-OV-1.5-Instruct plus VQAv2/OKVQA/A-OKVQA/OCRVQA/GQA/TextCaps/Visual Genome QA, VG detection, and RefCOCO grounding."
+    wandb_notes: "[laion-aes pretrain] LLaVA-1.5 reproduction two-stage curriculum using jit/HSDP. Stage-1 laion-aes, stage-2 LLaVA-OV-1.5-Instruct plus VQAv2/OKVQA/A-OKVQA/OCRVQA/GQA/TextCaps/Visual Genome QA, VG detection, and RefCOCO grounding."

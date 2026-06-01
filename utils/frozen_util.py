@@ -14,8 +14,11 @@ key `k` when `k == p` or `k` starts with `p + "/"`.
 from typing import Iterable, Sequence, Tuple
 
 import jax
+import jax.numpy as jnp
+from flax.core import FrozenDict
 from flax import traverse_util
 
+from utils.llm_util import LOC_TOKEN_END, LOC_TOKEN_START
 from utils.state_util import flatten_state_dict
 
 
@@ -80,6 +83,93 @@ def extract_trainable_parameters(
 #   - projector      (image→LM projector)
 
 _ALL_VLM_GROUPS = ("image_encoder", "lm_backbone", "projector")
+_LOC_EMBEDDING_KEY = "lm_backbone/embedder/input_embedding"
+_LOC_EMBEDDING_PARTS = tuple(_LOC_EMBEDDING_KEY.split("/"))
+
+
+def _can_train_loc_embedding(flat_params) -> bool:
+  emb = flat_params.get(_LOC_EMBEDDING_KEY, None)
+  shape = getattr(emb, "shape", None)
+  return shape is not None and len(shape) >= 1 and int(shape[0]) > LOC_TOKEN_START
+
+
+def _get_path(tree, parts):
+  cur = tree
+  for part in parts:
+    cur = cur[part]
+  return cur
+
+
+def _has_path(tree, parts) -> bool:
+  try:
+    _get_path(tree, parts)
+    return True
+  except (KeyError, TypeError):
+    return False
+
+
+def _set_path(tree, parts, value):
+  if not parts:
+    return value
+  if isinstance(tree, FrozenDict):
+    out = tree.unfreeze()
+    out[parts[0]] = _set_path(out[parts[0]], parts[1:], value)
+    return FrozenDict(out)
+  out = dict(tree)
+  out[parts[0]] = _set_path(out[parts[0]], parts[1:], value)
+  return out
+
+
+def _loc_slice_for_embedding(embedding):
+  start = LOC_TOKEN_START
+  end = min(LOC_TOKEN_END, int(embedding.shape[0]))
+  if start >= end:
+    return None
+  return start, end
+
+
+def merge_params_trainable_loc_embeddings(
+    wrt_params,
+    frozen_params,
+    current_params,
+    enable: bool = True,
+):
+  """Merge params while keeping non-loc embedding rows frozen.
+
+  When the LM is frozen but loc embeddings are trainable, the whole embedding
+  leaf must be present in `wrt_params`.  This helper uses the current params as
+  a stop-gradient source for non-loc rows, then writes trainable loc rows back.
+  """
+  params = merge_params(wrt_params, frozen_params) if frozen_params else wrt_params
+  if not enable or not _has_path(params, _LOC_EMBEDDING_PARTS):
+    return params
+
+  emb = _get_path(params, _LOC_EMBEDDING_PARTS)
+  loc_slice = _loc_slice_for_embedding(emb)
+  if loc_slice is None or not _has_path(current_params, _LOC_EMBEDDING_PARTS):
+    return params
+
+  start, end = loc_slice
+  base_emb = _get_path(current_params, _LOC_EMBEDDING_PARTS)
+  merged_emb = jax.lax.stop_gradient(base_emb).at[start:end].set(emb[start:end])
+  return _set_path(params, _LOC_EMBEDDING_PARTS, merged_emb)
+
+
+def zero_nonloc_embedding_rows(tree):
+  """Zero every update/gradient row except the loc-token embedding rows."""
+  if not _has_path(tree, _LOC_EMBEDDING_PARTS):
+    return tree
+  emb = _get_path(tree, _LOC_EMBEDDING_PARTS)
+  loc_slice = _loc_slice_for_embedding(emb)
+  if loc_slice is None:
+    return tree
+
+  start, end = loc_slice
+  row_mask = jnp.zeros((emb.shape[0],), dtype=bool).at[start:end].set(True)
+  while row_mask.ndim < emb.ndim:
+    row_mask = row_mask[..., None]
+  masked_emb = jnp.where(row_mask, emb, jnp.zeros_like(emb))
+  return _set_path(tree, _LOC_EMBEDDING_PARTS, masked_emb)
 
 
 def get_trainable(
@@ -87,6 +177,7 @@ def get_trainable(
     freeze_lm: bool = False,
     txt_feature_layer: int = 0,
     freeze_image_encoder: bool = False,
+    train_loc_embeddings_when_lm_frozen: bool = True,
 ):
   """Split VLM params into (trainable, frozen) according to flags.
 
@@ -99,6 +190,10 @@ def get_trainable(
       the entire lm_backbone is frozen (original behaviour).
     freeze_image_encoder: if True, freeze the vision tower.  This matches the
       standard LLaVA-1.5 projector/LM tuning setup.
+    train_loc_embeddings_when_lm_frozen: if True, keep only the
+      <loc0000>..<loc1023> rows in lm_backbone/embedder/input_embedding
+      trainable while the rest of the LM stays frozen. Row-level freezing is
+      enforced in train_step and the optimizer update transform.
 
   Returns:
     (trainable_params, frozen_params). When nothing is frozen,
@@ -107,7 +202,13 @@ def get_trainable(
   if not freeze_lm and not freeze_image_encoder:
     return params, {}
 
-  flat_keys = list(flatten_state_dict(params).keys())
+  flat_params = flatten_state_dict(params)
+  flat_keys = list(flat_params.keys())
+  train_loc_embedding = (
+      bool(train_loc_embeddings_when_lm_frozen)
+      and freeze_lm
+      and _can_train_loc_embedding(flat_params)
+  )
   top_level = {k.split("/", 1)[0] for k in flat_keys}
   unknown = top_level - set(_ALL_VLM_GROUPS)
   assert not unknown, (
@@ -122,9 +223,11 @@ def get_trainable(
   if not freeze_lm:
     trainable_prefixes = [g for g in _ALL_VLM_GROUPS if g not in frozen_prefixes]
   elif txt_feature_layer == 0:
-    # Original behaviour: freeze all of lm_backbone.
+    # Freeze all of lm_backbone except optional loc-token embedding rows.
     frozen_prefixes.add("lm_backbone")
     trainable_prefixes = [g for g in _ALL_VLM_GROUPS if g not in frozen_prefixes]
+    if train_loc_embedding:
+      trainable_prefixes.append(_LOC_EMBEDDING_KEY)
   else:
     # Freeze only lm_backbone/embedder + lm_backbone/layer_0..N-1.
     # Remaining LM layers (N..last) and final_norm stay trainable.
@@ -143,6 +246,8 @@ def get_trainable(
         [g for g in _ALL_VLM_GROUPS if g not in (frozen_prefixes | {"lm_backbone"})]
         + trainable_lm_prefixes
     )
+    if train_loc_embedding:
+      trainable_prefixes.append(_LOC_EMBEDDING_KEY)
 
   trainable, frozen = extract_trainable_parameters(params, trainable_prefixes)
   assert frozen, "freeze was requested but no params were frozen"
@@ -155,6 +260,7 @@ def label_trainable_frozen_params(
     txt_feature_layer: int = 0,
     freeze_image_encoder: bool = False,
     image_prefix: str = "image_encoder",
+    train_loc_embeddings_when_lm_frozen: bool = True,
 ):
   """Label params for optimizer partitioning.
 
@@ -171,6 +277,7 @@ def label_trainable_frozen_params(
       freeze_lm=freeze_lm,
       txt_feature_layer=txt_feature_layer,
       freeze_image_encoder=freeze_image_encoder,
+      train_loc_embeddings_when_lm_frozen=train_loc_embeddings_when_lm_frozen,
   )
   frozen_keys = set(flatten_state_dict(frozen).keys()) if frozen else set()
   flat_params = flatten_state_dict(params)

@@ -1,0 +1,58 @@
+model:
+    arch: llava
+    lm_backbone_str: "gemma3_1B"
+    lm_checkpoint_variant: "it"
+    vision_tower_str: "openai/clip-vit-large-patch14-336"
+    vision_feature_layer: -2
+    vision_select_feature: "patch"
+    clip_input_format: "minus_one_to_one"
+    projector_type: "mlp2x_gelu"
+    projector_use_ln: False
+    attn_logits_soft_cap: 0.0
+    final_logit_softcap: 0.0
+    txt_feature_layer: 0
+    recon_loss_weight: 0.0
+
+dataset:
+    image_size: 336
+    max_txt_len: 512
+    resize_mode: stretch
+    num_workers: 16
+    prefetch_factor: 4
+    dataloader_timeout: 900
+
+training:
+    seed: 42
+    batch_size: 32
+    optimizer: adam
+    freeze_lm: False
+    freeze_image_encoder: True
+    vision_tower_from_scratch: False
+    clip_from_pt: True
+    hf_cache_dir: /dev/shm/huggingface
+    online_eval_tasks: []
+    final_eval_tasks: [vqav2, mme, textvqa, pope, refcocog, pixelbench, mmbench, gqa, vizwiz, scienceqa_img, seed_bench]
+
+sampling:
+    max_new_tokens: 64
+    beam_size: 5
+
+eval:
+    device_batch_size: 8
+    short_answer_max_new_tokens: 8
+    mmbench_max_txt_len: 512
+    mmbench_max_new_tokens: 8
+    online_vqav2_sample_fraction: 0.1
+
+load_from: /kmh-nfs-ssd-us-mount/logs/sqa/paligemma-baseline/20260601_032005_3g1urd_kmh-tpuvm-v5p-64-spot-llqt42lti_us-east5-a__b_lr_ep_eval
+load_from_pretrained: ""
+eval_only: True
+finetune: False
+sharding: hsdp
+
+logging:
+    use_wandb: True
+    wandb_project: "jax-llava"
+    wandb_entity: "sqa24-massachusetts-institute-of-technology"
+    wandb_tags: ["eval-only", "beam5", "u38ukpdo", "llava1.5"]
+    wandb_notes: "Eval-only beam search 5 for jax-llava run u38ukpdo checkpoint_7375; all stage2 final benchmark tasks."

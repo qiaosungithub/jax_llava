@@ -10,7 +10,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from utils.info_util import print_params
 from utils.optim_util import muon
 from utils.logging_util import log_for_0
-from utils.frozen_util import label_trainable_frozen_params
+from utils.frozen_util import label_trainable_frozen_params, zero_nonloc_embedding_rows
 from utils.pjit_util import MeshMode
 
 
@@ -140,6 +140,18 @@ def create_base_optimizer(config, lr_fn, weight_decay: float = 0.0, weight_decay
   return base_tx
 
 
+def _zero_nonloc_embedding_updates():
+  def init_fn(params):
+    del params
+    return optax.EmptyState()
+
+  def update_fn(updates, state, params=None):
+    del params
+    return zero_nonloc_embedding_rows(updates), state
+
+  return optax.GradientTransformation(init_fn, update_fn)
+
+
 def _build_optimizer(config, params):
   if config.eval_only:
     tx = optax.sgd(learning_rate=0.0)
@@ -158,6 +170,7 @@ def _build_optimizer(config, params):
   weight_decay = _get_weight_decay(config)
   exclude_bias_norm = bool(config.training.get("exclude_bias_norm_from_weight_decay", True))
   weight_decay_mask = _create_weight_decay_mask(params) if exclude_bias_norm else None
+  train_loc_embeddings_when_lm_frozen = bool(config.training.get('train_loc_embeddings_when_lm_frozen', True))
 
   tx_main = create_base_optimizer(config, normal_lr_fn, weight_decay=weight_decay, weight_decay_mask=weight_decay_mask)
   tx_siglip = create_base_optimizer(config, siglip_lr_fn, weight_decay=weight_decay, weight_decay_mask=weight_decay_mask)
@@ -167,6 +180,7 @@ def _build_optimizer(config, params):
       txt_feature_layer=int(config.model.get('txt_feature_layer', 0)),
       freeze_image_encoder=bool(config.training.get('freeze_image_encoder', False)),
       image_prefix='image_encoder',
+      train_loc_embeddings_when_lm_frozen=train_loc_embeddings_when_lm_frozen,
   )
   tx = optax.multi_transform(
       {
@@ -176,6 +190,8 @@ def _build_optimizer(config, params):
       },
       param_groups,
   )
+  if bool(config.training.get('freeze_lm', False)) and train_loc_embeddings_when_lm_frozen:
+    tx = optax.chain(tx, _zero_nonloc_embedding_updates())
   return tx, normal_lr_fn, siglip_lr_fn
 
 

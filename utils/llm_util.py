@@ -33,6 +33,10 @@ N_LOC = 1024   # coordinate bins, shared for x and y
 _LOC_BASE = 256001         # proto piece index of <unused99> → <loc0000>
 _LOC_UNUSED_OFFSET = 99    # <unusedX> where X = _LOC_UNUSED_OFFSET + loc_index
 
+LOC_TOKEN_START = _LOC_BASE
+LOC_TOKEN_COUNT = N_LOC
+LOC_TOKEN_END = LOC_TOKEN_START + LOC_TOKEN_COUNT
+
 
 @dataclasses.dataclass(frozen=True)
 class PaliGemma3Tokenizer(gm.text.Gemma3Tokenizer):
