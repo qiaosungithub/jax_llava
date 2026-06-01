@@ -294,15 +294,16 @@ def _make_global_batch(batch, partition_specs, mesh):
     )
 
 
-def _fake_batch(config, global_batch_size):
+def _fake_batch(config, global_batch_size, *, max_txt_len=None):
+    max_txt_len = int(config.dataset.max_txt_len if max_txt_len is None else max_txt_len)
     return {
         'pixel_values': jax.ShapeDtypeStruct(
             (global_batch_size, config.dataset.image_size, config.dataset.image_size, 3),
             jnp.float32,
         ),
-        'input_ids': jax.ShapeDtypeStruct((global_batch_size, config.dataset.max_txt_len), jnp.int32),
-        'attention_mask': jax.ShapeDtypeStruct((global_batch_size, config.dataset.max_txt_len), jnp.bool_),
-        'labels': jax.ShapeDtypeStruct((global_batch_size, config.dataset.max_txt_len), jnp.int32),
+        'input_ids': jax.ShapeDtypeStruct((global_batch_size, max_txt_len), jnp.int32),
+        'attention_mask': jax.ShapeDtypeStruct((global_batch_size, max_txt_len), jnp.bool_),
+        'labels': jax.ShapeDtypeStruct((global_batch_size, max_txt_len), jnp.int32),
         'prefix_len': jax.ShapeDtypeStruct((global_batch_size,), jnp.int32),
         'mask_token_category_probs': jax.ShapeDtypeStruct((global_batch_size, 7), jnp.float32),
     }
@@ -319,6 +320,11 @@ def _build_pjit_fns(config, model, state, mesh_bundle):
     mesh, get_partition_spec, _, reduce_scatter, pjit_compile = mesh_bundle
     state_spec = get_partition_spec(state, MeshMode.MODEL)
     batch_spec = get_partition_spec(_fake_batch(config, int(config.training.batch_size)), MeshMode.DATA)
+    mmbench_max_txt_len = int(getattr(config.eval, 'mmbench_max_txt_len', config.dataset.max_txt_len))
+    mmbench_batch_spec = get_partition_spec(
+        _fake_batch(config, int(config.training.batch_size), max_txt_len=mmbench_max_txt_len),
+        MeshMode.DATA,
+    )
 
     p_train_step = pjit_compile(
         partial(train_step, rng_init=random.PRNGKey(config.training.seed), config=config),
@@ -343,25 +349,24 @@ def _build_pjit_fns(config, model, state, mesh_bundle):
     )
     _attach_sample_metadata(p_sample_step, mesh, batch_spec, reduce_scatter)
 
-    # One shared short-answer sampler avoids compiling separate 8-token
-    # executables for VQA, yes/no, and multiple-choice evals.
-    short_answer_tokens = int(
-        getattr(
-            config.eval,
-            'short_answer_max_new_tokens',
-            getattr(config.eval, 'mmbench_max_new_tokens', 8),
-        )
-    )
-    short_answer_out_spec = get_partition_spec(
-        jax.ShapeDtypeStruct((int(config.training.batch_size), short_answer_tokens), jnp.int32),
+    # MMBench can need a longer prompt length than training/VQA prompts, so it
+    # gets its own input spec instead of reusing batch_spec['input_ids'].
+    mmbench_new_tokens = int(getattr(config.eval, 'mmbench_max_new_tokens', 8))
+    mmbench_out_spec = get_partition_spec(
+        jax.ShapeDtypeStruct((int(config.training.batch_size), mmbench_new_tokens), jnp.int32),
         MeshMode.DATA,
     )
     p_sample_step_mmbench = pjit_compile(
-        partial(sample_step, model=model, max_new_tokens=short_answer_tokens, beam_size=1),
-        in_shardings=(state_spec.params, batch_spec['pixel_values'], batch_spec['input_ids'], batch_spec['prefix_len']),
-        out_shardings=short_answer_out_spec,
+        partial(sample_step, model=model, max_new_tokens=mmbench_new_tokens, beam_size=1),
+        in_shardings=(
+            state_spec.params,
+            mmbench_batch_spec['pixel_values'],
+            mmbench_batch_spec['input_ids'],
+            mmbench_batch_spec['prefix_len'],
+        ),
+        out_shardings=mmbench_out_spec,
     )
-    _attach_sample_metadata(p_sample_step_mmbench, mesh, batch_spec, reduce_scatter)
+    _attach_sample_metadata(p_sample_step_mmbench, mesh, mmbench_batch_spec, reduce_scatter)
 
     return state_spec, batch_spec, p_train_step, p_sample_step, p_sample_step_mmbench
 

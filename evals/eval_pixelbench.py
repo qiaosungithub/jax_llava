@@ -151,7 +151,38 @@ def _safe_str(value):
     return str(value).strip()
 
 
+_OUTPUT_INSTRUCTION_MARKERS = (
+    "answer with",
+    "answer only",
+    "only answer",
+    "respond with",
+    "respond only",
+    "reply with",
+    "reply only",
+    "output only",
+    "return only",
+    "provide only",
+    "answer in",
+)
+
+
+def _has_output_instruction(text):
+    text = _safe_str(text).lower()
+    return any(marker in text for marker in _OUTPUT_INSTRUCTION_MARKERS)
+
+
+def _append_instruction_if_missing(question, instruction):
+    question = _safe_str(question).rstrip()
+    if _has_output_instruction(question):
+        return question + "\n"
+    return f"{question}\n{instruction}\n"
+
+
 def _build_prompt(row):
+    existing_prompt = _safe_str(row.get("prompt"))
+    if existing_prompt:
+        return existing_prompt.rstrip() + "\n"
+
     bench = row.get("benchmark", "")
     question = _safe_str(row.get("question"))
     if bench == "mmvp":
@@ -162,9 +193,11 @@ def _build_prompt(row):
         prompt += "\nAnswer with the option letter only.\n"
         return prompt
     if bench == "vstar":
-        if "answer with" in question.lower():
-            return question.rstrip() + "\n"
-        return question.rstrip() + "\nAnswer with the option letter only.\n"
+        return _append_instruction_if_missing(question, "Answer with the option letter only.")
+    if bench == "ocrbench":
+        return _append_instruction_if_missing(question, "Answer with the exact text or short phrase only.")
+    if bench == "countbenchqa":
+        return _append_instruction_if_missing(question, "Answer with a single number.")
     return question.rstrip() + "\n"
 
 
@@ -357,6 +390,7 @@ def _vis_record(item):
     return (
         f"benchmark: {item.get('benchmark', '')}\n"
         f"question: {item.get('question', '')}\n"
+        f"prompt: {item.get('prompt', '')}\n"
         f"prediction: {item.get('prediction', '')}\n"
         f"answer: {item.get('answer', '')}\n"
         f"score: {item.get('score', '')}"

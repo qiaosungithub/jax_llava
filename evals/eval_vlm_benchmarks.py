@@ -419,11 +419,13 @@ class WDSUnderstandingEvalDataset(IterableDataset):
         pad_len = self.max_len - eff_len
         pad_id = self.tokenizer.special_tokens.PAD
         input_ids = ids[:eff_len] + [pad_id] * pad_len
+        aux = dict(item.get("aux") or {})
+        aux["prompt"] = prompt
         return {
             "pixel_values": pixel_values,
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "prefix_len": torch.tensor(eff_len, dtype=torch.int32),
-            "aux": item.get("aux", {}),
+            "aux": aux,
         }
 
 
@@ -536,7 +538,10 @@ def _merge_and_score(
 
 
 def _vis_row(row: Dict[str, Any]) -> str:
-    lines = [f"question: {row.get('question', '')}", f"prediction: {row.get('prediction', '')}"]
+    lines = [f"question: {row.get('question', '')}"]
+    if row.get("prompt"):
+        lines.append(f"prompt: {row.get('prompt', '')}")
+    lines.append(f"prediction: {row.get('prediction', '')}")
     if row.get("answers"):
         lines.append(f"gt_answers: {row.get('answers')}")
     if row.get("choices"):

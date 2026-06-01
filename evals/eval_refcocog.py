@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw
 from jax.experimental import multihost_utils as mu
 from torch.utils.data import DataLoader, Dataset, Sampler
 
-from input_pipeline import LetterboxPadTransform, get_transforms, prepare_batch_data
+from input_pipeline import LetterboxPadTransform, format_detection_prompt, get_transforms, prepare_batch_data
 from utils.logging_util import log_for_0, log_for_all
 from utils.eval_io_util import ensure_eval_result_base_dir, eval_result_prefix
 
@@ -434,7 +434,7 @@ def preprocess_refcocog_sample(sample, transform, tokenizer, max_len):
     if not phrase:
         return None
 
-    prompt = f"Locate the region described by this phrase: {phrase}\n"
+    prompt = format_detection_prompt(phrase)
     ids = tokenizer.encode(prompt, add_bos=True, add_eos=False)
     eff_len = min(len(ids), max_len)
     pad_len = max_len - eff_len
@@ -444,6 +444,7 @@ def preprocess_refcocog_sample(sample, transform, tokenizer, max_len):
     prefix_len = torch.tensor(eff_len, dtype=torch.int32)
 
     aux = dict(sample.get("aux", {}))
+    aux["prompt"] = prompt
     aux["img_w"] = int(img_w)
     aux["img_h"] = int(img_h)
     aux["vis_image"] = np.asarray(image, dtype=np.uint8)
@@ -612,6 +613,7 @@ def eval_refcocog(p_sample_step, run_p_sample_step, model, tokenizer, params, co
                 "id": aux["id"],
                 "phrase": aux["phrase"],
                 "image": aux["image"],
+                "prompt": aux.get("prompt", ""),
                 "pred_text": out_str,
                 "pred_bbox_xyxy": pred_xyxy,
                 "gt_bbox_xyxy": aux["gt_bbox_xyxy"],
@@ -671,6 +673,7 @@ def eval_refcocog(p_sample_step, run_p_sample_step, model, tokenizer, params, co
     sample_texts = [
         (
             f"phrase: {o['phrase']}\n"
+            f"prompt: {o.get('prompt', '')}\n"
             f"pred: {o['pred_text']}\n"
             f"pred_box: {o['pred_bbox_xyxy']}\n"
             f"gt_box: {o['gt_bbox_xyxy']}\n"

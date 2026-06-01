@@ -119,6 +119,8 @@ def preprocess_textvqa_sample(sample, transform, tokenizer, max_len):
 
     prompt = _format_vqa_prompt(question)
     ids = tokenizer.encode(prompt, add_bos=True, add_eos=False)
+    aux = dict(sample.get("aux") or {})
+    aux["prompt"] = prompt
 
     eff_len = min(len(ids), max_len)
     pad_len = max_len - eff_len
@@ -136,7 +138,7 @@ def preprocess_textvqa_sample(sample, transform, tokenizer, max_len):
         "pixel_values": pixel_values,
         "input_ids": input_ids,
         "prefix_len": prefix_len,
-        "aux": sample.get("aux"),
+        "aux": aux,
     }
 
 
@@ -327,6 +329,7 @@ def eval_textvqa(p_sample_step, run_p_sample_step, model, tokenizer, params, con
             ALL_OUTS.append({
                 "question_id": aux["question_id"],
                 "question": aux.get("question", ""),
+                "prompt": aux.get("prompt", ""),
                 "answer": out_str,
                 "answers": aux.get("answers", []),
             })
@@ -392,6 +395,7 @@ def eval_textvqa(p_sample_step, run_p_sample_step, model, tokenizer, params, con
 def vis_qa(o):
     return (
         f'question: {o.get("question", "")}\n'
+        f'prompt: {o.get("prompt", "")}\n'
         f'answer: {o.get("answer", "")}\n'
         f'gt_answers: {o.get("answers", [])}'
     )

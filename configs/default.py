@@ -33,6 +33,13 @@ def get_config():
     # Keep custom QA/region loaders from reading huge buffers before first yield.
     dataset.item_shuffle_size = ml_collections.ConfigDict()
     dataset.item_shuffle_size.default = 512
+    dataset.item_shuffle_size.llava_ov15 = 50000
+    # 0 means use all Visual Genome region annotations for genome_det.
+    # LLaVA-1.5-style SFT configs override this to 10.
+    dataset.genome_det_regions_per_image = 0
+    # Optional per-dataset startup skip for iterable WebDataset streams.
+    dataset.stream_start_skip = ml_collections.ConfigDict()
+    dataset.stream_start_skip.default = 0
     # 0 keeps PyTorch's default; remote configs can set this to fail fast.
     dataset.dataloader_timeout = 0
 
@@ -171,7 +178,7 @@ def get_config():
     eval.pope_dataset = "coco"
     eval.pope_image_root = "/kmh-nfs-ssd-us-mount/code/hanhong/shared/COCO/val2014"
     eval.pope_splits = ["random", "popular", "adversarial"]
-    eval.pope_prompt_template = "{question}\n"
+    eval.pope_prompt_template = "{question}\nPlease answer yes or no.\n"
     eval.mmbench_prompt_prefix = ""
     eval.pope_cache_dir = "/kmh-nfs-ssd-us-mount/data/cached/zhh/pope_eval"
     eval.refcocog_root = "/kmh-nfs-ssd-us-mount/code/hanhong/shared/refcocog/val.json"
@@ -188,6 +195,9 @@ def get_config():
     eval.mmbench_cache_dir = "/kmh-nfs-ssd-us-mount/data/cached/zhh/mmbench_eval"
     eval.mmbench_data_cache_dir = "/kmh-nfs-ssd-us-mount/data/cached/zhh/mmbench_data"
     eval.mmbench_export_test = False
+    # MMBench prompts can be much longer than short VQA prompts. This is eval-only
+    # and uses the short-answer sampler, so it does not change train sequence length.
+    eval.mmbench_max_txt_len = 512
     eval.short_answer_max_new_tokens = 8
     eval.mmbench_max_new_tokens = 8
     # Online VQAv2 is too expensive at full val scale; final eval still uses
@@ -215,6 +225,12 @@ def get_config():
     eval.knn_val_examples = None
     eval.knn_batch_size = 256
     eval.knn_num_workers = 4
+    # Fit PCA whitening on KNN train/reference features, apply to train+val,
+    # then run the usual L2-normalized cosine KNN.  0 keeps all feature dims.
+    eval.knn_pca_whitening = True
+    eval.knn_pca_whitening_eps = 1e-5
+    eval.knn_pca_whitening_dim = 0
+    eval.knn_pca_whitening_batch_size = 65536
 
     config.finetune = False  # set to True in remote_run_config.yml to load finetune_config.yml
 

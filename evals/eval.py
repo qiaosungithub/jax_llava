@@ -25,31 +25,6 @@ from utils import vis_util
 
 
 _RUN_ID_BUF_SIZE = 128
-SHORT_ANSWER_TASKS = {
-    "vqav2",
-    "mme",
-    "textvqa",
-    "gqa",
-    "vizwiz",
-    "scienceqa",
-    "scienceqa_img",
-    "scienceqa-img",
-    "sciqa",
-    "sciqa_img",
-    "seed",
-    "seed_bench",
-    "seed-bench",
-    "seed_bench_image",
-    "seed-bench-image",
-    "pope",
-    "mmbench",
-    "refcocog",
-    "mmvp",
-    "v*",
-    "vstar",
-    "countbench",
-    "countbenchqa",
-}
 
 
 def _broadcast_string_from_source(value, is_source):
@@ -97,11 +72,10 @@ def run_eval_tasks(
         t = str(task).strip().lower()
         if not t:
             continue
-        short_sample_fn = (
-            p_sample_step_mmbench
-            if p_sample_step_mmbench is not None and t in SHORT_ANSWER_TASKS
-            else p_sample_fn
-        )
+        # MMBench has a separate compiled sampler with a longer prompt length.
+        # Other short-answer tasks use the regular sampler so their prompt shape
+        # stays tied to config.dataset.max_txt_len.
+        short_sample_fn = p_sample_fn
 
         if t == "knn_partial":
             knn_data_dir = None

@@ -21,6 +21,14 @@ dataset_name_to_path_dict = {
     'visual-genome-gcap':'gs://kmh-gcp-💣/data/visual_genome/wds/shard-{000000..000040}.tar',
     'visual-genome-det': 'gs://kmh-gcp-💣/data/visual_genome/wds/shard-{000000..000040}.tar',
     'vqav2':             'gs://kmh-gcp-💣/data/vqav2/vqav2_image_records_wds/train2014/shard-{000000..000008}.tar',
+    'okvqa':             'gs://kmh-gcp-💣/data/okvqa/train/shard-{000000..000004}.tar',
+    'okvqa-train':       'gs://kmh-gcp-💣/data/okvqa/train/shard-{000000..000004}.tar',
+    'aokvqa':            'gs://kmh-gcp-💣/data/aokvqa/train/shard-{000000..000008}.tar',
+    'aokvqa-train':      'gs://kmh-gcp-💣/data/aokvqa/train/shard-{000000..000008}.tar',
+    'ocrvqa':            'gs://kmh-gcp-💣/data/ocrvqa/train/shard-{000000..000083}.tar',
+    'ocrvqa-train':      'gs://kmh-gcp-💣/data/ocrvqa/train/shard-{000000..000083}.tar',
+    'refcoco':           'gs://kmh-gcp-💣/data/refcoco/train/shard-{000000..000008}.tar',
+    'refcoco-train':     'gs://kmh-gcp-💣/data/refcoco/train/shard-{000000..000008}.tar',
     'gqa':               'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/gqa-balanced/train/shard-{000000..000036}.tar',
     'gqa-train':         'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/gqa-balanced/train/shard-{000000..000036}.tar',
     'gqa-val':           'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/gqa-balanced/val/shard-{000000..000005}.tar',
@@ -44,6 +52,8 @@ dataset_name_to_path_dict = {
     'llava-1.5':         'gs://kmh-gcp-💣/data/llava-v1-5-mix665k/shards/llava_v1_5_mix665k-{000000..000003}.tar',
     'llava-ov-1.5-instruct': 'gs://kmh-gcp-💣/data/llava-ov-1.5-instruct/configs/*/shard-*.tar',
     'llava-ov1.5':       'gs://kmh-gcp-💣/data/llava-ov-1.5-instruct/configs/*/shard-*.tar',
+    'llava-ov-1.5-instruct-image-shuffled-v1': 'gs://kmh-gcp-💣/data/llava-ov-1.5-instruct-image-shuffled-v1/part-*/shard-*.tar',
+    'llava-ov-1.5-instruct-image-shuffled-v1-pilot': 'gs://kmh-gcp-💣/data/llava-ov-1.5-instruct-image-shuffled-v1-pilot/shard-*.tar',
 }
 
 # Default dataset_type for each named dataset.
@@ -59,6 +69,14 @@ dataset_name_to_type_dict = {
     'visual-genome-gcap':'genome_gcap',
     'visual-genome-det': 'genome_det',
     'vqav2':             'vqav2',
+    'okvqa':             'okvqa',
+    'okvqa-train':       'okvqa',
+    'aokvqa':            'aokvqa',
+    'aokvqa-train':      'aokvqa',
+    'ocrvqa':            'ocrvqa',
+    'ocrvqa-train':      'ocrvqa',
+    'refcoco':           'refcoco',
+    'refcoco-train':     'refcoco',
     'gqa':               'gqa',
     'gqa-train':         'gqa',
     'gqa-val':           'gqa',
@@ -78,6 +96,8 @@ dataset_name_to_type_dict = {
     'llava-1.5':         'llava15',
     'llava-ov-1.5-instruct': 'llava_ov15',
     'llava-ov1.5':       'llava_ov15',
+    'llava-ov-1.5-instruct-image-shuffled-v1': 'llava_ov15',
+    'llava-ov-1.5-instruct-image-shuffled-v1-pilot': 'llava_ov15',
 }
 
 

@@ -177,6 +177,8 @@ def preprocess_pope_sample(sample, transform, tokenizer, max_len, prompt_templat
 
     prompt = _format_prompt(prompt_template, question)
     ids = tokenizer.encode(prompt, add_bos=True, add_eos=False)
+    aux = dict(sample.get("aux") or {})
+    aux["prompt"] = prompt
 
     eff_len = min(len(ids), max_len)
     pad_len = max_len - eff_len
@@ -194,7 +196,7 @@ def preprocess_pope_sample(sample, transform, tokenizer, max_len, prompt_templat
         "pixel_values": pixel_values,
         "input_ids": input_ids,
         "prefix_len": prefix_len,
-        "aux": sample.get("aux"),
+        "aux": aux,
     }
 
 
@@ -335,6 +337,7 @@ def vis_pope_qa(o):
     return (
         f"split: {o.get('split', '')}\n"
         f"question: {o.get('question', '')}\n"
+        f"prompt: {o.get('prompt', '')}\n"
         f"answer: {o.get('pred_answer_raw', '')}\n"
         f"gt_answer: {o.get('gt_answer_norm', '')}"
     )
@@ -429,6 +432,7 @@ def eval_pope(p_sample_step, run_p_sample_step, model, tokenizer, params, config
                     "question_id": aux.get("question_id", -1),
                     "image": aux.get("image", ""),
                     "question": aux.get("question", ""),
+                    "prompt": aux.get("prompt", ""),
                     "pred_answer_raw": out_str,
                     "pred_answer_norm": pred_norm,
                     "gt_answer_norm": gt_norm,

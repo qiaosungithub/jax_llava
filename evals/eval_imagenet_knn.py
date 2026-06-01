@@ -535,6 +535,101 @@ def _allgather_feats(
 
 # ── KNN evaluation (process 0 only) ──────────────────────────────────────────
 
+def _config_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _pca_whiten_features(
+    train_feats: np.ndarray,
+    val_feats: np.ndarray,
+    *,
+    eps: float = 1e-5,
+    keep_dim: Optional[int] = None,
+    batch_size: int = 65536,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fit PCA whitening on train features and apply it to train/val features.
+
+    The transform is fitted only on the KNN reference/train set to avoid using
+    validation distribution information.  Both sets then get:
+
+        (x - train_mean) @ eigvecs / sqrt(eigvals + eps)
+
+    The downstream KNN code still L2-normalizes before cosine similarity.
+    """
+    train_feats = np.asarray(train_feats, dtype=np.float32)
+    val_feats = np.asarray(val_feats, dtype=np.float32)
+    n_train, dim = train_feats.shape
+    if n_train < 2 or dim == 0:
+        log_for_0("[KNN] Skip PCA whitening: need at least two train features.")
+        return train_feats, val_feats
+
+    keep_dim = dim if keep_dim is None or int(keep_dim) <= 0 else min(int(keep_dim), dim)
+    batch_size = max(int(batch_size), 1)
+    t0 = time.time()
+    log_for_0(
+        f"[KNN] Fitting PCA whitening on train feats: n={n_train:,}, dim={dim}, "
+        f"keep_dim={keep_dim}, eps={eps:g}, cov_batch={batch_size}"
+    )
+
+    mean = train_feats.mean(axis=0, dtype=np.float64)
+    cov = np.zeros((dim, dim), dtype=np.float64)
+    for start in range(0, n_train, batch_size):
+        chunk = train_feats[start : start + batch_size].astype(np.float64, copy=False)
+        chunk = chunk - mean
+        cov += chunk.T @ chunk
+    cov /= max(n_train - 1, 1)
+
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    order = np.argsort(eigvals)[::-1]
+    eigvals = eigvals[order][:keep_dim]
+    eigvecs = eigvecs[:, order][:, :keep_dim]
+    projection = eigvecs * (1.0 / np.sqrt(np.maximum(eigvals, 0.0) + float(eps)))[None, :]
+
+    log_for_0(
+        f"[KNN] PCA whitening eigvals: max={float(eigvals[0]):.6g}, "
+        f"median={float(np.median(eigvals)):.6g}, min_kept={float(eigvals[-1]):.6g}"
+    )
+
+    def _transform(feats: np.ndarray, name: str) -> np.ndarray:
+        can_write_in_place = keep_dim == feats.shape[1] and feats.dtype == np.float32
+        if can_write_in_place:
+            out = feats
+        else:
+            out = np.empty((feats.shape[0], keep_dim), dtype=np.float32)
+        for start in range(0, feats.shape[0], batch_size):
+            chunk = feats[start : start + batch_size].astype(np.float64, copy=False)
+            chunk = chunk - mean
+            out[start : start + batch_size] = (chunk @ projection).astype(np.float32)
+        log_for_0(f"[KNN] PCA-whitened {name} feats: {out.shape}")
+        return out
+
+    train_w = _transform(train_feats, "train")
+    val_w = _transform(val_feats, "val")
+    log_for_0(f"[KNN] PCA whitening finished in {time.time()-t0:.1f}s")
+    return train_w, val_w
+
+
+def _maybe_apply_knn_feature_transform(
+    train_feats: np.ndarray,
+    val_feats: np.ndarray,
+    config,
+) -> tuple[np.ndarray, np.ndarray]:
+    if not _config_bool(config.eval.get("knn_pca_whitening", True), default=True):
+        log_for_0("[KNN] PCA whitening disabled; using raw features + L2 norm.")
+        return train_feats, val_feats
+    return _pca_whiten_features(
+        train_feats,
+        val_feats,
+        eps=float(config.eval.get("knn_pca_whitening_eps", 1e-5)),
+        keep_dim=config.eval.get("knn_pca_whitening_dim", 0),
+        batch_size=int(config.eval.get("knn_pca_whitening_batch_size", 65536)),
+    )
+
+
 def _knn_accuracy_jax(
     train_feats:  np.ndarray,   # (N_train, D)
     train_labels: np.ndarray,   # (N_train,)
@@ -712,6 +807,13 @@ def eval_imagenet_knn(
     )
     log_for_0(f"[KNN] Val feats gathered: {val_feats.shape}")
     mu.sync_global_devices("knn_val_features_gathered")
+
+    train_feats, val_feats = _maybe_apply_knn_feature_transform(
+        train_feats,
+        val_feats,
+        config,
+    )
+    mu.sync_global_devices("knn_feature_transform_done")
 
     # Every host runs the same JAX KNN program.  Running JAX only on process 0
     # can desynchronize multi-controller TPU programs after HSDP feature

@@ -25,11 +25,18 @@ dataset:
     dataloader_timeout: 900
     item_shuffle_size:
         default: 512
-        llava_ov15: 512
+        llava_ov15: 50000
         vqav2: 512
+        okvqa: 512
+        aokvqa: 512
+        ocrvqa: 512
         gqa: 512
         textvqa: 512
         genome: 512
+        genome_det: 512
+        refcoco: 512
+    # LLaVA-1.5 samples 10 Visual Genome region annotations per image.
+    genome_det_regions_per_image: 10
 
 training:
     curriculum: llava15_two_stage # train 2 stages together.
@@ -60,7 +67,8 @@ training:
         dataset:
             max_txt_len: 64
         dataset_items:
-            - blip3o-short
+            # - blip3o-short
+            - cc12m
         mix_weights: [1]
         batch_size: 256
         freeze_lm: True
@@ -83,16 +91,24 @@ training:
         dataset:
             max_txt_len: 512
         dataset_items:
-            - llava-ov-1.5-instruct
+            - llava-ov-1.5-instruct-image-shuffled-v1
             - vqav2
+            - okvqa-train
+            - aokvqa-train
+            - ocrvqa-train
             - gqa-train
             - textcaps-train
             - visual-genome
+            - visual-genome-det
+            - refcoco-train
         # Approximate current loader sample units in millions:
-        # LLaVA-OV1.5 22M, VQAv2 ~0.4M QA, GQA train ~0.94M QA,
-        # TextCaps ~0.022M captions, Visual Genome ~1.7M QA.
-        # TODO: implement LLaVA-1.5-style per-image QA conversation merging for exact 665K counts.
-        mix_weights: [22, 0.4, 0.94, 0.022, 1.7]
+        # LLaVA-OV1.5 22M, VQAv2 ~0.4M QA, OKVQA ~0.009M QA,
+        # A-OKVQA ~0.068M MC-augmented QA, OCRVQA sampled as ~0.08M QA,
+        # GQA train ~0.94M QA,
+        # TextCaps ~0.022M captions, Visual Genome ~1.7M QA,
+        # Visual Genome detection ~0.86M phrase-to-box samples after 10 regions/image,
+        # RefCOCO ~0.048M phrase-to-box samples.
+        mix_weights: [22, 0.4, 0.009, 0.068, 0.08, 0.94, 0.022, 1.7, 0.86, 0.048]
         batch_size: 128
         freeze_lm: False
         freeze_image_encoder: True
@@ -104,8 +120,8 @@ training:
         warmup_steps: 156
         lr_schedule: cos
         sample_per_step: 200
-        online_eval_per_step: 750
-        online_eval_tasks: [vqav2, mme, textvqa, pope, refcocog, pixelbench, gqa, vizwiz, scienceqa_img, seed_bench]
+        online_eval_per_step: 1200
+        online_eval_tasks: [vqav2, mme, textvqa, refcocog, pixelbench, gqa, vizwiz, scienceqa_img, seed_bench]
         final_eval_tasks: [vqav2, mme, textvqa, pope, refcocog, pixelbench, mmbench, gqa, vizwiz, scienceqa_img, seed_bench]
 
 sampling:
@@ -124,12 +140,12 @@ sharding: hsdp
 
 # Continue the original LLaVA curriculum run from the last complete checkpoint
 # before window 7034 hit the old topology-specific Orbax restore bug.
-load_from: /kmh-nfs-ssd-us-mount/logs/sqa/paligemma-baseline/20260530_031225_726dru_kmh-tpuvm-v5p-64-spot-keya-lax60d_us-central1-a__b_lr_ep_eval
-wandb_resume_id: q043krc3
+# load_from: /kmh-nfs-ssd-us-mount/logs/sqa/paligemma-baseline/20260530_031225_726dru_kmh-tpuvm-v5p-64-spot-keya-lax60d_us-central1-a__b_lr_ep_eval
+# wandb_resume_id: q043krc3
 
 logging:
     use_wandb: True
     wandb_project: "jax-llava"
     wandb_entity: "sqa24-massachusetts-institute-of-technology"
     wandb_tags: ["llava1.5", "curriculum", "hsdp"]
-    wandb_notes: "[init] LLaVA-1.5 two-stage curriculum using jit/HSDP. Stage-1 blip3o-short, stage-2 LLaVA-OV-1.5-Instruct plus VQAv2/GQA/TextCaps/Visual Genome QA."
+    wandb_notes: "[cc12m pretrain] LLaVA-1.5 reproduction two-stage curriculum using jit/HSDP. Stage-1 cc12m, stage-2 LLaVA-OV-1.5-Instruct plus VQAv2/OKVQA/A-OKVQA/OCRVQA/GQA/TextCaps/Visual Genome QA, VG detection, and RefCOCO grounding."

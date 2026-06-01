@@ -113,6 +113,8 @@ def preprocess_mme_sample(sample, transform, tokenizer, max_len):
     prefix = f"{question}\n"
     full_ids = tokenizer.encode(prefix, add_bos=True, add_eos=False)
     prefix_len = min(len(full_ids), max_len)
+    aux = dict(sample.get("aux") or {})
+    aux["prompt"] = prefix
 
     cur_len = len(full_ids)
     pad_len = max_len - cur_len
@@ -134,7 +136,7 @@ def preprocess_mme_sample(sample, transform, tokenizer, max_len):
         "attention_mask": attention_mask,
         "labels": labels,
         "prefix_len": prefix_len,
-        "aux": sample.get("aux"),
+        "aux": aux,
     }
 
 
@@ -287,6 +289,7 @@ def score_mme(all_results):
 def vis_mme_qa(o):
     return (
         f'question: {o.get("question", "")}\n'
+        f'prompt: {o.get("prompt", "")}\n'
         f'answer: {o.get("pred_answer", "")}\n'
         f'gt_answer: {o.get("gt_answer", "")}'
     )
@@ -335,6 +338,7 @@ def eval_mme(p_sample_step, run_p_sample_step, model, tokenizer, params, config)
                     "question_id": aux["question_id"],
                     "category": aux["category"],
                     "question": aux["question"],
+                    "prompt": aux.get("prompt", ""),
                     "gt_answer": aux["answer"],
                     "pred_answer": out_str,
                 }
@@ -344,6 +348,7 @@ def eval_mme(p_sample_step, run_p_sample_step, model, tokenizer, params, config)
                     vis_mme_qa(
                         {
                             "question": aux["question"],
+                            "prompt": aux.get("prompt", ""),
                             "pred_answer": out_str,
                             "gt_answer": aux["answer"],
                         }

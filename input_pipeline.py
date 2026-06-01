@@ -111,6 +111,17 @@ _GCAP_REGION_PROMPTS = [
     "Give a short caption for region {loc}.",
 ]
 
+_DETECTION_PROMPT_SUFFIX = (
+    "Output exactly four location tokens, indicating up, left, down, right."
+)
+_MC_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def format_detection_prompt(phrase: str) -> str:
+    phrase = (phrase or "").strip()
+    return f"Locate the region described by this phrase: {phrase}\n{_DETECTION_PROMPT_SUFFIX}\n"
+
+
 _OCR_TEXT_PROMPTS = [
     "Read the text in this image.",
     "Transcribe the visible text from this image.",
@@ -154,6 +165,33 @@ def _sample_qa_prompt(question: str) -> str:
     return random.choice(templates).format(question=qline)
 
 
+_SHORT_ANSWER_FORMAT_PROMPT = "Answer the question using a single word or phrase."
+
+
+def _format_short_answer_qa_prompt(question: str) -> str:
+    qline = _ensure_question_line(question)
+    if not qline:
+        return ""
+    return f"{qline}\n{_SHORT_ANSWER_FORMAT_PROMPT}"
+
+
+def _format_multiple_choice_prompt(question: str, choices) -> str:
+    qline = _ensure_question_line(question)
+    if not qline:
+        return ""
+    lines = [qline]
+    for idx, choice in enumerate(choices or []):
+        if idx >= len(_MC_LETTERS):
+            break
+        text = str(choice).strip()
+        if text:
+            lines.append(f"{_MC_LETTERS[idx]}. {text}")
+    if len(lines) <= 1:
+        return ""
+    lines.append("Answer with the option's letter from the given choices directly.")
+    return "\n".join(lines)
+
+
 _MASK_TOKEN_VALUES = np.array([4, 8, 16, 32, 64, 128, 256], dtype=np.int32)
 _MASK_EPS = 1e-6
 
@@ -161,10 +199,12 @@ _MASK_EPS = 1e-6
 def _dataset_type_to_mask_category(dataset_type: str) -> str:
     if dataset_type in {
         "vqav2",
+        "okvqa",
+        "aokvqa",
+        "ocrvqa",
         "genome",
         "gqa",
         "llava15",
-        "llava150k",
         "llava_ov15",
         "textvqa",
         "tallyqa",
@@ -173,7 +213,7 @@ def _dataset_type_to_mask_category(dataset_type: str) -> str:
         return "vqa"
     if dataset_type in {"rendered_text", "textcaps"}:
         return "ocr"
-    if dataset_type in {"genome_gcap", "genome_det"}:
+    if dataset_type in {"genome_gcap", "genome_det", "refcoco"}:
         return "grounded_caption"
     return "caption"
 
@@ -239,15 +279,34 @@ def _build_mask_category_distribution(dataset_config, dataset_type: str) -> torc
     return torch.tensor(probs, dtype=torch.float32)
 
 
-def _item_shuffle_size(dataset_config, dataset_type: str, default: int) -> int:
-    value = getattr(dataset_config, "item_shuffle_size", None)
-    if value is None:
-        value = getattr(dataset_config, "shuffle_buffer_size", None)
+def _dataset_config_int(dataset_config, field: str, dataset_type: str, default: int) -> int:
+    value = getattr(dataset_config, field, None)
     if value is None:
         return int(default)
     if hasattr(value, "get") and not isinstance(value, (str, bytes)):
         value = value.get(dataset_type, value.get("default", default))
     return max(1, int(value))
+
+
+def _item_shuffle_size(dataset_config, dataset_type: str, default: int) -> int:
+    value = getattr(dataset_config, "item_shuffle_size", None)
+    if value is not None:
+        return _dataset_config_int(dataset_config, "item_shuffle_size", dataset_type, default)
+    value = getattr(dataset_config, "shuffle_buffer_size", None)
+    if value is None:
+        return int(default)
+    if hasattr(value, "get") and not isinstance(value, (str, bytes)):
+        value = value.get(dataset_type, value.get("default", default))
+    return max(1, int(value))
+
+
+def _stream_start_skip(dataset_config, dataset_type: str) -> int:
+    value = getattr(dataset_config, "stream_start_skip", None)
+    if value is None:
+        return 0
+    if hasattr(value, "get") and not isinstance(value, (str, bytes)):
+        value = value.get(dataset_type, value.get("default", 0))
+    return max(0, int(value))
 
 
 def _decode_image_if_needed(image):
@@ -502,7 +561,7 @@ def _box_to_loc_tokens(transform, x, y, w, h, img_w, img_h):
 
 
 def _get_text_from_sample(sample, dataset_type):
-    if dataset_type in {"llava150k", "llava15", "llava_ov15"}:
+    if dataset_type in {"llava15", "llava_ov15"}:
         raw = sample.get("json")
         if raw is None:
             return ("", "")
@@ -590,12 +649,13 @@ def preprocess_fn(
         if image is None:
             return None
         image = _decode_image_if_needed(image)
+        orig_w, orig_h = image.size
         pixel_values = transform(image)
     except Exception:
         return None
 
     text_out = _get_text_from_sample(sample, dataset_type)
-    if dataset_type in {"llava150k", "llava15"}:
+    if dataset_type in {"llava15"}:
         question_part = (sample.get("question", "") or "").strip()
         answer_part = (sample.get("aux", {}) or {}).get("answer", "")
         answer_part = "" if answer_part is None else str(answer_part).strip()
@@ -625,12 +685,12 @@ def preprocess_fn(
         prefix = _sample_caption_prompt("rendered_text") + "\n"
         full_text = f"{prefix}{caption}"
         prefix_tokens = tokenizer.encode(prefix, add_bos=True, add_eos=False)
-    elif dataset_type in {"vqav2", "gqa"}:
+    elif dataset_type in {"vqav2", "gqa", "okvqa", "ocrvqa"}:
         question = (sample.get("question", "") or "").strip()
         if not question:
             log_for_0(f'question is empty')
             return None
-        prompt = _sample_qa_prompt(question)
+        prompt = _format_short_answer_qa_prompt(question)
         if not prompt:
             return None
         prefix = f"{prompt}\n"
@@ -642,11 +702,40 @@ def preprocess_fn(
         answer = random.choice(answers)
         full_text = f"{prefix}{answer}"
         prefix_tokens = tokenizer.encode(prefix, add_bos=True, add_eos=False)
+    elif dataset_type == "aokvqa":
+        question = (sample.get("question", "") or "").strip()
+        if not question:
+            return None
+        aux = sample.get("aux", None) or {}
+        if aux.get("task") == "multiple_choice":
+            choices = aux.get("choices", [])
+            answer = (aux.get("answer", "") or "").strip()
+            prompt = _format_multiple_choice_prompt(question, choices)
+            if not prompt or not answer:
+                return None
+            prefix = f"{prompt}\n"
+            full_text = f"{prefix}{answer}"
+            prefix_tokens = tokenizer.encode(prefix, add_bos=True, add_eos=False)
+        else:
+            prompt = _format_short_answer_qa_prompt(question)
+            if not prompt:
+                return None
+            prefix = f"{prompt}\n"
+            answers = [
+                str(a).strip()
+                for a in aux.get("answers", [])
+                if str(a).strip()
+            ]
+            if not answers:
+                return None
+            answer = random.choice(answers)
+            full_text = f"{prefix}{answer}"
+            prefix_tokens = tokenizer.encode(prefix, add_bos=True, add_eos=False)
     elif dataset_type in {"textvqa", "tallyqa", "dvqa"}:
         question = (sample.get("question", "") or "").strip()
         if not question:
             return None
-        prompt = _sample_qa_prompt(question)
+        prompt = _format_short_answer_qa_prompt(question)
         if not prompt:
             return None
         prefix = f"{prompt}\n"
@@ -670,7 +759,7 @@ def preprocess_fn(
         answer = (aux.get("answer", "") or "").strip()
         if not answer:
             return None
-        prompt = _sample_qa_prompt(question)
+        prompt = _format_short_answer_qa_prompt(question)
         if not prompt:
             return None
         prefix = f"{prompt}\n"
@@ -719,7 +808,20 @@ def preprocess_fn(
         loc = _box_to_loc_tokens(transform, x, y, w, h, img_w, img_h)
         if loc is None:
             return None
-        prefix = f"Locate the region described by this phrase: {phrase}\n"
+        prefix = format_detection_prompt(phrase)
+        full_text = f"{prefix}{loc}"
+        prefix_tokens = tokenizer.encode(prefix, add_bos=True, add_eos=False)
+    elif dataset_type == "refcoco":
+        phrase = (sample.get("phrase") or "").strip()
+        bbox = sample.get("bbox", [])
+        if not phrase or not bbox or len(bbox) < 4:
+            return None
+        img_w = sample.get("img_w") or orig_w or 1
+        img_h = sample.get("img_h") or orig_h or 1
+        loc = _box_to_loc_tokens(transform, bbox[0], bbox[1], bbox[2], bbox[3], img_w, img_h)
+        if loc is None:
+            return None
+        prefix = format_detection_prompt(phrase)
         full_text = f"{prefix}{loc}"
         prefix_tokens = tokenizer.encode(prefix, add_bos=True, add_eos=False)
     elif dataset_type == "textcaps":
@@ -816,6 +918,74 @@ def expand_vqa_sample(sample):
     return out
 
 
+def expand_aokvqa_sample(sample):
+    """Expand grouped A-OKVQA records into 4-way MC training items.
+
+    The uploaded storage keeps one record per image. LLaVA-1.5 reports the
+    A-OKVQA SFT scale after multiple-choice augmentation, so each valid QA is
+    emitted four times with a deterministic cyclic rotation of the choices.
+    The target is the correct option letter after rotation.
+    """
+    j = sample.get("json")
+    if j is None:
+        return []
+    if isinstance(j, bytes):
+        j = json.loads(j.decode("utf-8"))
+    qas = j.get("qas", [])
+    img = sample.get("jpg") or sample.get("jpeg") or sample.get("png") or sample.get("webp")
+    if img is None or not qas:
+        return []
+
+    out = []
+    for qa in qas:
+        question = (qa.get("question", "") or "").strip()
+        choices = [str(x).strip() for x in qa.get("choices", []) if str(x).strip()]
+        correct_idx = qa.get("correct_choice_idx")
+        try:
+            correct_idx = int(correct_idx)
+        except (TypeError, ValueError):
+            correct_idx = -1
+
+        if question and len(choices) >= 2 and 0 <= correct_idx < len(choices):
+            for shift in range(len(choices)):
+                order = list(range(len(choices)))
+                order = order[shift:] + order[:shift]
+                rotated_choices = [choices[i] for i in order]
+                new_correct_idx = order.index(correct_idx)
+                out.append({
+                    "jpg": img,
+                    "question": question,
+                    "aux": {
+                        "task": "multiple_choice",
+                        "question_id": qa.get("question_id", 0),
+                        "question": question,
+                        "choices": rotated_choices,
+                        "answer": _MC_LETTERS[new_correct_idx],
+                        "answer_text": choices[correct_idx],
+                        "choice_order": order,
+                    },
+                })
+            continue
+
+        direct_answers = [
+            str(a).strip()
+            for a in qa.get("direct_answers", [])
+            if str(a).strip()
+        ]
+        if question and direct_answers:
+            out.append({
+                "jpg": img,
+                "question": question,
+                "aux": {
+                    "task": "direct_answer",
+                    "question_id": qa.get("question_id", 0),
+                    "question": question,
+                    "answers": direct_answers,
+                },
+            })
+    return out
+
+
 def expand_genome_sample(sample):
     """Expand one (jpg, json) into list of (image, qa) for each question.
     Visual Genome QAs each have a single answer string (no list).
@@ -838,6 +1008,74 @@ def expand_genome_sample(sample):
                 "qa_id":    int(qa.get("qa_id", 0)),
                 "question": qa.get("question", ""),
                 "answer":   qa.get("answer", ""),
+            },
+        })
+    return out
+
+
+def _refcoco_phrases(ref):
+    phrases = []
+    for key in ("sentences", "captions"):
+        values = ref.get(key, [])
+        if isinstance(values, str):
+            values = [values]
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if isinstance(value, dict):
+                value = value.get("sent") or value.get("sentence") or value.get("caption")
+            text = str(value).strip()
+            if text:
+                phrases.append(text)
+    # Preserve order while de-duplicating repeated referring expressions.
+    seen = set()
+    deduped = []
+    for phrase in phrases:
+        norm = phrase.lower()
+        if norm in seen:
+            continue
+        seen.add(norm)
+        deduped.append(phrase)
+    return deduped
+
+
+def expand_refcoco_sample(sample):
+    """Expand grouped RefCOCO records into one phrase-to-box item per ref."""
+    j = sample.get("json")
+    if j is None:
+        return []
+    if isinstance(j, bytes):
+        j = json.loads(j.decode("utf-8"))
+    refs = j.get("refs", [])
+    img = sample.get("jpg") or sample.get("jpeg") or sample.get("png") or sample.get("webp")
+    if img is None or not refs:
+        return []
+
+    out = []
+    for ref in refs:
+        bbox = ref.get("bbox", [])
+        if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            continue
+        try:
+            bbox = [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])]
+        except (TypeError, ValueError):
+            continue
+        if bbox[2] <= 0 or bbox[3] <= 0:
+            continue
+        phrases = _refcoco_phrases(ref)
+        if not phrases:
+            continue
+        out.append({
+            "jpg": img,
+            "phrase": random.choice(phrases),
+            "bbox": bbox,
+            "aux": {
+                "dataset": "refcoco",
+                "image_id": j.get("image_id"),
+                "ref_id": ref.get("ref_id"),
+                "ann_id": ref.get("ann_id"),
+                "bbox": bbox,
+                "phrases": phrases,
             },
         })
     return out
@@ -939,13 +1177,16 @@ def expand_genome_gcap_sample(sample, region_lookup: dict) -> list:
 
 _EXPAND_FN = {
     "vqav2":   expand_vqa_sample,
+    "okvqa":   expand_vqa_sample,
     "gqa":     expand_vqa_sample,
     "textvqa": expand_vqa_sample,
+    "ocrvqa":  expand_vqa_sample,
     "tallyqa": expand_vqa_sample,
     "dvqa":    expand_vqa_sample,
+    "aokvqa":  expand_aokvqa_sample,
     "genome":  expand_genome_sample,
+    "refcoco": expand_refcoco_sample,
     "llava15": expand_llava_sample,
-    "llava150k": expand_llava_sample,
     "llava_ov15": expand_llava_sample,
     # genome_gcap needs region_lookup; handled separately in GenomeGCapIterableDataset
 }
@@ -1057,7 +1298,10 @@ def _shuffled_worker_urls(root_url, data_seed_offset: int, epoch: int):
 
 class VQAv2IterableDataset(IterableDataset):
     """IterableDataset over VQA-style WebDataset shards.
-    Expands (image, qas) -> (image, qa) per question, then performs strong item-level shuffling.
+    Shuffles raw image samples first, then expands one chosen image sample into
+    QA items lazily. Remaining QA items from the same image re-enter the active
+    image buffer as one pending entry, which avoids filling the buffer with many
+    copies of the same image.
     """
 
     def __init__(self, root_url, config, tokenizer, num_shards=None, dataset_type="vqav2", data_seed_offset=0):
@@ -1083,11 +1327,12 @@ class VQAv2IterableDataset(IterableDataset):
         rng = random.Random(_worker_seed(2027, self.shard_rank, self.data_seed_offset))
         expand_fn = _EXPAND_FN.get(self.dataset_type, expand_vqa_sample)
 
-        # Strong item-level shuffle AFTER expand.
-        # Keep PIL-image buffers bounded for image-heavy QA datasets.
+        # Shuffle raw image samples before expansion. This keeps the buffer at
+        # image granularity; one image with many QA pairs occupies one slot.
         shuffle_buf = []
         shuffle_sizes = {
             "textvqa": 2000,
+            "ocrvqa": 2000,
             "dvqa": 20000,
             "tallyqa": 50000,
         }
@@ -1096,6 +1341,46 @@ class VQAv2IterableDataset(IterableDataset):
             self.dataset_type,
             shuffle_sizes.get(self.dataset_type, 10000),
         )
+        # Many VLM shards are internally ordered by source/length. If every
+        # worker starts at sample 0 of its first shard, the global batch gets an
+        # accidental length curriculum. A per-worker random offset desynchronizes
+        # those shard positions without requiring a huge in-memory image buffer.
+        start_skip_max = _stream_start_skip(self.config, self.dataset_type)
+        start_skip_remaining = (
+            rng.randrange(start_skip_max + 1) if start_skip_max > 0 else 0
+        )
+
+        def pop_random_entry():
+            idx = rng.randrange(len(shuffle_buf))
+            entry = shuffle_buf[idx]
+            shuffle_buf[idx] = shuffle_buf[-1]
+            shuffle_buf.pop()
+            return entry
+
+        def emit_one_from_buffer():
+            entry_type, payload = pop_random_entry()
+            if entry_type == "pending":
+                items = payload
+            else:
+                items = expand_fn(payload)
+                if not items:
+                    return None
+                # Break local correlation inside one image before recycling the
+                # remaining QA items as a single pending image entry.
+                rng.shuffle(items)
+
+            chosen = items.pop()
+            if items:
+                shuffle_buf.append(("pending", items))
+
+            return preprocess_fn(
+                chosen,
+                self.transform,
+                self.tokenizer,
+                self.max_len,
+                dataset_type=self.dataset_type,
+                mask_token_category_probs=self.mask_token_category_probs,
+            )
 
         epoch = 0
         error_handler = make_stop_after_n_errors(_max_wds_errors(self.config))
@@ -1115,34 +1400,16 @@ class VQAv2IterableDataset(IterableDataset):
             for sample in ds:
                 if sample is None:
                     continue
-
-                items = expand_fn(sample)
-                if not items:
+                if start_skip_remaining > 0:
+                    start_skip_remaining -= 1
                     continue
 
-                # Optional: break local correlation within one image
-                rng.shuffle(items)
+                shuffle_buf.append(("raw", sample))
 
-                for item in items:
-                    shuffle_buf.append(item)
-
-                    if len(shuffle_buf) >= SHUFFLE_SIZE:
-                        # Randomly pop one item, keep buffer full
-                        idx = rng.randrange(len(shuffle_buf))
-                        chosen = shuffle_buf[idx]
-                        shuffle_buf[idx] = shuffle_buf[-1]
-                        shuffle_buf.pop()
-
-                        out = preprocess_fn(
-                            chosen,
-                            self.transform,
-                            self.tokenizer,
-                            self.max_len,
-                            dataset_type=self.dataset_type,
-                            mask_token_category_probs=self.mask_token_category_probs,
-                        )
-                        if out is not None:
-                            yield out
+                while len(shuffle_buf) >= SHUFFLE_SIZE:
+                    out = emit_one_from_buffer()
+                    if out is not None:
+                        yield out
 
 
 class GenomeGCapIterableDataset(IterableDataset):
@@ -1239,6 +1506,7 @@ class GenomeDetIterableDataset(IterableDataset):
         self.max_len = config.max_txt_len
         self.data_seed_offset = int(data_seed_offset)
         self.mask_token_category_probs = _build_mask_category_distribution(config, "genome_det")
+        self.max_regions_per_image = max(0, int(getattr(config, "genome_det_regions_per_image", 0)))
         region_json_gcs = _region_desc_gcs_from_root(root_url)
         self.region_lookup = _load_region_lookup(region_json_gcs)
 
@@ -1264,6 +1532,8 @@ class GenomeDetIterableDataset(IterableDataset):
             if not items:
                 continue
             rng.shuffle(items)
+            if self.max_regions_per_image > 0:
+                items = items[:self.max_regions_per_image]
 
             for item in items:
                 shuffle_buf.append(item)
@@ -1288,10 +1558,10 @@ class GenomeDetIterableDataset(IterableDataset):
 def make_dataset(root, dataset_config, tokenizer, is_train=True, dataset_type="default", data_seed_offset=0):
     log_for_0(f"Making dataset for {dataset_type} with root {root}")
     assert dataset_type in [
-        "default", "laion_aes", "cc12m", "blip3o", "textcaps", "llava150k", "llava15", "llava_ov15", "vqav2", "gqa", "textvqa", "tallyqa", "dvqa", "genome", "genome_gcap", "genome_det", "rendered_text"
+        "default", "laion_aes", "cc12m", "blip3o", "textcaps", "llava15", "llava_ov15", "vqav2", "okvqa", "aokvqa", "ocrvqa", "gqa", "textvqa", "tallyqa", "dvqa", "genome", "genome_gcap", "genome_det", "refcoco", "rendered_text"
     ], f"Invalid dataset type: {dataset_type}"
 
-    if dataset_type in ["vqav2", "gqa", "textvqa", "tallyqa", "dvqa", "genome", "llava15", "llava150k", "llava_ov15"]:
+    if dataset_type in ["vqav2", "okvqa", "aokvqa", "ocrvqa", "gqa", "textvqa", "tallyqa", "dvqa", "genome", "refcoco", "llava15", "llava_ov15"]:
         ds = VQAv2IterableDataset(
             root,
             dataset_config,

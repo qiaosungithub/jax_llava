@@ -88,9 +88,12 @@ def _valid_option_columns(row):
     return [c for c in string.ascii_uppercase if c in row and _safe_text(row[c])]
 
 
+_DEFAULT_MMBENCH_SUFFIX = "Answer with the option letter only.\n"
+
+
 def build_mmbench_prompt(row, prefix="", suffix=None):
     if suffix is None:
-        suffix = "Please select the correct answer from the options above. Answer with the option letter only.\n"
+        suffix = _DEFAULT_MMBENCH_SUFFIX
 
     hint = _safe_text(row.get("hint"))
     question = _safe_text(row.get("question"))
@@ -108,21 +111,90 @@ def build_mmbench_prompt(row, prefix="", suffix=None):
     return prefix + body
 
 
-def _encode_prompt(row, tokenizer, max_len, prefix, suffix):
-    prompt = build_mmbench_prompt(row, prefix=prefix, suffix=suffix)
-    ids = tokenizer.encode(prompt, add_bos=True, add_eos=False)
+def _token_len(tokenizer, text):
+    return len(tokenizer.encode(text, add_bos=True, add_eos=False))
 
-    # If a long hint overflows, preserve question/options/instruction first.
-    if len(ids) > max_len and _safe_text(row.get("hint")):
-        row_no_hint = dict(row)
-        row_no_hint["hint"] = ""
-        prompt = build_mmbench_prompt(row_no_hint, prefix=prefix, suffix=suffix)
-        ids = tokenizer.encode(prompt, add_bos=True, add_eos=False)
+
+def _clip_text(text, max_chars):
+    text = _safe_text(text)
+    if max_chars is None or len(text) <= max_chars:
+        return text
+    max_chars = max(0, int(max_chars))
+    if max_chars <= 3:
+        return text[:max_chars]
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def _row_with_limits(row, *, keep_hint, question_chars=None, option_chars=None):
+    out = dict(row)
+    if not keep_hint:
+        out["hint"] = ""
+    if question_chars is not None:
+        out["question"] = _clip_text(out.get("question"), question_chars)
+    if option_chars is not None:
+        for key in _valid_option_columns(out):
+            out[key] = _clip_text(out.get(key), option_chars)
+    return out
+
+
+def _fit_mmbench_prompt(row, tokenizer, max_len, prefix, suffix):
+    """Build a prompt that fits max_len while preserving answer options.
+
+    Long MMBench rows often overflow because of hints or verbose choices. The
+    important part for multiple choice scoring is the question, option labels,
+    option text, and final "letter only" instruction. So we drop hints first,
+    then progressively shorten question/options instead of blindly chopping off
+    the tail where the options and instruction live.
+    """
+    attempts = []
+    full_prompt = build_mmbench_prompt(row, prefix=prefix, suffix=suffix)
+    attempts.append((full_prompt, False, _token_len(tokenizer, full_prompt)))
+
+    no_hint = _row_with_limits(row, keep_hint=False)
+    prompt = build_mmbench_prompt(no_hint, prefix=prefix, suffix=suffix)
+    attempts.append((prompt, True, _token_len(tokenizer, prompt)))
+
+    # Progressively tighten text fields. Question gets twice the option budget.
+    for option_chars in (512, 384, 256, 192, 128, 96, 64, 48, 32, 24, 16):
+        fitted = _row_with_limits(
+            row,
+            keep_hint=False,
+            question_chars=option_chars * 2,
+            option_chars=option_chars,
+        )
+        prompt = build_mmbench_prompt(fitted, prefix=prefix, suffix=suffix)
+        attempts.append((prompt, True, _token_len(tokenizer, prompt)))
+
+    for prompt, truncated, n_tokens in attempts:
+        if n_tokens <= max_len:
+            return prompt, tokenizer.encode(prompt, add_bos=True, add_eos=False), truncated, n_tokens
+
+    # Last resort for pathological rows or very small max_len: keep the shortest
+    # structured prompt and let token truncation apply only after options were
+    # aggressively shortened.
+    prompt, _, n_tokens = attempts[-1]
+    return prompt, tokenizer.encode(prompt, add_bos=True, add_eos=False), True, n_tokens
+
+
+def _encode_prompt(row, tokenizer, max_len, prefix, suffix):
+    prompt, ids, truncated, raw_len = _fit_mmbench_prompt(
+        row,
+        tokenizer,
+        max_len,
+        prefix,
+        suffix,
+    )
 
     eff_len = min(len(ids), max_len)
     pad_id = tokenizer.special_tokens.PAD
     input_ids = ids[:eff_len] + [pad_id] * (max_len - eff_len)
-    return torch.tensor(input_ids, dtype=torch.long), torch.tensor(eff_len, dtype=torch.int32), prompt
+    return (
+        torch.tensor(input_ids, dtype=torch.long),
+        torch.tensor(eff_len, dtype=torch.int32),
+        prompt,
+        truncated or raw_len > max_len,
+        int(raw_len),
+    )
 
 
 def can_infer_option(answer, choices):
@@ -214,7 +286,7 @@ class MMBenchDataset(Dataset):
         self.prompt_suffix = getattr(
             config.eval,
             "mmbench_prompt_suffix",
-            "Please select the correct answer from the options above. Answer with the option letter only.\n",
+            _DEFAULT_MMBENCH_SUFFIX,
         )
         self.image_map = {}
         if "image" in self.data:
@@ -261,7 +333,7 @@ class MMBenchDataset(Dataset):
         except Exception:
             return None
 
-        input_ids, prefix_len, prompt = _encode_prompt(
+        input_ids, prefix_len, prompt, prompt_truncated, prompt_token_len = _encode_prompt(
             row,
             self.tokenizer,
             self.max_len,
@@ -281,6 +353,9 @@ class MMBenchDataset(Dataset):
             "l2-category": _safe_text(row.get("l2-category")),
             "split": _safe_text(row.get("split")) or "dev",
             "prompt": prompt,
+            "prompt_truncated": bool(prompt_truncated),
+            "prompt_token_len": int(prompt_token_len),
+            "prompt_max_len": int(self.max_len),
         }
         return {
             "pixel_values": pixel_values,
@@ -324,6 +399,9 @@ def _dummy_aux():
         "l2-category": "",
         "split": "",
         "prompt": "",
+        "prompt_truncated": False,
+        "prompt_token_len": 0,
+        "prompt_max_len": 0,
     }
 
 
@@ -361,6 +439,7 @@ def _run_mmbench_predictions(p_sample_step, run_p_sample_step, model, tokenizer,
     )
 
     all_outs = []
+    truncated_prompts = 0
     max_len = int(getattr(config.eval, "mmbench_max_txt_len", config.dataset.max_txt_len))
     for i in range(fixed_num_steps):
         try:
@@ -398,10 +477,15 @@ def _run_mmbench_predictions(p_sample_step, run_p_sample_step, model, tokenizer,
             item["prediction"] = pred
             item["pred_option"] = pred_option
             all_outs.append(item)
+            truncated_prompts += int(bool(aux.get("prompt_truncated", False)))
 
         if i % 20 == 0:
             log_for_0(f"MMBench {split_name} batch {i}, collected {len(all_outs)} results...")
 
+    log_for_0(
+        f"MMBench {split_name}: prompt fitting truncated/dropped hint for "
+        f"{truncated_prompts}/{len(all_outs)} local samples (max_len={max_len})."
+    )
     mu.sync_global_devices(f"mmbench {split_name} inference done")
 
     base_dir, result_prefix = _result_prefix(config, split_name)
@@ -487,6 +571,7 @@ def _vis_mmbench(item):
     options = "\n".join([f"{k}. {v}" for k, v in choices.items()])
     return (
         f"question: {item.get('question', '')}\n"
+        f"prompt: {item.get('prompt', '')}\n"
         f"options:\n{options}\n"
         f"prediction: {item.get('prediction', '')}\n"
         f"pred_option: {item.get('pred_option', '')}\n"
