@@ -82,10 +82,13 @@ def get_config():
     muon.weight_decay = 0.0
     muon.consistent_rms = True
     # Optional dedicated LR for the vision encoder param group.
-    # If vision_encoder_learning_rate is set, it is used directly.
-    # Otherwise we use (main_lr * vision_encoder_lr_scale).
+    # If unset, the vision encoder uses the main optimizer LR.
     training.vision_encoder_learning_rate = None
-    training.vision_encoder_lr_scale = 1.0
+    # Optional dedicated LR for the multimodal connector/projector param group.
+    # If unset, the connector uses the main optimizer LR.
+    training.connector_learning_rate = None
+    # Backward-compatible aliases for the same connector/projector group.
+    training.projector_learning_rate = None
     training.exclude_bias_norm_from_weight_decay = True
     training.grad_clip_norm = 0.0 # disabled
 

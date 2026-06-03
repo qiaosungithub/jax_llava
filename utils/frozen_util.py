@@ -260,6 +260,7 @@ def label_trainable_frozen_params(
     txt_feature_layer: int = 0,
     freeze_image_encoder: bool = False,
     image_prefix: str = "image_encoder",
+    connector_prefixes: Sequence[str] = ("projector",),
     train_loc_embeddings_when_lm_frozen: bool = True,
 ):
   """Label params for optimizer partitioning.
@@ -267,6 +268,7 @@ def label_trainable_frozen_params(
   Labels:
     frozen: leaves excluded from training; use optax.set_to_zero().
     img: trainable image encoder leaves; use vision LR schedule.
+    connector: trainable connector/projector leaves; use connector LR schedule.
     main: all other trainable leaves; use normal LR schedule.
 
   The returned pytree has the same structure as `params` and can be passed
@@ -288,6 +290,8 @@ def label_trainable_frozen_params(
       labels_flat[key] = "frozen"
     elif key == image_prefix or key.startswith(image_prefix + "/"):
       labels_flat[key] = "img"
+    elif any(key == p or key.startswith(p + "/") for p in connector_prefixes):
+      labels_flat[key] = "connector"
     else:
       labels_flat[key] = "main"
 

@@ -94,6 +94,13 @@ def _load_mme_rows(root: str):
     return rows
 
 
+def _format_mme_question(question: str) -> str:
+    question = question.strip()
+    if question and question[-1] not in ".?!":
+        question = question + "?"
+    return question
+
+
 def preprocess_mme_sample(sample, transform, tokenizer, max_len):
     """Preprocess one MME sample with natural question prompt."""
     try:
@@ -104,12 +111,10 @@ def preprocess_mme_sample(sample, transform, tokenizer, max_len):
     except Exception:
         return None
 
-    question = (sample.get("question") or "").strip()
+    question = _format_mme_question(sample.get("question") or "")
     if not question:
         return None
 
-    if not question.endswith("?"):
-        question = question + "?"
     prefix = f"{question}\n"
     full_ids = tokenizer.encode(prefix, add_bos=True, add_eos=False)
     prefix_len = min(len(full_ids), max_len)

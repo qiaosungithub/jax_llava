@@ -152,20 +152,37 @@ def _zero_nonloc_embedding_updates():
   return optax.GradientTransformation(init_fn, update_fn)
 
 
+def _resolve_group_base_lr(config, *, group_name: str, base_lr: float) -> float:
+  explicit_key = f"{group_name}_learning_rate"
+  explicit_lr = config.training.get(explicit_key, None)
+  if explicit_lr is None and group_name == "connector":
+    explicit_lr = config.training.get("projector_learning_rate", None)
+  if explicit_lr is not None:
+    return float(explicit_lr)
+  return float(base_lr)
+
+
 def _build_optimizer(config, params):
   if config.eval_only:
     tx = optax.sgd(learning_rate=0.0)
     zero = optax.constant_schedule(value=0.0)
-    return tx, zero, zero
+    return tx, zero, zero, zero
 
   base_lr = config.training.adam.learning_rate if config.training.optimizer == 'adam' else config.training.muon.learning_rate
-  vision_base_lr = config.training.get('vision_encoder_learning_rate', None)
-  if vision_base_lr is None:
-    vision_lr_scale = float(config.training.get('vision_encoder_lr_scale', 1.0))
-    vision_base_lr = float(base_lr) * vision_lr_scale
+  vision_base_lr = _resolve_group_base_lr(
+      config,
+      group_name="vision_encoder",
+      base_lr=float(base_lr),
+  )
+  connector_base_lr = _resolve_group_base_lr(
+      config,
+      group_name="connector",
+      base_lr=float(base_lr),
+  )
 
   normal_lr_fn = create_lr_schedule(config.training, base_lr)
-  siglip_lr_fn = create_lr_schedule(config.training, vision_base_lr)
+  vision_lr_fn = create_lr_schedule(config.training, vision_base_lr)
+  connector_lr_fn = create_lr_schedule(config.training, connector_base_lr)
 
   weight_decay = _get_weight_decay(config)
   exclude_bias_norm = bool(config.training.get("exclude_bias_norm_from_weight_decay", True))
@@ -173,18 +190,21 @@ def _build_optimizer(config, params):
   train_loc_embeddings_when_lm_frozen = bool(config.training.get('train_loc_embeddings_when_lm_frozen', True))
 
   tx_main = create_base_optimizer(config, normal_lr_fn, weight_decay=weight_decay, weight_decay_mask=weight_decay_mask)
-  tx_siglip = create_base_optimizer(config, siglip_lr_fn, weight_decay=weight_decay, weight_decay_mask=weight_decay_mask)
+  tx_vision = create_base_optimizer(config, vision_lr_fn, weight_decay=weight_decay, weight_decay_mask=weight_decay_mask)
+  tx_connector = create_base_optimizer(config, connector_lr_fn, weight_decay=weight_decay, weight_decay_mask=weight_decay_mask)
   param_groups = label_trainable_frozen_params(
       params,
       freeze_lm=bool(config.training.get('freeze_lm', False)),
       txt_feature_layer=int(config.model.get('txt_feature_layer', 0)),
       freeze_image_encoder=bool(config.training.get('freeze_image_encoder', False)),
       image_prefix='image_encoder',
+      connector_prefixes=("projector",),
       train_loc_embeddings_when_lm_frozen=train_loc_embeddings_when_lm_frozen,
   )
   tx = optax.multi_transform(
       {
-          'img': tx_siglip,
+          'img': tx_vision,
+          'connector': tx_connector,
           'main': tx_main,
           'frozen': optax.set_to_zero(),
       },
@@ -192,7 +212,7 @@ def _build_optimizer(config, params):
   )
   if bool(config.training.get('freeze_lm', False)) and train_loc_embeddings_when_lm_frozen:
     tx = optax.chain(tx, _zero_nonloc_embedding_updates())
-  return tx, normal_lr_fn, siglip_lr_fn
+  return tx, normal_lr_fn, vision_lr_fn, connector_lr_fn
 
 
 def create_train_state(
@@ -208,9 +228,9 @@ def create_train_state(
     params = initialized(rng_init, config.dataset.image_size, model, config.dataset.max_txt_len)
     if print_info:
       print_params(params)
-    tx, normal_lr_fn, siglip_lr_fn = _build_optimizer(config, params)
+    tx, normal_lr_fn, vision_lr_fn, connector_lr_fn = _build_optimizer(config, params)
     state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
-    return state, normal_lr_fn, siglip_lr_fn
+    return state, normal_lr_fn, vision_lr_fn, connector_lr_fn
 
   mesh, get_partition_spec, _, _, pjit_compile = mesh_bundle
   del mesh
@@ -222,7 +242,7 @@ def create_train_state(
   param_count = sum(int(np.prod(x.shape)) for x in jax.tree.leaves(params_shape))
   log_for_0("Total trainable parameters: " + str(param_count))
 
-  tx, normal_lr_fn, siglip_lr_fn = _build_optimizer(config, params_shape)
+  tx, normal_lr_fn, vision_lr_fn, connector_lr_fn = _build_optimizer(config, params_shape)
   log_for_0("Inferring optimizer state shapes...")
   opt_shape = jax.eval_shape(tx.init, params_shape)
   state_shape = train_state.TrainState(
@@ -250,4 +270,4 @@ def create_train_state(
   state = train_state.TrainState(step=0, apply_fn=model.apply, params=params, tx=tx, opt_state=opt_state)
   if print_info:
     print_params(params)
-  return state, normal_lr_fn, siglip_lr_fn
+  return state, normal_lr_fn, vision_lr_fn, connector_lr_fn

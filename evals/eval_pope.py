@@ -467,7 +467,7 @@ def eval_pope(p_sample_step, run_p_sample_step, model, tokenizer, params, config
     )
     dataset_name = getattr(config.eval, "pope_dataset", "coco")
     prompt_template = getattr(
-        config.eval, "pope_prompt_template", "{question}\n"
+        config.eval, "pope_prompt_template", "{question}\nPlease answer yes or no.\n"
     )
     num_workers = int(getattr(config.eval, "pope_num_workers", 0))
 

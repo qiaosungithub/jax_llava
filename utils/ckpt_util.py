@@ -9,6 +9,33 @@ import orbax.checkpoint as ocp
 
 FS = gcsfs.GCSFileSystem()
 _CHECKPOINT_RE = re.compile(r"^checkpoint_(\d+)$")
+_NORMAL_CKPT_PREFIX = "/qiao_zhicheng_hanhong_files/"
+_PRETRAINED_CKPT_PREFIX = "/pretrained-ckpts/qiao_zhicheng_hanhong_files/"
+
+def _bucket_for_zone(zone: str):
+    if zone.startswith('us-central1'):
+        return 'kmh-gcp-us-central1'
+    if zone.startswith('us-east1'):
+        return 'kmh-gcp-us-east1'
+    if zone.startswith('us-east5'):
+        return 'kmh-gcp-us-east5'
+    if zone.startswith('us-central2'):
+        return 'kmh-gcp-us-central2'
+    if zone.startswith('asia-northeast1-b'):
+        return 'kmh-gcp-asia-northeast1-b'
+    if zone.startswith('europe-west4'):
+        return 'kmh-gcp'
+    return None
+
+def _convert_known_gs_to_zone(path: str, zone: str):
+    bucket = _bucket_for_zone(zone)
+    if bucket is None:
+        return path
+    for prefix in (_PRETRAINED_CKPT_PREFIX, _NORMAL_CKPT_PREFIX):
+        idx = path.find(prefix)
+        if idx >= 0 and path.startswith('gs://kmh-gcp'):
+            return f"gs://{bucket}{path[idx:]}"
+    return path
 
 def infer_zone_card(config, workdir):
     matched_zones = [z for z in ['us-central1', 'us-east1', 'us-east5', 'us-central2', 'asia-northeast1-b', 'europe-west4'] if z in workdir]
@@ -23,6 +50,8 @@ def infer_zone_card(config, workdir):
 
 def convert_to_gs(path: str, zone=None):
     if path.startswith('gs://'):
+        if zone is not None:
+            return _convert_known_gs_to_zone(path, zone)
         return path
     assert os.path.isabs(path), f'ckpt path {path} is not absolute.'
     # assert path.startswith('/')
@@ -51,13 +80,30 @@ def exist_general(path):
         return FS.exists(path)
     return os.path.exists(path)
 
+def convert_to_pretrained_gs(path: str, zone=None):
+    """Maps a normal regional checkpoint path to the same bucket's durable prefix."""
+    gs_path = convert_to_gs(path, zone).rstrip('/')
+    if _PRETRAINED_CKPT_PREFIX in gs_path:
+        return gs_path
+    assert _NORMAL_CKPT_PREFIX in gs_path, (
+        f'cannot convert checkpoint path to pretrained-ckpts path: {gs_path}'
+    )
+    return gs_path.replace(_NORMAL_CKPT_PREFIX, _PRETRAINED_CKPT_PREFIX, 1)
+
+def _latest_checkpoint_or_none(path):
+    path = path.rstrip('/')
+    if os.path.basename(path).startswith('checkpoint_'):
+        return path if exist_general(path) else None
+    try:
+        latest = checkpoints.latest_checkpoint(path)
+    except Exception:
+        latest = None
+    if latest is not None:
+        return latest.rstrip('/')
+    return None
+
 def is_checkpoint(path):
-    if not exist_general(path):
-        return False
-    if not os.path.basename(path).startswith('checkpoint_'):
-        path = checkpoints.latest_checkpoint(path)
-        return path is not None and is_checkpoint(path)
-    return True
+    return _latest_checkpoint_or_none(path) is not None
 
 def checkpoint_step(load_from, zone):
     """
@@ -68,25 +114,33 @@ def checkpoint_step(load_from, zone):
     assert match is not None, f'cannot infer checkpoint step from {gs_path}'
     return int(match.group(1))
 
-def _resolve_checkpoint_path(load_from, zone):
+def _resolve_checkpoint_path(load_from, zone, allow_pretrained_fallback=False):
     """Returns the concrete checkpoint_N path for either a ckpt or workdir path."""
     gs_path = convert_to_gs(load_from, zone).rstrip('/')
-    assert exist_general(gs_path), f'checkpoint {gs_path} does not exist'
-    if not os.path.basename(gs_path).startswith('checkpoint_'):
-        latest = checkpoints.latest_checkpoint(gs_path)
-        assert latest is not None, f'no checkpoint found under {gs_path}'
-        gs_path = latest.rstrip('/')
-    return gs_path
+    resolved = _latest_checkpoint_or_none(gs_path)
+    if resolved is None and allow_pretrained_fallback:
+        pretrained_path = convert_to_pretrained_gs(load_from, zone)
+        resolved = _latest_checkpoint_or_none(pretrained_path)
+        if resolved is not None:
+            log_for_0(
+                'Checkpoint %s not found; using durable pretrained checkpoint %s.',
+                gs_path,
+                resolved,
+            )
+    assert resolved is not None, f'checkpoint {gs_path} does not exist'
+    return resolved
 
-def restore_checkpoint(state, load_from, zone):
+def restore_checkpoint(state, load_from, zone, allow_pretrained_fallback=False):
     """
     Restores the model state from a checkpoint located in the specified working directory.
     """
-    gs_path = convert_to_gs(load_from, zone)
-    # assert gs path exists
-    assert exist_general(gs_path), f'checkpoint {gs_path} does not exist'
+    gs_path = _resolve_checkpoint_path(
+        load_from,
+        zone,
+        allow_pretrained_fallback=allow_pretrained_fallback,
+    )
     state = checkpoints.restore_checkpoint(gs_path, state)
-    log_for_0("Restored from checkpoint at {}".format(load_from))
+    log_for_0("Restored from checkpoint at {}".format(gs_path))
     return state
 
 def restore_checkpoint_params(params_target, load_from, zone):
@@ -97,7 +151,11 @@ def restore_checkpoint_params(params_target, load_from, zone):
     target=None asks Orbax to reuse checkpoint-saved device sharding, which can
     fail when a v6e checkpoint is resumed on v5p or any different topology.
     """
-    gs_path = _resolve_checkpoint_path(load_from, zone)
+    gs_path = _resolve_checkpoint_path(
+        load_from,
+        zone,
+        allow_pretrained_fallback=True,
+    )
     checkpointer = ocp.Checkpointer(ocp.PyTreeCheckpointHandler())
     restore_target = {'params': params_target}
     restore_args = ocp.checkpoint_utils.construct_restore_args(restore_target)
@@ -112,6 +170,21 @@ def restore_checkpoint_params(params_target, load_from, zone):
     params = restored['params'] if isinstance(restored, dict) else restored.params
     log_for_0("Restored params from checkpoint at {}".format(load_from))
     return params
+
+def copy_latest_checkpoint_to_pretrained(workdir, zone=None):
+    """Copies the latest normal checkpoint_N to the same bucket's pretrained prefix."""
+    if jax.process_index() != 0:
+        return False
+    src = _resolve_checkpoint_path(workdir, zone, allow_pretrained_fallback=False)
+    dst_root = convert_to_pretrained_gs(convert_to_gs(workdir, zone))
+    dst = f"{dst_root.rstrip('/')}/{os.path.basename(src)}"
+    if exist_general(dst):
+        log_for_0("Pretrained checkpoint already exists at %s; skipping copy.", dst)
+        return True
+    log_for_0("Copying final checkpoint to durable pretrained path: %s -> %s", src, dst)
+    FS.copy(src, dst, recursive=True)
+    log_for_0("Durable pretrained checkpoint saved to %s.", dst)
+    return True
 
 def save_checkpoint(state, workdir):
     """

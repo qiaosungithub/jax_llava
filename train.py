@@ -25,6 +25,7 @@ from models.paligemma_enc_dec import PaliGemmaEncDec
 from utils import vis_util
 from utils.ckpt_util import (
     checkpoint_step,
+    copy_latest_checkpoint_to_pretrained,
     infer_zone_card,
     restore_checkpoint,
     restore_checkpoint_params,
@@ -560,7 +561,8 @@ def _build_curriculum_stage_config(config, stage_key, *, stage_start_step, stage
         'clip_from_pt', 'hf_cache_dir', 'optimizer', 'grad_clip_norm', 'log_per_step',
         'checkpoint_per_step', 'log_vis_per_step', 'sample_per_step', 'online_eval_per_step',
         'online_eval_tasks', 'final_eval_tasks', 'warmup_steps',
-        'lr_schedule', 'seed', 'vision_encoder_learning_rate', 'vision_encoder_lr_scale',
+        'lr_schedule', 'seed', 'vision_encoder_learning_rate',
+        'connector_learning_rate', 'projector_learning_rate',
         'exclude_bias_norm_from_weight_decay',
     ]
     for key in training_keys:
@@ -619,7 +621,12 @@ def _run_train_phase(
 
     mesh, get_partition_spec, _, _, _ = mesh_bundle
     model = _create_model(config, finetune_mode=finetune_mode)
-    state, normal_lr_fn, siglip_lr_fn = create_train_state(rng, config, model, mesh_bundle=mesh_bundle)
+    state, normal_lr_fn, vision_lr_fn, connector_lr_fn = create_train_state(
+        rng,
+        config,
+        model,
+        mesh_bundle=mesh_bundle,
+    )
     state_spec = get_partition_spec(state, MeshMode.MODEL)
 
     if restore_mode == 'fresh_pretrained':
@@ -674,7 +681,9 @@ def _run_train_phase(
             summary = metrics_tracker.finalize()
             summary['steps_per_second'] = config.training.log_per_step / timer.elapse_with_reset()
             summary['normal_lr'] = normal_lr_fn(local_step + 1)
-            summary['siglip_lr'] = siglip_lr_fn(local_step + 1)
+            summary['vision_encoder_lr'] = vision_lr_fn(local_step + 1)
+            summary['connector_lr'] = connector_lr_fn(local_step + 1)
+            summary['siglip_lr'] = summary['vision_encoder_lr']
             summary['step'] = step + 1
             if 'curriculum_stage_index' in config.training:
                 summary['curriculum_stage'] = int(config.training.curriculum_stage_index)
@@ -842,6 +851,9 @@ def _single_stage_train(config, workdir, *, finetune_mode=False):
         finetune_mode=finetune_mode,
     )
     jax.random.normal(jax.random.key(0), ()).block_until_ready()
+    if bool(config.training.get('copy_final_checkpoint_to_pretrained', True)):
+        copy_latest_checkpoint_to_pretrained(workdir, zone=zone)
+        mu.sync_global_devices('pretrained_ckpt')
     return state
 
 
@@ -944,6 +956,9 @@ def _train_llava_curriculum(config: ml_collections.ConfigDict, workdir: str):
             )
 
     jax.random.normal(jax.random.key(0), ()).block_until_ready()
+    if bool(config.training.get('copy_final_checkpoint_to_pretrained', True)):
+        copy_latest_checkpoint_to_pretrained(workdir, zone=zone)
+        mu.sync_global_devices('pretrained_ckpt')
     return state
 
 
@@ -961,7 +976,7 @@ def just_evaluate(config: ml_collections.ConfigDict, workdir: str):
     resolve_dataset_roots(config, zone)
     tokenizer = create_tokenizer(config.model.lm_backbone_str)
     model = _create_model(config)
-    state, _, _ = create_train_state(rng, config, model, mesh_bundle=mesh_bundle)
+    state, _, _, _ = create_train_state(rng, config, model, mesh_bundle=mesh_bundle)
     if config.load_from:
         state = restore_checkpoint(state, config.load_from, zone=zone)
     else:

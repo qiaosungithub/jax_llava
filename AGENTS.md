@@ -64,3 +64,13 @@ Follow these notes when editing the JAX LLaVA training/data code in this repo.
   stage 2 median `3.91` steps/s all points (`3.94` filtered >2 steps/s).
   Finished row-148 stage-2 segment `20260531_004908_ggu3cd...` median was
   `3.84` steps/s over 17 logged points.
+
+## Durable Checkpoint Notes
+
+- Final training checkpoints should be mirrored to the same regional bucket
+  under `pretrained-ckpts/qiao_zhicheng_hanhong_files/...`; this matches the
+  shell helper `ltgcp` and protects checkpoints from ordinary bucket cleanup.
+- `load_from_pretrained` params-only restore should first use the normal
+  zone-local checkpoint path and then fall back to the same-zone
+  `pretrained-ckpts` path. Known `gs://kmh-gcp-*` checkpoint paths are
+  rewritten to the current target zone before restore to avoid cross-zone reads.

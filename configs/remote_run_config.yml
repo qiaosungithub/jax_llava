@@ -79,6 +79,8 @@ training:
             learning_rate: 0.001
             adam_b2: 0.95
             weight_decay: 0.0
+        vision_encoder_learning_rate: 0.00002
+        connector_learning_rate: 0.001
         warmup_steps: 65
         lr_schedule: cos
         sample_per_step: -1
@@ -118,6 +120,8 @@ training:
             learning_rate: 0.00002
             adam_b2: 0.95
             weight_decay: 0.0
+        vision_encoder_learning_rate: 0.00002
+        connector_learning_rate: 0.0005
         warmup_steps: 156
         lr_schedule: cos
         sample_per_step: 200
@@ -149,4 +153,4 @@ logging:
     wandb_project: "jax-llava"
     wandb_entity: "sqa24-massachusetts-institute-of-technology"
     wandb_tags: ["llava1.5", "curriculum", "hsdp"]
-    wandb_notes: "[laion-aes pretrain] LLaVA-1.5 reproduction two-stage curriculum using jit/HSDP. Stage-1 laion-aes, stage-2 LLaVA-OV-1.5-Instruct plus VQAv2/OKVQA/A-OKVQA/OCRVQA/GQA/TextCaps/Visual Genome QA, VG detection, and RefCOCO grounding."
+    wandb_notes: "[ablation: stage2 connector lr 5e-4] [laion-aes pretrain] LLaVA-1.5 reproduction two-stage curriculum using jit/HSDP. Stage-1 laion-aes, stage-2 LLaVA-OV-1.5-Instruct plus VQAv2/OKVQA/A-OKVQA/OCRVQA/GQA/TextCaps/Visual Genome QA, VG detection, and RefCOCO grounding."

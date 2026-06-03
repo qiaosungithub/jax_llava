@@ -70,7 +70,7 @@ dataset:
 training:
     freeze_lm: False
     lm_init_pretrained_text_layers_only: False # If on, only load text embedding layers
-    vision_encoder_lr_scale: 1.0
+    vision_encoder_learning_rate: 0.0001
     optimizer: muon
     adam:
         learning_rate: 0.000002
