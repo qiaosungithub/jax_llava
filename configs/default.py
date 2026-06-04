@@ -126,6 +126,12 @@ def get_config():
     # Whether to freeze the LM backbone params during training (only the
     # image encoder + projector receive gradients).
     training.freeze_lm = False
+    # Optional split LM freeze flags for late-fusion runs. If both are None,
+    # freeze_lm keeps its legacy behavior. Otherwise:
+    # freeze_lm_embed freezes the embedder + layers before model.txt_feature_layer;
+    # freeze_lm_late freezes layers from model.txt_feature_layer onward + final_norm.
+    training.freeze_lm_embed = None
+    training.freeze_lm_late = None
     # If freeze_lm=True, keep the Gemma <loc0000>..<loc1023> embedding rows
     # trainable while all original token embedding rows remain frozen.
     training.train_loc_embeddings_when_lm_frozen = True

@@ -11,7 +11,7 @@ Prefixes are matched against the flattened key "a/b/c". A prefix `p` matches a
 key `k` when `k == p` or `k` starts with `p + "/"`.
 """
 
-from typing import Iterable, Sequence, Tuple
+from typing import Iterable, Optional, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -85,6 +85,38 @@ def extract_trainable_parameters(
 _ALL_VLM_GROUPS = ("image_encoder", "lm_backbone", "projector")
 _LOC_EMBEDDING_KEY = "lm_backbone/embedder/input_embedding"
 _LOC_EMBEDDING_PARTS = tuple(_LOC_EMBEDDING_KEY.split("/"))
+
+
+def resolve_lm_freeze_flags(
+    *,
+    freeze_lm: bool = False,
+    txt_feature_layer: int = 0,
+    freeze_lm_embed: Optional[bool] = None,
+    freeze_lm_late: Optional[bool] = None,
+) -> tuple[bool, bool]:
+  """Resolve legacy and split LM-freeze flags.
+
+  Backward compatibility:
+    * no split flags + freeze_lm=False: train the whole LM.
+    * no split flags + freeze_lm=True + txt_feature_layer==0: freeze all LM.
+    * no split flags + freeze_lm=True + txt_feature_layer>0: freeze embedder
+      and layers before txt_feature_layer; train later LM layers.
+
+  Explicit split flags override the corresponding half. Missing split flags
+  inherit freeze_lm so callers can write freeze_lm=True plus one override.
+  """
+  legacy_mode = freeze_lm_embed is None and freeze_lm_late is None
+  if legacy_mode:
+    if not freeze_lm:
+      return False, False
+    if int(txt_feature_layer) == 0:
+      return True, True
+    return True, False
+
+  return (
+      bool(freeze_lm if freeze_lm_embed is None else freeze_lm_embed),
+      bool(freeze_lm if freeze_lm_late is None else freeze_lm_late),
+  )
 
 
 def _can_train_loc_embedding(flat_params) -> bool:
@@ -176,6 +208,8 @@ def get_trainable(
     params,
     freeze_lm: bool = False,
     txt_feature_layer: int = 0,
+    freeze_lm_embed: Optional[bool] = None,
+    freeze_lm_late: Optional[bool] = None,
     freeze_image_encoder: bool = False,
     train_loc_embeddings_when_lm_frozen: bool = True,
 ):
@@ -183,11 +217,12 @@ def get_trainable(
 
   Args:
     params: the model params dict (unfrozen).
-    freeze_lm: if True, freeze part of lm_backbone.
-    txt_feature_layer: when freeze_lm=True and txt_feature_layer > 0, only
-      the lm_backbone embedder and blocks 0..txt_feature_layer-1 are frozen
-      (they act as a fixed text feature extractor).  When txt_feature_layer==0
-      the entire lm_backbone is frozen (original behaviour).
+    freeze_lm: legacy broad LM freeze flag.
+    txt_feature_layer: split point for late fusion. The embed side is
+      embedder + layers 0..txt_feature_layer-1. The late side is layers
+      txt_feature_layer..last + final_norm.
+    freeze_lm_embed: if provided, freeze the embed side.
+    freeze_lm_late: if provided, freeze the late side.
     freeze_image_encoder: if True, freeze the vision tower.  This matches the
       standard LLaVA-1.5 projector/LM tuning setup.
     train_loc_embeddings_when_lm_frozen: if True, keep only the
@@ -199,14 +234,20 @@ def get_trainable(
     (trainable_params, frozen_params). When nothing is frozen,
     `frozen_params` is an empty dict.
   """
-  if not freeze_lm and not freeze_image_encoder:
+  freeze_lm_embed, freeze_lm_late = resolve_lm_freeze_flags(
+      freeze_lm=freeze_lm,
+      txt_feature_layer=txt_feature_layer,
+      freeze_lm_embed=freeze_lm_embed,
+      freeze_lm_late=freeze_lm_late,
+  )
+  if not freeze_lm_embed and not freeze_lm_late and not freeze_image_encoder:
     return params, {}
 
   flat_params = flatten_state_dict(params)
   flat_keys = list(flat_params.keys())
   train_loc_embedding = (
       bool(train_loc_embeddings_when_lm_frozen)
-      and freeze_lm
+      and freeze_lm_embed
       and _can_train_loc_embedding(flat_params)
   )
   top_level = {k.split("/", 1)[0] for k in flat_keys}
@@ -220,32 +261,38 @@ def get_trainable(
   if freeze_image_encoder:
     frozen_prefixes.add("image_encoder")
 
-  if not freeze_lm:
-    trainable_prefixes = [g for g in _ALL_VLM_GROUPS if g not in frozen_prefixes]
-  elif txt_feature_layer == 0:
-    # Freeze all of lm_backbone except optional loc-token embedding rows.
-    frozen_prefixes.add("lm_backbone")
-    trainable_prefixes = [g for g in _ALL_VLM_GROUPS if g not in frozen_prefixes]
-    if train_loc_embedding:
-      trainable_prefixes.append(_LOC_EMBEDDING_KEY)
+  trainable_prefixes = [g for g in _ALL_VLM_GROUPS if g not in (frozen_prefixes | {"lm_backbone"})]
+
+  if not freeze_lm_embed and not freeze_lm_late:
+    trainable_prefixes.append("lm_backbone")
   else:
-    # Freeze only lm_backbone/embedder + lm_backbone/layer_0..N-1.
-    # Remaining LM layers (N..last) and final_norm stay trainable.
-    N = txt_feature_layer
-    frozen_lm_prefixes = {"lm_backbone/embedder"} | {
-        f"lm_backbone/layer_{i}" for i in range(N)
-    }
-    # Collect all lm_backbone sub-keys to derive the trainable remainder.
+    N = int(txt_feature_layer)
+    layer_prefixes = sorted(
+        {
+            "/".join(k.split("/")[:2])
+            for k in flat_keys
+            if k.startswith("lm_backbone/layer_")
+        },
+        key=lambda p: int(p.rsplit("_", 1)[1]),
+    )
+    frozen_lm_prefixes = set()
+    if freeze_lm_embed:
+      frozen_lm_prefixes.add("lm_backbone/embedder")
+      frozen_lm_prefixes.update(f"lm_backbone/layer_{i}" for i in range(N))
+    if freeze_lm_late:
+      for prefix in layer_prefixes:
+        layer_idx = int(prefix.rsplit("_", 1)[1])
+        if layer_idx >= N:
+          frozen_lm_prefixes.add(prefix)
+      frozen_lm_prefixes.add("lm_backbone/final_norm")
+
     lm_flat_keys = [k for k in flat_keys if k.startswith("lm_backbone/")]
     trainable_lm_prefixes = sorted({
-        "/".join(k.split("/")[:2])  # e.g. "lm_backbone/layer_12"
+        "/".join(k.split("/")[:2])
         for k in lm_flat_keys
-        if not any(k.startswith(fp + "/") or k == fp for fp in frozen_lm_prefixes)
+        if not any(_key_matches_prefix(k, fp) for fp in frozen_lm_prefixes)
     })
-    trainable_prefixes = (
-        [g for g in _ALL_VLM_GROUPS if g not in (frozen_prefixes | {"lm_backbone"})]
-        + trainable_lm_prefixes
-    )
+    trainable_prefixes.extend(trainable_lm_prefixes)
     if train_loc_embedding:
       trainable_prefixes.append(_LOC_EMBEDDING_KEY)
 
@@ -258,6 +305,8 @@ def label_trainable_frozen_params(
     params,
     freeze_lm: bool = False,
     txt_feature_layer: int = 0,
+    freeze_lm_embed: Optional[bool] = None,
+    freeze_lm_late: Optional[bool] = None,
     freeze_image_encoder: bool = False,
     image_prefix: str = "image_encoder",
     connector_prefixes: Sequence[str] = ("projector",),
@@ -278,6 +327,8 @@ def label_trainable_frozen_params(
       params,
       freeze_lm=freeze_lm,
       txt_feature_layer=txt_feature_layer,
+      freeze_lm_embed=freeze_lm_embed,
+      freeze_lm_late=freeze_lm_late,
       freeze_image_encoder=freeze_image_encoder,
       train_loc_embeddings_when_lm_frozen=train_loc_embeddings_when_lm_frozen,
   )

@@ -10,7 +10,11 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from utils.info_util import print_params
 from utils.optim_util import muon
 from utils.logging_util import log_for_0
-from utils.frozen_util import label_trainable_frozen_params, zero_nonloc_embedding_rows
+from utils.frozen_util import (
+    label_trainable_frozen_params,
+    resolve_lm_freeze_flags,
+    zero_nonloc_embedding_rows,
+)
 from utils.pjit_util import MeshMode
 
 
@@ -188,6 +192,12 @@ def _build_optimizer(config, params):
   exclude_bias_norm = bool(config.training.get("exclude_bias_norm_from_weight_decay", True))
   weight_decay_mask = _create_weight_decay_mask(params) if exclude_bias_norm else None
   train_loc_embeddings_when_lm_frozen = bool(config.training.get('train_loc_embeddings_when_lm_frozen', True))
+  freeze_lm_embed, _ = resolve_lm_freeze_flags(
+      freeze_lm=bool(config.training.get('freeze_lm', False)),
+      txt_feature_layer=int(config.model.get('txt_feature_layer', 0)),
+      freeze_lm_embed=config.training.get('freeze_lm_embed', None),
+      freeze_lm_late=config.training.get('freeze_lm_late', None),
+  )
 
   tx_main = create_base_optimizer(config, normal_lr_fn, weight_decay=weight_decay, weight_decay_mask=weight_decay_mask)
   tx_vision = create_base_optimizer(config, vision_lr_fn, weight_decay=weight_decay, weight_decay_mask=weight_decay_mask)
@@ -196,6 +206,8 @@ def _build_optimizer(config, params):
       params,
       freeze_lm=bool(config.training.get('freeze_lm', False)),
       txt_feature_layer=int(config.model.get('txt_feature_layer', 0)),
+      freeze_lm_embed=config.training.get('freeze_lm_embed', None),
+      freeze_lm_late=config.training.get('freeze_lm_late', None),
       freeze_image_encoder=bool(config.training.get('freeze_image_encoder', False)),
       image_prefix='image_encoder',
       connector_prefixes=("projector",),
@@ -210,7 +222,7 @@ def _build_optimizer(config, params):
       },
       param_groups,
   )
-  if bool(config.training.get('freeze_lm', False)) and train_loc_embeddings_when_lm_frozen:
+  if freeze_lm_embed and train_loc_embeddings_when_lm_frozen:
     tx = optax.chain(tx, _zero_nonloc_embedding_updates())
   return tx, normal_lr_fn, vision_lr_fn, connector_lr_fn
 

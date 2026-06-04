@@ -36,6 +36,7 @@ from utils.frozen_util import (
     get_trainable,
     merge_params,
     merge_params_trainable_loc_embeddings,
+    resolve_lm_freeze_flags,
     zero_nonloc_embedding_rows,
 )
 from utils.llm_util import create_tokenizer, init_loc_token_embeddings
@@ -92,10 +93,18 @@ def train_step(state, batch, rng_init, config):
     freeze_image_encoder = bool(config.training.get('freeze_image_encoder', False))
     train_loc_embeddings_when_lm_frozen = bool(config.training.get('train_loc_embeddings_when_lm_frozen', True))
     txt_feature_layer = int(config.model.get('txt_feature_layer', 0))
+    freeze_lm_embed, _ = resolve_lm_freeze_flags(
+        freeze_lm=freeze_lm,
+        txt_feature_layer=txt_feature_layer,
+        freeze_lm_embed=config.training.get('freeze_lm_embed', None),
+        freeze_lm_late=config.training.get('freeze_lm_late', None),
+    )
     trainable_params, frozen_params = get_trainable(
         state.params,
         freeze_lm=freeze_lm,
         txt_feature_layer=txt_feature_layer,
+        freeze_lm_embed=config.training.get('freeze_lm_embed', None),
+        freeze_lm_late=config.training.get('freeze_lm_late', None),
         freeze_image_encoder=freeze_image_encoder,
         train_loc_embeddings_when_lm_frozen=train_loc_embeddings_when_lm_frozen,
     )
@@ -105,7 +114,7 @@ def train_step(state, batch, rng_init, config):
             wrt_params,
             frozen_params,
             state.params,
-            enable=freeze_lm and train_loc_embeddings_when_lm_frozen,
+            enable=freeze_lm_embed and train_loc_embeddings_when_lm_frozen,
         )
         outputs = state.apply_fn(
             {"params": params},
@@ -125,7 +134,7 @@ def train_step(state, batch, rng_init, config):
     if frozen_params:
         frozen_zero_grads = jax.tree.map(jnp.zeros_like, frozen_params)
         grads = merge_params(grads, frozen_zero_grads)
-    if freeze_lm and train_loc_embeddings_when_lm_frozen:
+    if freeze_lm_embed and train_loc_embeddings_when_lm_frozen:
         grads = zero_nonloc_embedding_rows(grads)
 
     grad_norm = optax.global_norm(grads)
@@ -557,7 +566,8 @@ def _build_curriculum_stage_config(config, stage_key, *, stage_start_step, stage
                 phase_config.dataset[target_key] = copy.deepcopy(value)
 
     training_keys = [
-        'batch_size', 'freeze_lm', 'freeze_image_encoder', 'vision_tower_from_scratch',
+        'batch_size', 'freeze_lm', 'freeze_lm_embed', 'freeze_lm_late',
+        'freeze_image_encoder', 'vision_tower_from_scratch',
         'clip_from_pt', 'hf_cache_dir', 'optimizer', 'grad_clip_norm', 'log_per_step',
         'checkpoint_per_step', 'log_vis_per_step', 'sample_per_step', 'online_eval_per_step',
         'online_eval_tasks', 'final_eval_tasks', 'warmup_steps',
