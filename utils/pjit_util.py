@@ -10,9 +10,13 @@ import numpy as np
 from jax.experimental import mesh_utils, multihost_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from utils.logging_util import log_for_0
-
 _mesh = None
+_mode = "hsdp"
+
+
+def log_for_0(*args, **kwargs):
+    from utils.logging_util import log_for_0 as _log_for_0
+    return _log_for_0(*args, **kwargs)
 
 
 class MeshMode(enum.Enum):
@@ -128,10 +132,36 @@ def apply_spec_to_last_dims(leaf, spec):
     return P(*((None,) * (len(shape) - len(spec_tuple)) + spec_tuple))
 
 
+def _model_axis_names(mesh: Mesh, sharding_mode: str):
+    if str(sharding_mode).lower() in {"hsdp", "fsdp"} and len(mesh.axis_names) > 1:
+        return (mesh.axis_names[-1],)
+    return ()
+
+
+def _data_axis_names(mesh: Mesh, sharding_mode: str):
+    mode = str(sharding_mode).lower()
+    if mode in {"hsdp", "fsdp"} and len(mesh.axis_names) > 1:
+        return tuple(mesh.axis_names[:-1])
+    return tuple(mesh.axis_names)
+
+
+def _axis_size(axis_rule, mesh_shape):
+    if axis_rule is None:
+        return 1
+    if isinstance(axis_rule, str):
+        return mesh_shape.get(axis_rule, 0)
+    size = 1
+    for axis_name in axis_rule:
+        size *= mesh_shape.get(axis_name, 0)
+    return size
+
+
 def get_spec_dict(tree, mesh: Mesh, param_mode: MeshMode, sharding_mode: str):
     sharding_mode = str(sharding_mode).lower()
     if param_mode == MeshMode.DATA:
-        spec_tree = jax.tree.map(lambda _: P(tuple(mesh.axis_names)), tree)
+        data_axes = _data_axis_names(mesh, sharding_mode)
+        data_spec = P(data_axes) if data_axes else P()
+        spec_tree = jax.tree.map(lambda _: data_spec, tree)
     elif sharding_mode == "ddp":
         spec_tree = jax.tree.map(lambda _: P(), tree)
     elif sharding_mode == "hsdp":
@@ -196,10 +226,11 @@ def get_mesh() -> Mesh:
 
 
 def prepare_pjit_funcs(mode: str = "hsdp"):
-    global _mesh
+    global _mesh, _mode
     mode = str(mode).lower()
     mesh = get_mesh()
     _mesh = mesh
+    _mode = mode
     mesh_size = int(np.prod(mesh.devices.shape))
     mesh_dict = {name: size for name, size in zip(mesh.axis_names, mesh.devices.shape)}
     log_for_0("Setting up jit/HSDP mesh mode=%s shape=%s size=%d axes=%s", mode, mesh.devices.shape, mesh_size, mesh_dict)
@@ -208,10 +239,11 @@ def prepare_pjit_funcs(mode: str = "hsdp"):
         return get_spec_dict(tree, mesh, param_mode=param_mode, sharding_mode=mode)
 
     def pjit_all_gather(tree):
+        data_axes = _data_axis_names(mesh, mode)
         return multihost_utils.host_local_array_to_global_array(
             tree,
             mesh,
-            P(tuple(mesh.axis_names)),
+            P(data_axes) if data_axes else P(),
         )
 
     def pjit_reduce_scatter(tree, param_mode=MeshMode.DATA):
@@ -251,6 +283,63 @@ def prepare_pjit_funcs(mode: str = "hsdp"):
 
 def named_sharding(mesh, spec):
     return NamedSharding(mesh, spec)
+
+
+def _current_mesh_shape():
+    if _mesh is None:
+        return {}
+    return {name: size for name, size in zip(_mesh.axis_names, _mesh.devices.shape)}
+
+
+def _valid_axis_for_dim(shape, dim, axis_rule):
+    if axis_rule is None:
+        return False
+    if not shape:
+        return False
+    dim = dim if dim >= 0 else len(shape) + dim
+    if dim < 0 or dim >= len(shape):
+        return False
+    divisor = _axis_size(axis_rule, _current_mesh_shape())
+    return bool(divisor and shape[dim] % divisor == 0)
+
+
+def _activation_spec(x, *, model_dim=None):
+    """Best-effort activation spec: shard batch on data axes and one model dim."""
+    if _mesh is None:
+        return P()
+    shape = getattr(x, "shape", ())
+    if not shape:
+        return P()
+    spec = [None] * len(shape)
+
+    data_axes = _data_axis_names(_mesh, _mode)
+    if data_axes and _valid_axis_for_dim(shape, 0, data_axes):
+        spec[0] = data_axes
+
+    model_axes = _model_axis_names(_mesh, _mode)
+    if model_dim is not None and model_axes:
+        model_dim = model_dim if model_dim >= 0 else len(shape) + model_dim
+        if model_dim != 0 and _valid_axis_for_dim(shape, model_dim, model_axes[0]):
+            spec[model_dim] = model_axes[0]
+
+    return P(*spec)
+
+
+def constrain_batch(x):
+    """Constrain an activation to keep only data-axis batch sharding."""
+    if _mesh is None:
+        return x
+    return jax.lax.with_sharding_constraint(x, _activation_spec(x))
+
+
+def constrain_batch_model(x, model_dim=-1):
+    """Constrain an activation to shard batch on data axes and model on one dim."""
+    if _mesh is None:
+        return x
+    return jax.lax.with_sharding_constraint(
+        x,
+        _activation_spec(x, model_dim=model_dim),
+    )
 
 
 def shard_cpu_tree_to_mesh(cpu_tree, mesh, partition_specs):

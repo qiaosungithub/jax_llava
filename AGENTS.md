@@ -74,3 +74,29 @@ Follow these notes when editing the JAX LLaVA training/data code in this repo.
   zone-local checkpoint path and then fall back to the same-zone
   `pretrained-ckpts` path. Known `gs://kmh-gcp-*` checkpoint paths are
   rewritten to the current target zone before restore to avoid cross-zone reads.
+
+## HSDP Memory Notes
+
+- `utils/pjit_util.py` treats the last mesh axis as the model axis for `hsdp`.
+  Batch/data arrays are sharded only over the preceding data axes; do not shard
+  batch over every mesh axis or activations can conflict with model sharding and
+  get gathered back to global-batch-sized attention buffers.
+- Training loss should use `token_xent_loss_from_hidden(...)`, not a full
+  `embedder.decode(out)` over `(B, K + T, vocab)`. The chunked loss only scans
+  labeled text positions and avoids the large Gemma3 full-vocab logits tensor.
+- CLIP/LLaVA and PrefixMAE paths use best-effort `constrain_batch_model(...)`
+  constraints around image features, q/k/v, attention maps, and hidden
+  activations. Keep these constraints when editing HSDP paths.
+- `LlavaGemma.generate_beam_search(...)` is a real cumulative-logprob beam search,
+  not a greedy alias. It keeps EOS beams alive, supports `txt_feature_layer > 0`,
+  and decodes only the last prompt hidden state during prefill to avoid a
+  `[B, prompt_len, vocab]` logits tensor.
+
+## TPU Manager & Job Queue
+
+- **Check job status**: use `tcs` (alias) or `tpu check sqa` to view running/errored/finished jobs, their window IDs, TPU assignments, and log dirs. Do NOT manually parse xibo `data.json` to get job info — `tcs` is the canonical interface.
+- **Queue a job**: `qsqa <dir_num>` from the working directory. This stages code (rsync to `/kmh-nfs-ssd-us-mount/staging/sqa/...`), registers with xibo (`tpu set-cur`), and adds to the MONITOR queue.
+- **MONITOR queue file**: `/kmh-nfs-ssd-us-mount/code/qiao/work/tpu_manager/queue.json`. MONITOR dispatches pending jobs by calling `tpu run <alias> <user> dir=<dir_no>`, which re-stages from the working directory at dispatch time.
+- **Directory numbers**: xibo maps dir numbers to working directory paths in `data.json`. `set-cur` only works for dir 1-100; for dir>100, register directly in `data['users']['sqa']['working_dir']`.
+- **Eval-only jobs**: set `eval_only: True` and `load_from: <log_dir_path>` in `remote_run_config.yml`. The code resolves checkpoint paths from log dirs via GCS mirror.
+- **Multiple jobs from the same codebase**: since MONITOR re-stages from the live working dir at dispatch time, use separate dir numbers pointing to separate directory copies to avoid config conflicts between queued jobs.

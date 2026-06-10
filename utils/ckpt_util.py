@@ -171,12 +171,12 @@ def restore_checkpoint_params(params_target, load_from, zone):
     log_for_0("Restored params from checkpoint at {}".format(load_from))
     return params
 
-def copy_latest_checkpoint_to_pretrained(workdir, zone=None):
+def copy_latest_checkpoint_to_pretrained(checkpoint_or_workdir, zone=None):
     """Copies the latest normal checkpoint_N to the same bucket's pretrained prefix."""
     if jax.process_index() != 0:
         return False
-    src = _resolve_checkpoint_path(workdir, zone, allow_pretrained_fallback=False)
-    dst_root = convert_to_pretrained_gs(convert_to_gs(workdir, zone))
+    src = _resolve_checkpoint_path(checkpoint_or_workdir, zone, allow_pretrained_fallback=False)
+    dst_root = convert_to_pretrained_gs(os.path.dirname(src.rstrip('/')), zone)
     dst = f"{dst_root.rstrip('/')}/{os.path.basename(src)}"
     if exist_general(dst):
         log_for_0("Pretrained checkpoint already exists at %s; skipping copy.", dst)

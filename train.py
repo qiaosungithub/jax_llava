@@ -343,10 +343,14 @@ def _attach_sample_metadata(fn, mesh, batch_spec, reduce_scatter):
 def _build_pjit_fns(config, model, state, mesh_bundle):
     mesh, get_partition_spec, _, reduce_scatter, pjit_compile = mesh_bundle
     state_spec = get_partition_spec(state, MeshMode.MODEL)
-    batch_spec = get_partition_spec(_fake_batch(config, int(config.training.batch_size)), MeshMode.DATA)
+    fake_bs = int(config.training.batch_size)
+    mesh_total = int(np.prod(mesh.devices.shape))
+    if fake_bs % mesh_total != 0:
+        fake_bs = mesh_total
+    batch_spec = get_partition_spec(_fake_batch(config, fake_bs), MeshMode.DATA)
     mmbench_max_txt_len = int(getattr(config.eval, 'mmbench_max_txt_len', config.dataset.max_txt_len))
     mmbench_batch_spec = get_partition_spec(
-        _fake_batch(config, int(config.training.batch_size), max_txt_len=mmbench_max_txt_len),
+        _fake_batch(config, fake_bs, max_txt_len=mmbench_max_txt_len),
         MeshMode.DATA,
     )
 
@@ -358,7 +362,7 @@ def _build_pjit_fns(config, model, state, mesh_bundle):
     )
 
     sample_out_spec = get_partition_spec(
-        jax.ShapeDtypeStruct((int(config.training.batch_size), int(config.sampling.max_new_tokens)), jnp.int32),
+        jax.ShapeDtypeStruct((fake_bs, int(config.sampling.max_new_tokens)), jnp.int32),
         MeshMode.DATA,
     )
     p_sample_step = pjit_compile(
@@ -377,7 +381,7 @@ def _build_pjit_fns(config, model, state, mesh_bundle):
     # gets its own input spec instead of reusing batch_spec['input_ids'].
     mmbench_new_tokens = int(getattr(config.eval, 'mmbench_max_new_tokens', 8))
     mmbench_out_spec = get_partition_spec(
-        jax.ShapeDtypeStruct((int(config.training.batch_size), mmbench_new_tokens), jnp.int32),
+        jax.ShapeDtypeStruct((fake_bs, mmbench_new_tokens), jnp.int32),
         MeshMode.DATA,
     )
     p_sample_step_mmbench = pjit_compile(
@@ -836,6 +840,7 @@ def _single_stage_train(config, workdir, *, finetune_mode=False):
     rng = random.PRNGKey(config.training.seed)
     zone, mesh_bundle, writer = _init_run(config, workdir)
     current_step = checkpoint_step(config.load_from, zone=zone) if config.load_from else 0
+    final_step = int(config.training.num_steps)
     if config.load_from:
         restore_mode = 'full'
         params_source = None
@@ -855,15 +860,19 @@ def _single_stage_train(config, workdir, *, finetune_mode=False):
         stage_key='train',
         stage_start_step=0,
         current_step=current_step,
-        stage_end_step=int(config.training.num_steps),
+        stage_end_step=final_step,
         restore_mode=restore_mode,
         params_source=params_source,
         finetune_mode=finetune_mode,
     )
     jax.random.normal(jax.random.key(0), ()).block_until_ready()
     if bool(config.training.get('copy_final_checkpoint_to_pretrained', True)):
-        copy_latest_checkpoint_to_pretrained(workdir, zone=zone)
-        mu.sync_global_devices('pretrained_ckpt')
+        final_checkpoint_source = workdir if current_step < final_step else config.load_from
+        if final_checkpoint_source:
+            copy_latest_checkpoint_to_pretrained(final_checkpoint_source, zone=zone)
+            mu.sync_global_devices('pretrained_ckpt')
+        else:
+            log_for_0('Skipping durable checkpoint copy; no checkpoint was produced or loaded.')
     return state
 
 
@@ -884,6 +893,7 @@ def _train_llava_curriculum(config: ml_collections.ConfigDict, workdir: str):
     rng = random.PRNGKey(config.training.seed)
     zone, mesh_bundle, writer = _init_run(config, workdir)
     current_step = checkpoint_step(config.load_from, zone=zone) if config.load_from else 0
+    initial_step = current_step
     if current_step > total_steps:
         raise ValueError(f'Checkpoint step {current_step} is beyond curriculum total steps {total_steps}')
 
@@ -967,8 +977,12 @@ def _train_llava_curriculum(config: ml_collections.ConfigDict, workdir: str):
 
     jax.random.normal(jax.random.key(0), ()).block_until_ready()
     if bool(config.training.get('copy_final_checkpoint_to_pretrained', True)):
-        copy_latest_checkpoint_to_pretrained(workdir, zone=zone)
-        mu.sync_global_devices('pretrained_ckpt')
+        final_checkpoint_source = workdir if initial_step < total_steps else config.load_from
+        if final_checkpoint_source:
+            copy_latest_checkpoint_to_pretrained(final_checkpoint_source, zone=zone)
+            mu.sync_global_devices('pretrained_ckpt')
+        else:
+            log_for_0('Skipping durable checkpoint copy; no checkpoint was produced or loaded.')
     return state
 
 

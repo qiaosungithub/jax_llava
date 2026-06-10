@@ -35,7 +35,8 @@ from gemma.gm.nn._transformer import _Inputs
 
 from models.siglip_enc_dec import PrefixMAE, patchify, unpatchify, recon_mse_loss
 from models.gemma import load_LM
-from models.paligemma import Projector, token_xent_loss
+from models.paligemma import Projector, token_xent_loss_from_hidden
+from utils.pjit_util import constrain_batch_model
 
 Array = jnp.ndarray
 PyTree = Any
@@ -241,6 +242,7 @@ class PaliGemmaEncDec(nn.Module):
 
         # ── Text embeddings ────────────────────────────────────────────────
         token_embeds = self.lm_backbone.embedder.encode(input_ids)   # (B, T_text, D_lm)
+        token_embeds = constrain_batch_model(token_embeds)
         log_dict['token_embeds_norm'] = jnp.mean(token_embeds ** 2)
 
         # ── Image encoding + optional reconstruction loss ──────────────────
@@ -299,6 +301,7 @@ class PaliGemmaEncDec(nn.Module):
                 images,
                 vis_mask=prefix_mask if _use_enc_mid_mask else None,
             )                                                        # (B, K, D_enc)
+            enc_tokens = constrain_batch_model(enc_tokens)
             log_dict['enc_tokens_norm'] = jnp.mean(enc_tokens ** 2)
 
             # reconstruction loss
@@ -349,6 +352,7 @@ class PaliGemmaEncDec(nn.Module):
 
             # Project K encoder tokens to LM hidden dim
             img_embeds = self.projector(enc_tokens)                  # (B, K, D_lm)
+            img_embeds = constrain_batch_model(img_embeds)
             log_dict['img_embeds_norm'] = jnp.mean(img_embeds ** 2)
 
             # Optional split: run text through first txt_feature_layer LM blocks
@@ -378,6 +382,7 @@ class PaliGemmaEncDec(nn.Module):
             # Prepend image embeddings to text embeddings (or text features)
             T_text_seq = token_embeds.shape[1]
             token_embeds = jnp.concatenate([img_embeds, token_embeds], axis=1)
+            token_embeds = constrain_batch_model(token_embeds)
 
             B, L, _ = token_embeds.shape
 
@@ -458,6 +463,7 @@ class PaliGemmaEncDec(nn.Module):
                 )
                 _rest_cache[_ln] = _lc
             out = self.lm_backbone.final_norm(_x)
+            out = constrain_batch_model(out)
             new_cache = {**_split_txt_cache, **_rest_cache}
         else:
             if cache is not None:
@@ -470,11 +476,14 @@ class PaliGemmaEncDec(nn.Module):
                 inputs_mask=inputs_mask,
             )
             out, new_cache = self.lm_backbone._apply_attention(inputs, cache)
-        logits = self.lm_backbone.embedder.decode(out)               # (B, L, V)
+            out = constrain_batch_model(out)
 
-        # logit capping. only used at training.
-        if self.final_logit_softcap != 0.0 and labels is not None:
-            logits = jnp.tanh(logits / self.final_logit_softcap) * self.final_logit_softcap
+        if labels is None:
+            logits = self.lm_backbone.embedder.decode(out)           # (B, L, V)
+            return {'logits': logits, 'cache': new_cache}
+
+        assert cache is None
+        embedding_table = self.lm_backbone.embedder.input_embedding_table
 
         # ── Text-only forward pass for CFG-style contrastive loss ──────────
         # When alpha > 0, we run a second forward pass using text embeddings
@@ -523,27 +532,34 @@ class PaliGemmaEncDec(nn.Module):
                 text_out = self.lm_backbone.final_norm(_x)
             else:
                 text_out, _ = self.lm_backbone._apply_attention(text_inputs, None)
-            text_only_logits = self.lm_backbone.embedder.decode(text_out)  # (B, T_text, V)
-
-            # Apply the same logit cap as the conditional branch.
-            if self.final_logit_softcap != 0.0:
-                text_only_logits = (
-                    jnp.tanh(text_only_logits / self.final_logit_softcap)
-                    * self.final_logit_softcap
-                )
+            text_out = constrain_batch_model(text_out)
 
             # Loss 1 – standard NTP on the text-only (unconditional) branch.
-            loss_text_only = token_xent_loss(text_only_logits, labels)
+            if self.text_only_loss_weight > 0.0:
+                loss_text_only, _ = token_xent_loss_from_hidden(
+                    text_out,
+                    embedding_table,
+                    labels,
+                    final_logit_softcap=self.final_logit_softcap,
+                )
+            else:
+                loss_text_only = jnp.zeros(())
 
             # Loss 2 – CFG-style contrastive loss.
-            # logits[:, K:, :] are the image-conditioned logits at text positions.
+            # out[:, K:, :] are the image-conditioned text hidden states.
             # Subtracting the stop-grad text prior sharpens image-specific predictions.
-            cond_text_logits  = logits[:, K:, :]                     # (B, T_text, V)
-            normalized_logits = (
-                cond_text_logits
-                - self.alpha * jax.lax.stop_gradient(text_only_logits)
-            )
-            loss_cfg = token_xent_loss(normalized_logits, labels)
+            if self.cfg_loss_weight > 0.0:
+                cond_text_hidden = out[:, K:, :]                     # (B, T_text, D_lm)
+                loss_cfg, _ = token_xent_loss_from_hidden(
+                    cond_text_hidden,
+                    embedding_table,
+                    labels,
+                    final_logit_softcap=self.final_logit_softcap,
+                    subtract_hidden=text_out,
+                    subtract_alpha=self.alpha,
+                )
+            else:
+                loss_cfg = jnp.zeros(())
 
             log_dict['loss_text_only'] = loss_text_only
             log_dict['loss_cfg']       = loss_cfg
@@ -553,22 +569,26 @@ class PaliGemmaEncDec(nn.Module):
 
         # ── Combined loss ──────────────────────────────────────────────────
         if labels is not None:
-            assert cache is None
-
             if images is not None:
-                # Prepend -100 for the K image token positions
-                labels_full = jnp.concatenate(
-                    [jnp.full((B, K), -100, dtype=jnp.int32), labels], axis=1
-                )
+                # Only text positions have labels; avoid materializing logits for
+                # the image prefix positions.
+                lm_hidden = out[:, K:, :]
+                labels_for_loss = labels
             else:
-                labels_full = labels # just for debug
+                lm_hidden = out
+                labels_for_loss = labels
 
-            loss_vlm = token_xent_loss(logits, labels_full)
+            loss_vlm, pred_ids = token_xent_loss_from_hidden(
+                lm_hidden,
+                embedding_table,
+                labels_for_loss,
+                final_logit_softcap=self.final_logit_softcap,
+            )
 
-            valid = labels_full != -100
+            valid = labels_for_loss != -100
             valid_count = valid.sum()
             acc = (
-                jnp.sum((jnp.argmax(logits, axis=-1) == labels_full) * valid)
+                jnp.sum((pred_ids == labels_for_loss) * valid)
                 / jnp.maximum(valid_count, 1)
             )
             log_dict['loss_vlm'] = loss_vlm
@@ -587,16 +607,14 @@ class PaliGemmaEncDec(nn.Module):
 
             debug = {
                 'attn_mask': attn_mask,
-                'labels':    labels_full,
-                'preds':     jnp.argmax(logits, axis=-1),
+                'labels':    labels_for_loss,
+                'preds':     pred_ids,
                 'input_ids': input_ids,
             }
             if self.recon_loss_weight > 0.0:
                 debug['recon_imgs'] = recon_imgs_vis  # (≤6, H, W, 3), normalised [-1, 1]
                 debug['orig_imgs']  = orig_imgs_vis   # (≤6, H, W, 3), normalised [-1, 1]
             return loss_total, log_dict, debug
-
-        return {'logits': logits, 'cache': new_cache}
 
     # ------------------------------------------------------------------
     # Reconstruction  (encoder + decoder, no LM)

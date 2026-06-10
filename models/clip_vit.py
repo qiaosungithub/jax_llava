@@ -16,6 +16,7 @@ from flax.core import unfreeze
 from transformers import CLIPImageProcessor, CLIPVisionConfig, FlaxCLIPVisionModel
 from transformers import logging as hf_logging
 from transformers.models.clip.modeling_flax_clip import FlaxCLIPVisionTransformer
+from utils.pjit_util import constrain_batch, constrain_batch_model
 
 
 @contextlib.contextmanager
@@ -150,6 +151,7 @@ class CLIPVisionTower(nn.Module):
         return (images - mean) / std
 
     def __call__(self, images: jnp.ndarray, train: bool = False) -> jnp.ndarray:
+        images = constrain_batch(images)
         pixel_values = self._normalize(images)
         outputs = self.vision_model(
             pixel_values,
@@ -162,6 +164,7 @@ class CLIPVisionTower(nn.Module):
             features = outputs.last_hidden_state
         else:
             features = outputs.hidden_states[self.feature_layer]
+        features = constrain_batch_model(features)
 
         if self.select_feature == "patch":
             return features[:, 1:, :]

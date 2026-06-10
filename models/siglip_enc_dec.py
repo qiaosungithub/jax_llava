@@ -33,6 +33,7 @@ from typing import Optional, Tuple
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
+from utils.pjit_util import constrain_batch, constrain_batch_model
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +63,7 @@ class Attention(nn.Module):
         x: jnp.ndarray,            # (B, T, D)
         mask: Optional[jnp.ndarray] = None,  # (B, T, T) bool, True=attend
     ) -> jnp.ndarray:
+        x = constrain_batch_model(x)
         B, T, D = x.shape
         H, Dh = self.num_heads, self.head_dim
         inner = H * Dh
@@ -73,14 +75,19 @@ class Attention(nn.Module):
             return z.reshape(B, T, H, Dh).transpose(0, 2, 1, 3)  # (B,H,T,Dh)
 
         q, k, v = heads(q), heads(k), heads(v)
+        q = constrain_batch_model(q, model_dim=1)
+        k = constrain_batch_model(k, model_dim=1)
+        v = constrain_batch_model(v, model_dim=1)
         attn = jnp.einsum('bhqd,bhkd->bhqk',
                           q.astype(jnp.float32),
                           k.astype(jnp.float32)) * (Dh ** -0.5)
         if mask is not None:
             attn = jnp.where(mask[:, None, :, :], attn, -1e9)
+        attn = constrain_batch_model(attn, model_dim=1)
         attn = jax.nn.softmax(attn, axis=-1).astype(x.dtype)
         out = jnp.einsum('bhqk,bhkd->bhqd', attn, v)
         out = out.transpose(0, 2, 1, 3).reshape(B, T, inner)
+        out = constrain_batch_model(out)
         return nn.Dense(D, use_bias=True, name='out_proj')(out)
 
 
@@ -96,6 +103,8 @@ class CrossAttention(nn.Module):
         context: jnp.ndarray,    # (B, Tk, D)
         qmask: Optional[jnp.ndarray] = None,  # (B, Tq) bool, True=run attention; False=zero row
     ) -> jnp.ndarray:            # (B, Tq, D)
+        query = constrain_batch_model(query)
+        context = constrain_batch_model(context)
         B, Tq, D = query.shape
         Tk = context.shape[1]
         H, Dh = self.num_heads, self.head_dim
@@ -109,15 +118,20 @@ class CrossAttention(nn.Module):
             return z.reshape(B, T, H, Dh).transpose(0, 2, 1, 3)
 
         q, k, v = heads(q, Tq), heads(k, Tk), heads(v, Tk)
+        q = constrain_batch_model(q, model_dim=1)
+        k = constrain_batch_model(k, model_dim=1)
+        v = constrain_batch_model(v, model_dim=1)
         attn = jnp.einsum('bhqd,bhkd->bhqk',
                           q.astype(jnp.float32),
                           k.astype(jnp.float32)) * (Dh ** -0.5)
+        attn = constrain_batch_model(attn, model_dim=1)
         attn = jax.nn.softmax(attn, axis=-1).astype(query.dtype)
         if qmask is not None:
             # No read from any patch for dropped query rows (equiv. row-wise attention mask)
             attn = attn * qmask[:, None, :, None].astype(attn.dtype)
         out = jnp.einsum('bhqk,bhkd->bhqd', attn, v)
         out = out.transpose(0, 2, 1, 3).reshape(B, Tq, inner)
+        out = constrain_batch_model(out)
         out = nn.Dense(D, use_bias=True, name='out_proj')(out)
         if qmask is not None:
             out = out * qmask[:, :, None].astype(out.dtype)
@@ -224,6 +238,7 @@ class ImageEncoder(nn.Module):
         vis_mask is only honoured when enc_cross_attn_split > 0; it triggers
         mid-masking at the split point.
         """
+        images = constrain_batch(images)
         B = images.shape[0]
         T = (self.image_size // self.patch_size) ** 2
         L = self.num_learnable_tokens
@@ -237,6 +252,7 @@ class ImageEncoder(nn.Module):
             name='patch_embed',
         )(images)                                       # (B, H/P, W/P, D)
         x = x.reshape(B, T, self.hidden_dim)
+        x = constrain_batch_model(x)
 
         patch_pos = self.param(
             'patch_pos_embed',
@@ -269,6 +285,7 @@ class ImageEncoder(nn.Module):
             learnable + learnable_pos,
             (B, L, self.hidden_dim),
         )                                              # (B, L, D)
+        tokens = constrain_batch_model(tokens)
 
         # ── Mid-masking setup ──────────────────────────────────────────────
         _do_mid_mask = (
