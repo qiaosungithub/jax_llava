@@ -1,5 +1,6 @@
 import hashlib
 import pickle
+import re
 
 import fsspec
 import jax
@@ -9,6 +10,10 @@ from utils.logging_util import log_for_0
 
 
 STATE_VERSION = 1
+_REPLICA_DATA_BUCKET_RE = re.compile(
+    r"^(gs://kmh-gcp-(?:us-central1|us-east5|asia-northeast1-b)/data)(/.*)?$"
+)
+_LOGICAL_DATA_BUCKET_PREFIX = "gs://kmh-gcp-<replica>/data"
 
 
 def stateful_dataloader_enabled(config) -> bool:
@@ -31,6 +36,120 @@ def _storage_path(path: str) -> str:
     return path[5:] if path.startswith("gs://") else path
 
 
+def _canonicalize_data_path(value):
+    if not isinstance(value, str):
+        return value
+    match = _REPLICA_DATA_BUCKET_RE.match(value)
+    if not match:
+        return value
+    suffix = match.group(2) or ""
+    return _LOGICAL_DATA_BUCKET_PREFIX + suffix
+
+
+def _canonicalize_data_paths(value):
+    if isinstance(value, dict):
+        return {str(k): _canonicalize_data_paths(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_canonicalize_data_paths(v) for v in value]
+    return _canonicalize_data_path(value)
+
+
+def _topology_compare_payload(topology):
+    payload = {
+        k: _as_plain(v)
+        for k, v in dict(topology).items()
+        if k not in ("hash", "logical_roots")
+    }
+    payload["roots"] = _canonicalize_data_paths(payload.get("roots", []))
+    return payload
+
+
+def _topology_hash(topology):
+    encoded = repr(sorted(_topology_compare_payload(topology).items())).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def _flatten_strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _flatten_strings(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _flatten_strings(item)
+
+
+def _data_bucket_prefix(value):
+    match = _REPLICA_DATA_BUCKET_RE.match(value) if isinstance(value, str) else None
+    return match.group(1) if match else None
+
+
+def _build_replica_prefix_remap(saved_roots, current_roots):
+    """Map saved same-dataset replica buckets to the current zone-local buckets."""
+    saved = list(_flatten_strings(saved_roots))
+    current = list(_flatten_strings(current_roots))
+    prefix_remap = {}
+    if len(saved) != len(current):
+        return prefix_remap
+
+    for saved_root, current_root in zip(saved, current):
+        if _canonicalize_data_path(saved_root) != _canonicalize_data_path(current_root):
+            continue
+        saved_prefix = _data_bucket_prefix(saved_root)
+        current_prefix = _data_bucket_prefix(current_root)
+        if not saved_prefix or not current_prefix or saved_prefix == current_prefix:
+            continue
+        previous = prefix_remap.get(saved_prefix)
+        if previous is not None and previous != current_prefix:
+            raise ValueError(
+                "Ambiguous dataloader state bucket remap: "
+                f"{saved_prefix} -> both {previous} and {current_prefix}"
+            )
+        prefix_remap[saved_prefix] = current_prefix
+    return prefix_remap
+
+
+def _remap_string_data_bucket(value, prefix_remap):
+    for saved_prefix, current_prefix in sorted(prefix_remap.items(), key=lambda item: -len(item[0])):
+        if value == saved_prefix or value.startswith(saved_prefix + "/"):
+            return current_prefix + value[len(saved_prefix):], 1
+    return value, 0
+
+
+def _remap_state_data_buckets(value, prefix_remap):
+    if not prefix_remap:
+        return value, 0
+    if isinstance(value, str):
+        return _remap_string_data_bucket(value, prefix_remap)
+    if isinstance(value, list):
+        remapped = []
+        count = 0
+        for item in value:
+            new_item, item_count = _remap_state_data_buckets(item, prefix_remap)
+            remapped.append(new_item)
+            count += item_count
+        return remapped, count
+    if isinstance(value, tuple):
+        remapped = []
+        count = 0
+        for item in value:
+            new_item, item_count = _remap_state_data_buckets(item, prefix_remap)
+            remapped.append(new_item)
+            count += item_count
+        return tuple(remapped), count
+    if isinstance(value, dict):
+        remapped = {}
+        count = 0
+        for key, item in value.items():
+            new_key, key_count = _remap_state_data_buckets(key, prefix_remap)
+            new_item, item_count = _remap_state_data_buckets(item, prefix_remap)
+            remapped[new_key] = new_item
+            count += key_count + item_count
+        return remapped, count
+    return value, 0
+
+
 def dataloader_topology(config, batch_size):
     """State that must match for exact dataloader resume."""
     roots = list(getattr(config.dataset, "root", []) or [])
@@ -46,8 +165,8 @@ def dataloader_topology(config, batch_size):
         "types": _as_plain(types),
         "mix_weights": _as_plain(weights),
     }
-    encoded = repr(sorted(payload.items())).encode("utf-8")
-    payload["hash"] = hashlib.sha256(encoded).hexdigest()[:16]
+    payload["logical_roots"] = _canonicalize_data_paths(payload["roots"])
+    payload["hash"] = _topology_hash(payload)
     return payload
 
 
@@ -127,12 +246,27 @@ def restore_dataloader_state(train_loader, config, load_from, zone, expected_ste
 
     expected_topology = dataloader_topology(config, batch_size)
     saved_topology = payload.get("topology", {})
-    if saved_topology.get("hash") != expected_topology.get("hash"):
+    saved_compare = _topology_compare_payload(saved_topology)
+    expected_compare = _topology_compare_payload(expected_topology)
+    if saved_compare != expected_compare:
         raise ValueError(
             "Dataloader topology changed; exact stateful resume is not valid. "
             f"saved={saved_topology}, current={expected_topology}"
         )
+    prefix_remap = _build_replica_prefix_remap(
+        saved_topology.get("roots", []),
+        expected_topology.get("roots", []),
+    )
+    loader_state = payload["loader_state"]
+    if prefix_remap:
+        loader_state, remap_count = _remap_state_data_buckets(loader_state, prefix_remap)
+        log_for_0(
+            "Dataloader state uses same logical dataset replicas; remapped %d "
+            "state URL entries with bucket prefixes %s.",
+            remap_count,
+            prefix_remap,
+        )
 
-    train_loader.load_state_dict(payload["loader_state"])
+    train_loader.load_state_dict(loader_state)
     log_for_0("Dataloader state restored from %s.", state_path)
     return True

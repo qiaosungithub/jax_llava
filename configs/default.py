@@ -29,6 +29,9 @@ def get_config():
     dataset.data_seed_offset = 0
     dataset.stateful_dataloader = False
     dataset.stateful_dataloader_strict = True
+    # None means snapshot at checkpoint cadence. Avoid torchdata's default of
+    # snapshotting every batch, which serializes large shuffle buffers.
+    dataset.stateful_snapshot_every_n_steps = None
     # Regular WebDataset loaders fill this buffer before yielding. Keep the
     # production default large, but allow remote smoke tests to lower it.
     dataset.webdataset_shuffle_size = 10000
@@ -158,6 +161,11 @@ def get_config():
     model.attn_logits_soft_cap = 0.0   # 0.0 = disabled; e.g. 50.0 for Gemma2-style
     model.final_logit_softcap = 0.0    # 0.0 = disabled; e.g. 30.0 for Gemma2-style
     model.txt_feature_layer = 0 # 0: disabled
+    # None means auto: when txt_feature_layer > 0 and the prefix text LM blocks
+    # are frozen, treat their outputs as fixed features to avoid useless HSDP
+    # backward compute. Set False if you intentionally train through that path.
+    model.stop_gradient_text_features = None
+    model.image_post_connector_scale = 1.0
     model.prompt_causal = True
 
     # ------------------------------------------------------------

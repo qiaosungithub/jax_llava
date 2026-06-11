@@ -395,6 +395,22 @@ def _stateful_enabled(config):
     return bool(getattr(config, "stateful_dataloader", False))
 
 
+def _stateful_snapshot_every_n_steps(config):
+    explicit = getattr(config.dataset, "stateful_snapshot_every_n_steps", None)
+    if explicit is not None:
+        return max(1, int(explicit))
+
+    training = getattr(config, "training", None)
+    checkpoint_per_step = -1
+    if training is not None:
+        checkpoint_per_step = int(training.get("checkpoint_per_step", -1))
+
+    # TorchData defaults to snapshotting every batch, which is too expensive for
+    # large WebDataset shuffle buffers. Align snapshots with checkpoint cadence
+    # so exact resume remains cheap during normal training.
+    return checkpoint_per_step if checkpoint_per_step > 0 else 1000
+
+
 def _expected_bucket_for_zone(zone):
     if zone in _ALLOWED_ZONE_BUCKETS:
         return _ALLOWED_ZONE_BUCKETS[zone]
@@ -2431,7 +2447,17 @@ def create_split(config, batch_size, data_seed_offset=0):
         dl_kwargs["prefetch_factor"] = config.dataset.prefetch_factor
         dl_kwargs["timeout"] = int(getattr(config.dataset, "dataloader_timeout", 0))
 
-    loader_cls = StatefulDataLoader if _stateful_enabled(config.dataset) else DataLoader
+    stateful_loader = _stateful_enabled(config.dataset)
+    if stateful_loader:
+        snapshot_every = _stateful_snapshot_every_n_steps(config)
+        dl_kwargs["snapshot_every_n_steps"] = snapshot_every
+        log_for_0(
+            "StatefulDataLoader snapshot_every_n_steps=%d. "
+            "Increase it if checkpoint replay is acceptable; decrease only for debugging.",
+            snapshot_every,
+        )
+
+    loader_cls = StatefulDataLoader if stateful_loader else DataLoader
     loader = loader_cls(**dl_kwargs)
     return loader, tokenizer
 

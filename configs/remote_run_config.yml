@@ -14,6 +14,7 @@ model:
     attn_logits_soft_cap: 0.0
     final_logit_softcap: 0.0
     txt_feature_layer: 0
+    image_post_connector_scale: 1.0
     prompt_causal: True
     recon_loss_weight: 0.0
 
@@ -90,7 +91,7 @@ training:
         # CLIP is frozen in stage 1, so ImageNet kNN cannot track training progress.
         online_eval_per_step: -1
         online_eval_tasks: []
-        final_eval_tasks: [vqav2]
+        final_eval_tasks: []
 
     stage2:
         name: "stage2_visual_instruction_sft"
@@ -117,6 +118,8 @@ training:
         mix_weights: [22, 0.4, 0.009, 0.068, 0.08, 0.94, 0.022, 1.7, 0.86, 0.048]
         batch_size: 128
         freeze_lm: False
+        freeze_lm_embed: False
+        freeze_lm_late: False
         freeze_image_encoder: True
         optimizer: adam
         adam:
@@ -161,4 +164,4 @@ logging:
     wandb_project: "jax-llava"
     wandb_entity: "sqa24-massachusetts-institute-of-technology"
     wandb_tags: ["llava1.5", "curriculum", "hsdp"]
-    wandb_notes: "[ablation: stage2 connector lr 5e-4] [laion-aes pretrain] LLaVA-1.5 reproduction two-stage curriculum using jit/HSDP. Stage-1 laion-aes, stage-2 LLaVA-OV-1.5-Instruct plus VQAv2/OKVQA/A-OKVQA/OCRVQA/GQA/TextCaps/Visual Genome QA, VG detection, and RefCOCO grounding."
+    wandb_notes: "[prompt causal baseline] [laion-aes pretrain] LLaVA-1.5 reproduction two-stage curriculum using jit/HSDP. Stage-1 trains connector only; stage-2 trains connector + LM. Adam original LR: stage1 connector 1e-3, stage2 LM 2e-5, connector 5e-4. Stage-2 data: LLaVA-OV1.5-Instruct plus VQAv2/OKVQA/A-OKVQA/OCRVQA/GQA/TextCaps/Visual Genome QA, VG detection, and RefCOCO grounding."

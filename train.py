@@ -217,6 +217,24 @@ def _get_lm_pretrained_text_layers(config):
     return int(value)
 
 
+def _infer_stop_gradient_text_features(config, model_kwargs):
+    explicit = model_kwargs.get('stop_gradient_text_features', None)
+    if explicit is not None:
+        return bool(explicit)
+
+    txt_feature_layer = int(model_kwargs.get('txt_feature_layer', 0))
+    if txt_feature_layer <= 0:
+        return False
+
+    freeze_lm_embed, _ = resolve_lm_freeze_flags(
+        freeze_lm=bool(config.training.get('freeze_lm', False)),
+        txt_feature_layer=txt_feature_layer,
+        freeze_lm_embed=config.training.get('freeze_lm_embed', None),
+        freeze_lm_late=config.training.get('freeze_lm_late', None),
+    )
+    return bool(freeze_lm_embed)
+
+
 def _create_model(config, *, finetune_mode: bool = False):
     arch = str(config.model.get('arch', 'paligemma_enc_dec')).lower()
     model_kwargs = config.model.to_dict()
@@ -228,8 +246,16 @@ def _create_model(config, *, finetune_mode: bool = False):
     if arch in {'paligemma_enc_dec', 'prefixmae_paligemma'}:
         if finetune_mode and 'use_decoder' not in model_kwargs:
             model_kwargs['use_decoder'] = False
+        model_kwargs['stop_gradient_text_features'] = _infer_stop_gradient_text_features(
+            config, model_kwargs
+        )
+        allowed = set(PaliGemmaEncDec.__dataclass_fields__.keys())
+        model_kwargs = {k: v for k, v in model_kwargs.items() if k in allowed}
         return PaliGemmaEncDec(**model_kwargs, image_size=config.dataset.image_size)
     if arch in {'llava', 'llava_gemma'}:
+        model_kwargs['stop_gradient_text_features'] = _infer_stop_gradient_text_features(
+            config, model_kwargs
+        )
         allowed = set(LlavaGemma.__dataclass_fields__.keys())
         model_kwargs = {k: v for k, v in model_kwargs.items() if k in allowed}
         return LlavaGemma(**model_kwargs, image_size=config.dataset.image_size)
@@ -466,6 +492,7 @@ def _build_pjit_fns(config, model, state, mesh_bundle):
         'default': compile_sample_step(sampling_tokens, default_beam),
         'shortqa': compile_sample_step(short_tokens, default_beam),
         'mid': compile_sample_step(mid_tokens, default_beam),
+        'mid_beam5': compile_sample_step(mid_tokens, 5, spec_name='mid_beam5'),
         'ocr': compile_sample_step(ocr_tokens, default_beam),
         'refcoco': compile_sample_step(refcoco_tokens, default_beam),
         'pixelbench': compile_sample_step(pixelbench_tokens, default_beam),

@@ -67,6 +67,22 @@ def _select_sample_fn(p_sample_fn, key="default"):
     return p_sample_fn
 
 
+def _select_beam5_sample_fn(p_sample_fn):
+    """Select the explicit beam-5 sampler without falling back to non-beam decoding."""
+    if not isinstance(p_sample_fn, dict):
+        log_for_0("Beam-5 eval skipped: sampler table is unavailable.")
+        return None
+    sample_fn = p_sample_fn.get("mid_beam5")
+    if sample_fn is None:
+        log_for_0("Beam-5 eval skipped: sampler 'mid_beam5' is unavailable.")
+    return sample_fn
+
+
+def _pixelbench_config_includes_vstar(config):
+    benchmarks = getattr(config.eval, "pixelbench_benchmarks", ("vstar",))
+    return any(str(name).strip().lower() in {"v*", "vstar", "vstar_bench"} for name in benchmarks)
+
+
 def run_eval_tasks(
     state,
     p_sample_fn,
@@ -276,6 +292,28 @@ def run_eval_tasks(
             if sample_outputs:
                 writer.write_texts(step, f"vizwiz_samples{suffix}", sample_outputs)
             log_for_0("VisWiz evaluation finished.")
+
+            beam5_sample_fn = _select_beam5_sample_fn(p_sample_fn)
+            if beam5_sample_fn is not None:
+                log_for_0(f"Evaluating VisWiz with beam_size=5 at step {step}...")
+                acc, sample_outputs, metric_dict = eval_vizwiz(
+                    beam5_sample_fn,
+                    run_p_sample_step,
+                    model,
+                    tokenizer,
+                    params,
+                    config,
+                )
+                log_for_0(f"VisWiz beam_size=5 accuracy: {acc:.2f}%")
+                scalar_dict = {f"vizwiz_acc_beam5{suffix}": acc, "step": step}
+                if metric_dict.get("num_without_gt", 0):
+                    scalar_dict[f"vizwiz_num_without_gt_beam5{suffix}"] = float(
+                        metric_dict["num_without_gt"]
+                    )
+                writer.write_scalars(step, scalar_dict)
+                if sample_outputs:
+                    writer.write_texts(step, f"vizwiz_samples_beam5{suffix}", sample_outputs)
+                log_for_0("VisWiz beam_size=5 evaluation finished.")
             continue
 
         if t in {"scienceqa", "scienceqa_img", "scienceqa-img", "sciqa", "sciqa_img"}:
@@ -416,6 +454,27 @@ def run_eval_tasks(
             if sample_outputs:
                 writer.write_texts(step, f"{t.replace('*', 'star')}_samples{suffix}", sample_outputs)
             log_for_0(f"PixelBench task '{t}' evaluation finished.")
+
+            should_eval_vstar_beam5 = pixelbench_aliases.get(t) == "vstar" or (
+                t == "pixelbench" and _pixelbench_config_includes_vstar(config)
+            )
+            if should_eval_vstar_beam5:
+                beam5_sample_fn = _select_beam5_sample_fn(p_sample_fn)
+                if beam5_sample_fn is not None:
+                    log_for_0(f"Evaluating VStar with beam_size=5 at step {step}...")
+                    acc, sample_outputs, _ = eval_pixelbench(
+                        beam5_sample_fn,
+                        run_p_sample_step,
+                        model,
+                        tokenizer,
+                        params,
+                        config,
+                        benchmarks=["vstar"],
+                    )
+                    writer.write_scalars(step, {f"vstar_acc_beam5{suffix}": acc, "step": step})
+                    if sample_outputs:
+                        writer.write_texts(step, f"vstar_samples_beam5{suffix}", sample_outputs)
+                    log_for_0("VStar beam_size=5 evaluation finished.")
             continue
 
         log_for_0(f"Unknown eval task '{task}', skipping.")

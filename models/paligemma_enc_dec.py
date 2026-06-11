@@ -128,6 +128,9 @@ class PaliGemmaEncDec(nn.Module):
 
     # experiment: image embeddings align with text embeddings, by passing txt_feature_layer layers.
     txt_feature_layer: int = 0
+    # Treat text features from frozen prefix LM layers as constants. This keeps
+    # late-fusion runs from spending backward compute on frozen text-only blocks.
+    stop_gradient_text_features: bool = False
     # Standard LLaVA behavior: image prefix tokens are bidirectional, while
     # prompt/text tokens remain causal. Set False to restore the old full
     # image+prompt bidirectional prefix.
@@ -392,6 +395,8 @@ class PaliGemmaEncDec(nn.Module):
                     )
                     _split_txt_cache[_ln] = _lc
                 token_embeds = _x  # (B, T_text, D_lm) – text features after N blocks
+                if self.stop_gradient_text_features:
+                    token_embeds = jax.lax.stop_gradient(token_embeds)
 
             # Prepend image embeddings to text embeddings (or text features)
             T_text_seq = token_embeds.shape[1]

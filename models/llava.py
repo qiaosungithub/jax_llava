@@ -92,6 +92,12 @@ class LlavaGemma(nn.Module):
     image_size: int = 336
     recon_loss_weight: float = 0.0
     txt_feature_layer: int = 0
+    # If the first txt_feature_layer LM blocks are frozen, their text-only
+    # output should usually be treated as a fixed feature. Otherwise JAX still
+    # builds a backward pass through those frozen blocks for no trainable
+    # parameter update, which makes late-fusion HSDP runs much slower.
+    stop_gradient_text_features: bool = False
+    image_post_connector_scale: float = 1.0
     # Standard LLaVA behavior: image prefix tokens are bidirectional, while
     # prompt/text tokens remain causal. Set False to restore the old full
     # image+prompt bidirectional prefix.
@@ -126,6 +132,14 @@ class LlavaGemma(nn.Module):
     def encode_image(self, images: Array, train: bool = False) -> Array:
         """Encode images into CLIP patch tokens."""
         return constrain_batch_model(self.image_encoder(images, train=train))
+
+    def _scale_image_embeds(self, img_embeds: Array) -> Array:
+        scale = 1.0 if self.image_post_connector_scale is None else float(
+            self.image_post_connector_scale
+        )
+        if scale == 1.0:
+            return img_embeds
+        return img_embeds * jnp.asarray(scale, dtype=img_embeds.dtype)
 
     def make_causal_with_prefix_block(
         self,
@@ -229,9 +243,6 @@ class LlavaGemma(nn.Module):
         token_embeds_rms = _rms_from_mean_square(token_embeds_norm)
         token_embeds_valid_norm = _masked_mean_square(token_embeds, text_mask)
         token_embeds_valid_rms = _rms_from_mean_square(token_embeds_valid_norm)
-        log_dict["token_embeds_norm"] = token_embeds_norm
-        log_dict["token_embeds_rms"] = token_embeds_rms
-        log_dict["token_embeds_valid_norm"] = token_embeds_valid_norm
         log_dict["token_embeds_valid_rms"] = token_embeds_valid_rms
         if text_mask is not None:
             valid_text_tokens = jnp.sum(text_mask.astype(jnp.float32))
@@ -249,16 +260,20 @@ class LlavaGemma(nn.Module):
             log_dict["clip_tokens_rms"] = _rms_from_mean_square(clip_tokens_norm)
             img_embeds = self.projector(clip_tokens)
             img_embeds = constrain_batch_model(img_embeds)
+            raw_img_embeds_norm = _mean_square(img_embeds)
+            raw_img_embeds_rms = _rms_from_mean_square(raw_img_embeds_norm)
+            img_embeds = self._scale_image_embeds(img_embeds)
+            img_embeds = constrain_batch_model(img_embeds)
             img_embeds_norm = _mean_square(img_embeds)
             img_embeds_rms = _rms_from_mean_square(img_embeds_norm)
             # Explicit post-connector metrics. img_embeds_norm is kept for
             # backward-compatible W&B curves.
-            log_dict["img_embeds_norm"] = img_embeds_norm
-            log_dict["img_embeds_rms"] = img_embeds_rms
-            log_dict["img_embeds_post_connector_norm"] = img_embeds_norm
+            log_dict["image_post_connector_scale"] = jnp.asarray(
+                self.image_post_connector_scale, dtype=jnp.float32
+            )
+            log_dict["img_embeds_pre_scale_rms"] = raw_img_embeds_rms
             log_dict["img_embeds_post_connector_rms"] = img_embeds_rms
-            log_dict["img_token_rms_ratio"] = img_embeds_rms / jnp.maximum(token_embeds_rms, 1e-12)
-            log_dict["img_token_valid_rms_ratio"] = (
+            log_dict["img_token_txt_embeds_valid_ratio"] = (
                 img_embeds_rms / jnp.maximum(token_embeds_valid_rms, 1e-12)
             )
 
@@ -269,27 +284,17 @@ class LlavaGemma(nn.Module):
                     jnp.asarray(prefix_len, dtype=jnp.int32),
                     cache,
                 )
+                if self.stop_gradient_text_features:
+                    token_embeds = jax.lax.stop_gradient(token_embeds)
                 txt_feature_embeds_norm = _mean_square(token_embeds)
                 txt_feature_embeds_rms = _rms_from_mean_square(txt_feature_embeds_norm)
                 txt_feature_embeds_valid_norm = _masked_mean_square(token_embeds, text_mask)
                 txt_feature_embeds_valid_rms = _rms_from_mean_square(
                     txt_feature_embeds_valid_norm
                 )
-                log_dict["txt_feature_embeds_norm"] = txt_feature_embeds_norm
-                log_dict["txt_feature_embeds_rms"] = txt_feature_embeds_rms
-                log_dict["txt_feature_embeds_valid_norm"] = txt_feature_embeds_valid_norm
                 log_dict["txt_feature_embeds_valid_rms"] = txt_feature_embeds_valid_rms
-                log_dict["img_txt_feature_rms_ratio"] = (
-                    img_embeds_rms / jnp.maximum(txt_feature_embeds_rms, 1e-12)
-                )
-                log_dict["txt_feature_img_rms_ratio"] = (
-                    txt_feature_embeds_rms / jnp.maximum(img_embeds_rms, 1e-12)
-                )
                 log_dict["img_txt_feature_valid_rms_ratio"] = (
                     img_embeds_rms / jnp.maximum(txt_feature_embeds_valid_rms, 1e-12)
-                )
-                log_dict["txt_feature_valid_img_rms_ratio"] = (
-                    txt_feature_embeds_valid_rms / jnp.maximum(img_embeds_rms, 1e-12)
                 )
 
             token_embeds = jnp.concatenate([img_embeds, token_embeds], axis=1)
@@ -389,6 +394,8 @@ class LlavaGemma(nn.Module):
         if images is not None:
             clip_tokens = self.encode_image(images, train=False)
             img_embeds = self.projector(clip_tokens)
+            img_embeds = self._scale_image_embeds(img_embeds)
+            img_embeds = constrain_batch_model(img_embeds)
             K = img_embeds.shape[1]
         else:
             img_embeds = None
@@ -572,6 +579,8 @@ class LlavaGemma(nn.Module):
         if images is not None:
             clip_tokens = self.encode_image(images, train=False)
             img_embeds = self.projector(clip_tokens)
+            img_embeds = self._scale_image_embeds(img_embeds)
+            img_embeds = constrain_batch_model(img_embeds)
             K = img_embeds.shape[1]
         else:
             img_embeds = None
