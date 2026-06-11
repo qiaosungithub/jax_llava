@@ -56,6 +56,17 @@ def _broadcast_string_from_source(value, is_source):
     return bytes(out[:end].tolist()).decode("utf-8")
 
 
+def _select_sample_fn(p_sample_fn, key="default"):
+    """Select a task-specific sampler, while preserving legacy single-sampler callers."""
+    if isinstance(p_sample_fn, dict):
+        return (
+            p_sample_fn.get(key)
+            or p_sample_fn.get("default")
+            or next(iter(p_sample_fn.values()))
+        )
+    return p_sample_fn
+
+
 def run_eval_tasks(
     state,
     p_sample_fn,
@@ -88,10 +99,6 @@ def run_eval_tasks(
         t = str(task).strip().lower()
         if not t:
             continue
-        # MMBench has a separate compiled sampler with a longer prompt length.
-        # Other short-answer tasks use the regular sampler so their prompt shape
-        # stays tied to config.dataset.max_txt_len.
-        short_sample_fn = p_sample_fn
 
         if t == "knn_partial":
             knn_data_dir = None
@@ -129,7 +136,7 @@ def run_eval_tasks(
                 model,
                 config,
                 knn_data_dir,
-                images_per_class=None,
+                images_per_class=config.eval.get("knn_full_images_per_class", None),
                 seed=config.eval.get("knn_seed", 42),
                 k=config.eval.get("knn_k", 20),
                 temperature=config.eval.get("knn_temperature", 0.07),
@@ -178,7 +185,12 @@ def run_eval_tasks(
         if t == "vqav2":
             log_for_0(f"Evaluating VQAv2 at step {step}...")
             acc, sample_outputs, _ = eval_vqav2(
-                short_sample_fn, run_p_sample_step, model, tokenizer, params, config
+                _select_sample_fn(p_sample_fn, "shortqa"),
+                run_p_sample_step,
+                model,
+                tokenizer,
+                params,
+                config,
             )
             log_for_0(f"VQAv2 accuracy: {acc:.2f}%")
             writer.write_scalars(step, {f"vqav2_acc{suffix}": acc, "step": step})
@@ -190,7 +202,12 @@ def run_eval_tasks(
         if t == "mme":
             log_for_0(f"Evaluating MME at step {step}...")
             mme_p, mme_s, sample_outputs, _ = eval_mme(
-                short_sample_fn, run_p_sample_step, model, tokenizer, params, config
+                _select_sample_fn(p_sample_fn, "shortqa"),
+                run_p_sample_step,
+                model,
+                tokenizer,
+                params,
+                config,
             )
             log_for_0(f"MME-P: {mme_p:.2f}")
             log_for_0(f"MME-S: {mme_s:.2f}")
@@ -210,7 +227,12 @@ def run_eval_tasks(
         if t == "textvqa":
             log_for_0(f"Evaluating TextVQA at step {step}...")
             acc, sample_outputs, _ = eval_textvqa(
-                short_sample_fn, run_p_sample_step, model, tokenizer, params, config
+                _select_sample_fn(p_sample_fn, "mid"),
+                run_p_sample_step,
+                model,
+                tokenizer,
+                params,
+                config,
             )
             log_for_0(f"TextVQA accuracy: {acc:.2f}%")
             writer.write_scalars(step, {f"textvqa_acc{suffix}": acc, "step": step})
@@ -222,7 +244,12 @@ def run_eval_tasks(
         if t == "gqa":
             log_for_0(f"Evaluating GQA at step {step}...")
             acc, sample_outputs, _ = eval_gqa(
-                short_sample_fn, run_p_sample_step, model, tokenizer, params, config
+                _select_sample_fn(p_sample_fn, "shortqa"),
+                run_p_sample_step,
+                model,
+                tokenizer,
+                params,
+                config,
             )
             log_for_0(f"GQA accuracy: {acc:.2f}%")
             writer.write_scalars(step, {f"gqa_acc{suffix}": acc, "step": step})
@@ -234,7 +261,12 @@ def run_eval_tasks(
         if t == "vizwiz":
             log_for_0(f"Evaluating VisWiz at step {step}...")
             acc, sample_outputs, metric_dict = eval_vizwiz(
-                short_sample_fn, run_p_sample_step, model, tokenizer, params, config
+                _select_sample_fn(p_sample_fn, "mid"),
+                run_p_sample_step,
+                model,
+                tokenizer,
+                params,
+                config,
             )
             log_for_0(f"VisWiz accuracy: {acc:.2f}%")
             scalar_dict = {f"vizwiz_acc{suffix}": acc, "step": step}
@@ -249,7 +281,12 @@ def run_eval_tasks(
         if t in {"scienceqa", "scienceqa_img", "scienceqa-img", "sciqa", "sciqa_img"}:
             log_for_0(f"Evaluating ScienceQA-IMG at step {step}...")
             acc, sample_outputs, _ = eval_scienceqa_img(
-                short_sample_fn, run_p_sample_step, model, tokenizer, params, config
+                _select_sample_fn(p_sample_fn, "shortqa"),
+                run_p_sample_step,
+                model,
+                tokenizer,
+                params,
+                config,
             )
             log_for_0(f"ScienceQA-IMG accuracy: {acc:.2f}%")
             writer.write_scalars(step, {f"scienceqa_img_acc{suffix}": acc, "step": step})
@@ -261,7 +298,12 @@ def run_eval_tasks(
         if t in {"seed", "seed_bench", "seed-bench", "seed_bench_image", "seed-bench-image"}:
             log_for_0(f"Evaluating SEED-Bench at step {step}...")
             acc, sample_outputs, metric_dict = eval_seed_bench(
-                short_sample_fn, run_p_sample_step, model, tokenizer, params, config
+                _select_sample_fn(p_sample_fn, "shortqa"),
+                run_p_sample_step,
+                model,
+                tokenizer,
+                params,
+                config,
             )
             log_for_0(f"SEED-Bench accuracy: {acc:.2f}%")
             scalar_dict = {f"seed_bench_acc{suffix}": acc, "step": step}
@@ -277,7 +319,12 @@ def run_eval_tasks(
         if t == "pope":
             log_for_0(f"Evaluating POPE at step {step}...")
             pope_f1, sample_outputs, metric_dict = eval_pope(
-                short_sample_fn, run_p_sample_step, model, tokenizer, params, config
+                _select_sample_fn(p_sample_fn, "shortqa"),
+                run_p_sample_step,
+                model,
+                tokenizer,
+                params,
+                config,
             )
             log_for_0(f"POPE macro F1: {pope_f1:.2f}%")
             split_metrics = metric_dict.get("splits", {})
@@ -295,8 +342,7 @@ def run_eval_tasks(
 
         if t == "mmbench":
             if p_sample_step_mmbench is None:
-                log_for_0("Skip MMBench: p_sample_step_mmbench is None")
-                continue
+                p_sample_step_mmbench = _select_sample_fn(p_sample_fn, "mmbench")
             log_for_0(f"Evaluating MMBench at step {step}...")
             acc, sample_outputs, _ = eval_mmbench(
                 p_sample_step_mmbench,
@@ -316,7 +362,12 @@ def run_eval_tasks(
         if t == "refcocog":
             log_for_0(f"Evaluating RefCOCOg at step {step}...")
             acc, sample_outputs, metric_dict = eval_refcocog(
-                short_sample_fn, run_p_sample_step, model, tokenizer, params, config
+                _select_sample_fn(p_sample_fn, "refcoco"),
+                run_p_sample_step,
+                model,
+                tokenizer,
+                params,
+                config,
             )
             scalar_dict = {f"refcocog_acc{suffix}": acc, "step": step}
             if isinstance(metric_dict, dict) and "miou" in metric_dict:
@@ -339,9 +390,14 @@ def run_eval_tasks(
         }
         if t == "pixelbench" or t in pixelbench_aliases:
             benchmarks = None if t == "pixelbench" else [pixelbench_aliases[t]]
+            sample_key = "pixelbench"
+            if t in {"mmvp", "v*", "vstar", "countbench", "countbenchqa"}:
+                sample_key = "mid"
+            elif t == "ocrbench":
+                sample_key = "ocr"
             log_for_0(f"Evaluating PixelBench task '{t}' at step {step}...")
             acc, sample_outputs, metric_dict = eval_pixelbench(
-                short_sample_fn,
+                _select_sample_fn(p_sample_fn, sample_key),
                 run_p_sample_step,
                 model,
                 tokenizer,

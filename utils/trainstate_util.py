@@ -245,18 +245,23 @@ def create_train_state(
     return state, normal_lr_fn, vision_lr_fn, connector_lr_fn
 
   mesh, get_partition_spec, _, _, pjit_compile = mesh_bundle
-  del mesh
   log_for_0("Inferring parameter shapes for sharded init...")
-  params_shape = jax.eval_shape(
-      lambda key: _init_params_raw(key, config.dataset.image_size, model, config.dataset.max_txt_len),
-      rng_init,
-  )
+  # Model init runs the full forward pass, including best-effort activation
+  # sharding constraints. Those constraints are PartitionSpecs, so even
+  # shape-only init must execute under the same mesh context as pjit-compiled
+  # training/init functions.
+  with mesh:
+    params_shape = jax.eval_shape(
+        lambda key: _init_params_raw(key, config.dataset.image_size, model, config.dataset.max_txt_len),
+        rng_init,
+    )
   param_count = sum(int(np.prod(x.shape)) for x in jax.tree.leaves(params_shape))
   log_for_0("Total trainable parameters: " + str(param_count))
 
   tx, normal_lr_fn, vision_lr_fn, connector_lr_fn = _build_optimizer(config, params_shape)
   log_for_0("Inferring optimizer state shapes...")
-  opt_shape = jax.eval_shape(tx.init, params_shape)
+  with mesh:
+    opt_shape = jax.eval_shape(tx.init, params_shape)
   state_shape = train_state.TrainState(
       step=0,
       apply_fn=model.apply,

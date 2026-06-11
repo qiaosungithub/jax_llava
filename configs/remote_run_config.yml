@@ -14,6 +14,7 @@ model:
     attn_logits_soft_cap: 0.0
     final_logit_softcap: 0.0
     txt_feature_layer: 0
+    prompt_causal: True
     recon_loss_weight: 0.0
 
 dataset:
@@ -23,6 +24,8 @@ dataset:
     num_workers: 16
     prefetch_factor: 4
     dataloader_timeout: 900
+    stateful_dataloader: True
+    stateful_dataloader_strict: True
     item_shuffle_size:
         default: 512
         llava_ov15: 50000
@@ -136,8 +139,13 @@ sampling:
 eval:
     eval_recon_tokens: []
     device_batch_size: 32
-    short_answer_max_new_tokens: 8
-    mmbench_max_new_tokens: 8
+    eval_tokens_default: 64
+    eval_tokens_shortqa: 8
+    eval_tokens_mid: 16
+    eval_tokens_ocr: 32
+    eval_tokens_refcoco: 16
+    eval_tokens_pixelbench: 32
+    eval_tokens_mmbench: 8
     online_vqav2_sample_fraction: 0.1
 
 finetune: False

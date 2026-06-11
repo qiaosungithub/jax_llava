@@ -27,6 +27,8 @@ def get_config():
     dataset.pin_memory = False
     # Base offset added to the checkpoint step when seeding dataloader shuffles.
     dataset.data_seed_offset = 0
+    dataset.stateful_dataloader = False
+    dataset.stateful_dataloader_strict = True
     # Regular WebDataset loaders fill this buffer before yielding. Keep the
     # production default large, but allow remote smoke tests to lower it.
     dataset.webdataset_shuffle_size = 10000
@@ -156,6 +158,7 @@ def get_config():
     model.attn_logits_soft_cap = 0.0   # 0.0 = disabled; e.g. 50.0 for Gemma2-style
     model.final_logit_softcap = 0.0    # 0.0 = disabled; e.g. 30.0 for Gemma2-style
     model.txt_feature_layer = 0 # 0: disabled
+    model.prompt_causal = True
 
     # ------------------------------------------------------------
     # Sampling
@@ -208,10 +211,21 @@ def get_config():
     eval.mmbench_data_cache_dir = "/kmh-nfs-ssd-us-mount/data/cached/zhh/mmbench_data"
     eval.mmbench_export_test = False
     # MMBench prompts can be much longer than short VQA prompts. This is eval-only
-    # and uses the short-answer sampler, so it does not change train sequence length.
+    # and uses a separate sampler, so it does not change train sequence length.
     eval.mmbench_max_txt_len = 512
-    eval.short_answer_max_new_tokens = 8
-    eval.mmbench_max_new_tokens = 8
+    # Generation budgets for eval. Keep these task-facing knobs separate from
+    # `sampling.max_new_tokens`, which is used for generic visualization/sample
+    # generation and may be longer than short-answer benchmark outputs need.
+    eval.eval_tokens_default = 64
+    eval.eval_tokens_shortqa = 8
+    eval.eval_tokens_mid = 16
+    eval.eval_tokens_ocr = 32
+    eval.eval_tokens_refcoco = 16
+    eval.eval_tokens_pixelbench = 32
+    eval.eval_tokens_mmbench = 8
+    # Backward-compatible aliases.
+    eval.short_answer_max_new_tokens = eval.eval_tokens_shortqa
+    eval.mmbench_max_new_tokens = eval.eval_tokens_mmbench
     # Online VQAv2 is too expensive at full val scale; final eval still uses
     # eval.vqav2_num_samples unless explicitly overridden.
     eval.online_vqav2_sample_fraction = 0.1

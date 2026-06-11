@@ -128,6 +128,10 @@ class PaliGemmaEncDec(nn.Module):
 
     # experiment: image embeddings align with text embeddings, by passing txt_feature_layer layers.
     txt_feature_layer: int = 0
+    # Standard LLaVA behavior: image prefix tokens are bidirectional, while
+    # prompt/text tokens remain causal. Set False to restore the old full
+    # image+prompt bidirectional prefix.
+    prompt_causal: bool = True
 
     # ── Misc ───────────────────────────────────────────────────────────────
     eos_id: int = 1
@@ -176,15 +180,23 @@ class PaliGemmaEncDec(nn.Module):
         L: int,
         prefix_total: Array,            # (B,)
         cache_size: Optional[int] = None,
+        image_prefix: Optional[Array] = None,
     ) -> Array:
         """(B, L, cache_size) bool attention mask.
 
-        Positions 0 … prefix_total[b]-1 form a fully-bidirectional prefix block;
-        subsequent positions attend causally.
+        When prompt_causal=True, only image prefix tokens are bidirectional;
+        prompt/text tokens attend causally. When False, the legacy
+        image+prompt prefix is fully bidirectional.
         """
         if cache_size is None:
             cache_size = L
-        pt = prefix_total[:, None, None]                             # (B,1,1)
+        if image_prefix is None or not self.prompt_causal:
+            bidir_prefix = prefix_total
+        else:
+            bidir_prefix = jnp.asarray(image_prefix, dtype=jnp.int32)
+            if bidir_prefix.ndim == 0:
+                bidir_prefix = jnp.broadcast_to(bidir_prefix, prefix_total.shape)
+        pt = bidir_prefix[:, None, None]                             # (B,1,1)
         i  = jnp.arange(L,          dtype=jnp.int32)[None, :, None] # (1,L,1)
         j  = jnp.arange(cache_size, dtype=jnp.int32)[None, None, :] # (1,1,C)
         return (j <= i) | ((i < pt) & (j < pt))                     # (B,L,C)
@@ -365,7 +377,9 @@ class PaliGemmaEncDec(nn.Module):
                     jnp.arange(_T, dtype=jnp.int32)[None, :], (_Bt, _T)
                 )
                 _cs = cache[next(iter(cache))]['k'].shape[1] if cache is not None else None
-                _txt_amask = self.make_causal_with_prefix_block(_T, prefix_len, _cs)
+                _txt_amask = self.make_causal_with_prefix_block(
+                    _T, prefix_len, _cs, image_prefix=0
+                )
                 if cache is not None:
                     _emb_dtype = cache[next(iter(cache))]['v'].dtype
                     token_embeds = token_embeds.astype(_emb_dtype)
@@ -406,7 +420,10 @@ class PaliGemmaEncDec(nn.Module):
                 # is a masked image token (sequence index nv <= j < K).
                 pid_i  = positions[:, :, None]                        # (B, L, 1)
                 pid_j  = positions[:, None, :]                        # (B, 1, L)
-                pt     = prefix_total[:, None, None].astype(jnp.int32)
+                bidir_prefix = jnp.where(
+                    self.prompt_causal, num_visible, prefix_total
+                )
+                pt     = bidir_prefix[:, None, None].astype(jnp.int32)
                 j_idx  = jnp.arange(L, dtype=jnp.int32)[None, None, :]
                 nv_3   = num_visible[:, None, None]
                 is_masked_img_key = (j_idx >= nv_3) & (j_idx < K)    # (B, 1, L)
@@ -423,9 +440,13 @@ class PaliGemmaEncDec(nn.Module):
                 prefix_total = prefix_len + K
                 if cache is not None:
                     cs = cache[list(cache.keys())[0]]['k'].shape[1]
-                    attn_mask = self.make_causal_with_prefix_block(L, prefix_total, cs)
+                    attn_mask = self.make_causal_with_prefix_block(
+                        L, prefix_total, cs, image_prefix=K
+                    )
                 else:
-                    attn_mask = self.make_causal_with_prefix_block(L, prefix_total)
+                    attn_mask = self.make_causal_with_prefix_block(
+                        L, prefix_total, image_prefix=K
+                    )
                 positions   = jnp.broadcast_to(
                     jnp.arange(L, dtype=jnp.int32)[None, :], (B, L)
                 )
@@ -439,9 +460,13 @@ class PaliGemmaEncDec(nn.Module):
 
             if cache is not None:
                 cs = cache[list(cache.keys())[0]]['k'].shape[1]
-                attn_mask = self.make_causal_with_prefix_block(L, prefix_total, cs)
+                attn_mask = self.make_causal_with_prefix_block(
+                    L, prefix_total, cs, image_prefix=0
+                )
             else:
-                attn_mask = self.make_causal_with_prefix_block(L, prefix_total)
+                attn_mask = self.make_causal_with_prefix_block(
+                    L, prefix_total, image_prefix=0
+                )
             positions   = jnp.broadcast_to(
                 jnp.arange(L, dtype=jnp.int32)[None, :], (B, L)
             )
@@ -507,10 +532,10 @@ class PaliGemmaEncDec(nn.Module):
             text_embeds = token_embeds[:, K:, :]                     # (B, T_text, D_lm)
             T_text      = text_embeds.shape[1]
 
-            # Purely causal attention mask – bidirectional only for the text
-            # prompt prefix (no image prefix here, so prefix_total = prefix_len).
+            # Text-only branch follows the same prompt_causal policy. With the
+            # default prompt_causal=True this is purely causal.
             text_attn_mask = self.make_causal_with_prefix_block(
-                T_text, prefix_len
+                T_text, prefix_len, image_prefix=0
             )                                                         # (B, T_text, T_text)
             text_positions = jnp.broadcast_to(
                 jnp.arange(T_text, dtype=jnp.int32)[None, :], (B, T_text)

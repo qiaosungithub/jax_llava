@@ -365,6 +365,27 @@ def collate_fn(batch):
     }
 
 
+def _make_dummy_pope_batch(batch_size, image_size, max_len):
+    return {
+        "pixel_values": torch.zeros((batch_size, 3, image_size, image_size), dtype=torch.float32),
+        "input_ids": torch.zeros((batch_size, max_len), dtype=torch.long),
+        "prefix_len": torch.ones((batch_size,), dtype=torch.int32),
+        "aux": [
+            {
+                "split": "",
+                "sample_uid": "",
+                "question_id": -1,
+                "question": "",
+                "image": "",
+                "label": "yes",
+                "prompt": "",
+            }
+            for _ in range(batch_size)
+        ],
+        "_all_pad": True,
+    }
+
+
 def normalize_pope_answer(text: str) -> str:
     text = "" if text is None else str(text)
 
@@ -530,12 +551,47 @@ def eval_pope(p_sample_step, run_p_sample_step, model, tokenizer, params, config
             num_workers=num_workers,
             collate_fn=collate_fn,
         )
+        loader_iter = iter(loader)
+        samples_per_process = (len(dataset) + jax.process_count() - 1) // jax.process_count()
+        fixed_num_steps = (samples_per_process + batch_size - 1) // batch_size
+        log_for_0(
+            f"POPE/{split}: fixed_num_steps={fixed_num_steps}, "
+            f"samples_per_process={samples_per_process}, batch_size={batch_size}"
+        )
 
-        for i, batch in enumerate(loader):
-            if not batch:
-                continue
+        for i in range(fixed_num_steps):
+            try:
+                raw_batch = next(loader_iter)
+                if not raw_batch:
+                    raw_batch = _make_dummy_pope_batch(
+                        batch_size, config.dataset.image_size, config.dataset.max_txt_len
+                    )
+            except StopIteration:
+                raw_batch = _make_dummy_pope_batch(
+                    batch_size, config.dataset.image_size, config.dataset.max_txt_len
+                )
 
-            batch = prepare_batch_data(batch, batch_size=batch_size)
+            if "aux" not in raw_batch:
+                raw_batch["aux"] = []
+            if len(raw_batch["aux"]) < batch_size:
+                raw_batch["aux"].extend(
+                    [
+                        {
+                            "split": split,
+                            "sample_uid": "",
+                            "question_id": -1,
+                            "question": "",
+                            "image": "",
+                            "label": "yes",
+                            "prompt": "",
+                        }
+                        for _ in range(batch_size - len(raw_batch["aux"]))
+                    ]
+                )
+
+            batch = prepare_batch_data(raw_batch, batch_size=batch_size)
+            if raw_batch.get("_all_pad", False):
+                batch["is_pad"] = np.ones((batch_size,), dtype=bool)
             out_strs = run_p_sample_step(
                 p_sample_step,
                 model,

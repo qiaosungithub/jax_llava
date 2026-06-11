@@ -26,6 +26,23 @@ Array = jnp.ndarray
 PyTree = Any
 
 
+def _mean_square(x: Array) -> Array:
+    return jnp.mean(x.astype(jnp.float32) ** 2)
+
+
+def _rms_from_mean_square(x_ms: Array) -> Array:
+    return jnp.sqrt(jnp.maximum(x_ms, 0.0))
+
+
+def _masked_mean_square(x: Array, mask: Optional[Array]) -> Array:
+    if mask is None:
+        return _mean_square(x)
+    mask = mask.astype(jnp.float32)
+    denom = jnp.maximum(jnp.sum(mask) * x.shape[-1], 1.0)
+    mask = mask[..., None]
+    return jnp.sum(x.astype(jnp.float32) ** 2 * mask) / denom
+
+
 class LlavaProjector(nn.Module):
     """LLaVA multimodal projector.
 
@@ -75,6 +92,10 @@ class LlavaGemma(nn.Module):
     image_size: int = 336
     recon_loss_weight: float = 0.0
     txt_feature_layer: int = 0
+    # Standard LLaVA behavior: image prefix tokens are bidirectional, while
+    # prompt/text tokens remain causal. Set False to restore the old full
+    # image+prompt bidirectional prefix.
+    prompt_causal: bool = True
     eos_id: int = 1
 
     def setup(self) -> None:
@@ -111,11 +132,18 @@ class LlavaGemma(nn.Module):
         L: int,
         prefix_total: Array,
         cache_size: Optional[int] = None,
+        image_prefix: Optional[Array] = None,
     ) -> Array:
-        """Build causal attention with a bidirectional image+prompt prefix."""
+        """Build causal attention, optionally with only image tokens bidirectional."""
         if cache_size is None:
             cache_size = L
-        pt = prefix_total[:, None, None]
+        if image_prefix is None or not self.prompt_causal:
+            bidir_prefix = prefix_total
+        else:
+            bidir_prefix = jnp.asarray(image_prefix, dtype=jnp.int32)
+            if bidir_prefix.ndim == 0:
+                bidir_prefix = jnp.broadcast_to(bidir_prefix, prefix_total.shape)
+        pt = bidir_prefix[:, None, None]
         i = jnp.arange(L, dtype=jnp.int32)[None, :, None]
         j = jnp.arange(cache_size, dtype=jnp.int32)[None, None, :]
         return (j <= i) | ((i < pt) & (j < pt))
@@ -139,7 +167,9 @@ class LlavaGemma(nn.Module):
         B, T, _ = token_embeds.shape
         positions = jnp.broadcast_to(jnp.arange(T, dtype=jnp.int32)[None, :], (B, T))
         cache_size = self._cache_size(cache) if cache is not None else None
-        attn_mask = self.make_causal_with_prefix_block(T, prefix_len, cache_size)
+        attn_mask = self.make_causal_with_prefix_block(
+            T, prefix_len, cache_size, image_prefix=0
+        )
         x = token_embeds.astype(self._cache_dtype(cache)) if cache is not None else token_embeds
 
         old_cache = cache or {}
@@ -189,20 +219,48 @@ class LlavaGemma(nn.Module):
         cache: Optional[PyTree] = None,
         use_cache: bool = False,
     ) -> Any:
-        del attention_mask, mask_token_category_probs, use_cache
+        del mask_token_category_probs, use_cache
 
         log_dict: Dict[str, Array] = {}
+        text_mask = attention_mask
         token_embeds = self.lm_backbone.embedder.encode(input_ids)
         token_embeds = constrain_batch_model(token_embeds)
-        log_dict["token_embeds_norm"] = jnp.mean(token_embeds ** 2)
+        token_embeds_norm = _mean_square(token_embeds)
+        token_embeds_rms = _rms_from_mean_square(token_embeds_norm)
+        token_embeds_valid_norm = _masked_mean_square(token_embeds, text_mask)
+        token_embeds_valid_rms = _rms_from_mean_square(token_embeds_valid_norm)
+        log_dict["token_embeds_norm"] = token_embeds_norm
+        log_dict["token_embeds_rms"] = token_embeds_rms
+        log_dict["token_embeds_valid_norm"] = token_embeds_valid_norm
+        log_dict["token_embeds_valid_rms"] = token_embeds_valid_rms
+        if text_mask is not None:
+            valid_text_tokens = jnp.sum(text_mask.astype(jnp.float32))
+            total_text_tokens = jnp.asarray(text_mask.size, dtype=jnp.float32)
+            log_dict["valid_text_tokens"] = valid_text_tokens
+            log_dict["text_padding_fraction"] = (
+                1.0 - valid_text_tokens / jnp.maximum(total_text_tokens, 1.0)
+            )
 
         if images is not None:
             images = constrain_batch(images)
             clip_tokens = self.encode_image(images, train=labels is not None)
-            log_dict["clip_tokens_norm"] = jnp.mean(clip_tokens ** 2)
+            clip_tokens_norm = _mean_square(clip_tokens)
+            log_dict["clip_tokens_norm"] = clip_tokens_norm
+            log_dict["clip_tokens_rms"] = _rms_from_mean_square(clip_tokens_norm)
             img_embeds = self.projector(clip_tokens)
             img_embeds = constrain_batch_model(img_embeds)
-            log_dict["img_embeds_norm"] = jnp.mean(img_embeds ** 2)
+            img_embeds_norm = _mean_square(img_embeds)
+            img_embeds_rms = _rms_from_mean_square(img_embeds_norm)
+            # Explicit post-connector metrics. img_embeds_norm is kept for
+            # backward-compatible W&B curves.
+            log_dict["img_embeds_norm"] = img_embeds_norm
+            log_dict["img_embeds_rms"] = img_embeds_rms
+            log_dict["img_embeds_post_connector_norm"] = img_embeds_norm
+            log_dict["img_embeds_post_connector_rms"] = img_embeds_rms
+            log_dict["img_token_rms_ratio"] = img_embeds_rms / jnp.maximum(token_embeds_rms, 1e-12)
+            log_dict["img_token_valid_rms_ratio"] = (
+                img_embeds_rms / jnp.maximum(token_embeds_valid_rms, 1e-12)
+            )
 
             split_txt_cache = {}
             if self.txt_feature_layer > 0:
@@ -211,7 +269,28 @@ class LlavaGemma(nn.Module):
                     jnp.asarray(prefix_len, dtype=jnp.int32),
                     cache,
                 )
-                log_dict["txt_feature_embeds_norm"] = jnp.mean(token_embeds ** 2)
+                txt_feature_embeds_norm = _mean_square(token_embeds)
+                txt_feature_embeds_rms = _rms_from_mean_square(txt_feature_embeds_norm)
+                txt_feature_embeds_valid_norm = _masked_mean_square(token_embeds, text_mask)
+                txt_feature_embeds_valid_rms = _rms_from_mean_square(
+                    txt_feature_embeds_valid_norm
+                )
+                log_dict["txt_feature_embeds_norm"] = txt_feature_embeds_norm
+                log_dict["txt_feature_embeds_rms"] = txt_feature_embeds_rms
+                log_dict["txt_feature_embeds_valid_norm"] = txt_feature_embeds_valid_norm
+                log_dict["txt_feature_embeds_valid_rms"] = txt_feature_embeds_valid_rms
+                log_dict["img_txt_feature_rms_ratio"] = (
+                    img_embeds_rms / jnp.maximum(txt_feature_embeds_rms, 1e-12)
+                )
+                log_dict["txt_feature_img_rms_ratio"] = (
+                    txt_feature_embeds_rms / jnp.maximum(img_embeds_rms, 1e-12)
+                )
+                log_dict["img_txt_feature_valid_rms_ratio"] = (
+                    img_embeds_rms / jnp.maximum(txt_feature_embeds_valid_rms, 1e-12)
+                )
+                log_dict["txt_feature_valid_img_rms_ratio"] = (
+                    txt_feature_embeds_valid_rms / jnp.maximum(img_embeds_rms, 1e-12)
+                )
 
             token_embeds = jnp.concatenate([img_embeds, token_embeds], axis=1)
             token_embeds = constrain_batch_model(token_embeds)
@@ -224,9 +303,13 @@ class LlavaGemma(nn.Module):
         prefix_total = jnp.asarray(prefix_len, dtype=jnp.int32) + K
         if cache is not None:
             cache_size = cache[list(cache.keys())[0]]["k"].shape[1]
-            attn_mask = self.make_causal_with_prefix_block(L, prefix_total, cache_size)
+            attn_mask = self.make_causal_with_prefix_block(
+                L, prefix_total, cache_size, image_prefix=K
+            )
         else:
-            attn_mask = self.make_causal_with_prefix_block(L, prefix_total)
+            attn_mask = self.make_causal_with_prefix_block(
+                L, prefix_total, image_prefix=K
+            )
 
         positions = jnp.broadcast_to(jnp.arange(L, dtype=jnp.int32)[None, :], (B, L))
         inputs = _Inputs(
@@ -337,7 +420,7 @@ class LlavaGemma(nn.Module):
         L = token_embeds.shape[1]
         positions = jnp.broadcast_to(jnp.arange(L, dtype=jnp.int32)[None, :], (B, L))
         prefill_attn_mask = self.make_causal_with_prefix_block(
-            L, prefix_total, cache_size=max_total_len
+            L, prefix_total, cache_size=max_total_len, image_prefix=K
         )
         if use_split:
             prefill_out, rest_cache = self._apply_lm_from_layer(
@@ -520,7 +603,7 @@ class LlavaGemma(nn.Module):
         L = token_embeds.shape[1]
         positions = jnp.broadcast_to(jnp.arange(L, dtype=jnp.int32)[None, :], (B, L))
         prefill_attn_mask = self.make_causal_with_prefix_block(
-            L, prefix_total, cache_size=max_total_len
+            L, prefix_total, cache_size=max_total_len, image_prefix=K
         )
         if use_split:
             prefill_out, rest_cache = self._apply_lm_from_layer(

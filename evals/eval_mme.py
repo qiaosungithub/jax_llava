@@ -8,6 +8,7 @@ from glob import glob
 
 import fsspec
 import jax
+import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
@@ -300,6 +301,25 @@ def vis_mme_qa(o):
     )
 
 
+def _make_dummy_mme_batch(batch_size, image_size, max_len):
+    return {
+        "pixel_values": torch.zeros((batch_size, 3, image_size, image_size), dtype=torch.float32),
+        "input_ids": torch.zeros((batch_size, max_len), dtype=torch.long),
+        "prefix_len": torch.ones((batch_size,), dtype=torch.int32),
+        "aux": [
+            {
+                "question_id": -1,
+                "category": "",
+                "question": "",
+                "prompt": "",
+                "answer": "",
+            }
+            for _ in range(batch_size)
+        ],
+        "_all_pad": True,
+    }
+
+
 def eval_mme(p_sample_step, run_p_sample_step, model, tokenizer, params, config):
     mme_root = getattr(config.eval, "mme_root", None)
     if not mme_root:
@@ -324,14 +344,54 @@ def eval_mme(p_sample_step, run_p_sample_step, model, tokenizer, params, config)
         num_workers=getattr(config.eval, "mme_num_workers", 0),
         collate_fn=collate_fn,
     )
+    loader_iter = iter(loader)
+
+    # All hosts must call the HSDP pjit the same number of times. MME has 2374
+    # samples, so with 8 hosts and local batch 8, ranks 0..5 have one extra
+    # tail batch while ranks 6..7 do not. Dummy all-pad batches keep the launch
+    # groups synchronized without adding duplicate predictions.
+    samples_per_process = (len(dataset) + jax.process_count() - 1) // jax.process_count()
+    fixed_num_steps = (samples_per_process + batch_size - 1) // batch_size
+    log_for_0(
+        "MME fixed eval schedule: "
+        f"total_samples={len(dataset)}, samples_per_process={samples_per_process}, "
+        f"fixed_num_steps={fixed_num_steps}, batch_size={batch_size}"
+    )
 
     all_outs = []
     sample_outputs = []
 
-    for i, batch in enumerate(loader):
-        if not batch:
-            continue
-        batch = prepare_batch_data(batch, batch_size=batch_size)
+    for i in range(fixed_num_steps):
+        try:
+            raw_batch = next(loader_iter)
+            if not raw_batch:
+                raw_batch = _make_dummy_mme_batch(
+                    batch_size, config.dataset.image_size, config.dataset.max_txt_len
+                )
+        except StopIteration:
+            raw_batch = _make_dummy_mme_batch(
+                batch_size, config.dataset.image_size, config.dataset.max_txt_len
+            )
+
+        if "aux" not in raw_batch:
+            raw_batch["aux"] = []
+        if len(raw_batch["aux"]) < batch_size:
+            raw_batch["aux"].extend(
+                [
+                    {
+                        "question_id": -1,
+                        "category": "",
+                        "question": "",
+                        "prompt": "",
+                        "answer": "",
+                    }
+                    for _ in range(batch_size - len(raw_batch["aux"]))
+                ]
+            )
+
+        batch = prepare_batch_data(raw_batch, batch_size=batch_size)
+        if raw_batch.get("_all_pad", False):
+            batch["is_pad"] = np.ones((batch_size,), dtype=bool)
         out_strs = run_p_sample_step(
             p_sample_step,
             model,

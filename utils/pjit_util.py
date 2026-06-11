@@ -12,6 +12,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 _mesh = None
 _mode = "hsdp"
+_logged_data_layout_fallback = False
 
 
 def log_for_0(*args, **kwargs):
@@ -145,6 +146,64 @@ def _data_axis_names(mesh: Mesh, sharding_mode: str):
     return tuple(mesh.axis_names)
 
 
+def _host_local_data_position_count(mesh: Mesh, data_axes):
+    axis_to_dim = {name: dim for dim, name in enumerate(mesh.axis_names)}
+    data_dims = tuple(axis_to_dim[name] for name in data_axes)
+    local_devices = set(jax.local_devices())
+    positions = set()
+    for index, device in np.ndenumerate(mesh.devices):
+        if device in local_devices:
+            positions.add(tuple(index[dim] for dim in data_dims))
+    return len(positions)
+
+
+def _host_local_batches_match_data_axes(mesh: Mesh, data_axes):
+    """Return True when a host-local batch maps to its process's data slice.
+
+    The dataloader emits `global_batch / process_count` examples on each
+    process. With HSDP DATA inputs sharded only over data axes, this is valid
+    only if each process owns exactly `1 / process_count` of the logical data
+    positions. Some TPU physical layouts put one host across too many data-axis
+    positions; in that case host-local arrays must be sharded over all mesh axes
+    at the input boundary.
+    """
+    if not data_axes:
+        return True
+    data_slots = 1
+    axis_to_dim = {name: dim for dim, name in enumerate(mesh.axis_names)}
+    for name in data_axes:
+        data_slots *= int(mesh.devices.shape[axis_to_dim[name]])
+    process_count = int(jax.process_count())
+    if process_count <= 0 or data_slots % process_count != 0:
+        return False
+    return _host_local_data_position_count(mesh, data_axes) == data_slots // process_count
+
+
+def _host_input_data_spec(mesh: Mesh, sharding_mode: str):
+    global _logged_data_layout_fallback
+    data_axes = _data_axis_names(mesh, sharding_mode)
+    if not data_axes:
+        return P()
+    mode = str(sharding_mode).lower()
+    if mode in {"hsdp", "fsdp"} and not _host_local_batches_match_data_axes(mesh, data_axes):
+        if not _logged_data_layout_fallback:
+            local_positions = _host_local_data_position_count(mesh, data_axes)
+            data_slots = int(np.prod([mesh.shape[name] for name in data_axes]))
+            expected = data_slots / max(int(jax.process_count()), 1)
+            log_for_0(
+                "Host-local batch fallback: DATA spec %s gives process %d %s/%s "
+                "data positions (expected %s); using all mesh axes for host inputs.",
+                P(data_axes),
+                jax.process_index(),
+                local_positions,
+                data_slots,
+                expected,
+            )
+            _logged_data_layout_fallback = True
+        return P(tuple(mesh.axis_names))
+    return P(data_axes)
+
+
 def _axis_size(axis_rule, mesh_shape):
     if axis_rule is None:
         return 1
@@ -156,11 +215,53 @@ def _axis_size(axis_rule, mesh_shape):
     return size
 
 
+def _process_major_model_axis_mesh(mesh_shape, devices):
+    """Lay out devices so each host owns a full slice of the model axis.
+
+    HSDP DATA inputs are sharded over all mesh axes except the last model axis.
+    The training dataloader emits `global_batch / process_count` examples per
+    host, so every host's local devices must cover only that many rows.  On some
+    TPU topologies the default JAX mesh can split one host over too many data
+    shards and then `make_array_from_process_local_data` expects a larger host
+    batch.  This process-major layout keeps the last axis local whenever the
+    model-axis size divides the local device count.
+    """
+    if len(mesh_shape) < 2 or not devices:
+        return None
+    by_process = {}
+    for device in devices:
+        process_index = getattr(device, "process_index", None)
+        if process_index is None:
+            return None
+        by_process.setdefault(process_index, []).append(device)
+    process_ids = sorted(by_process)
+    local_counts = {len(by_process[process_id]) for process_id in process_ids}
+    if len(local_counts) != 1:
+        return None
+    local_device_count = local_counts.pop()
+    model_axis_size = int(mesh_shape[-1])
+    if model_axis_size <= 0 or local_device_count % model_axis_size != 0:
+        return None
+    data_shape = tuple(mesh_shape[:-1])
+    data_slots = int(np.prod(data_shape))
+    data_slots_per_process = local_device_count // model_axis_size
+    if data_slots != len(process_ids) * data_slots_per_process:
+        return None
+
+    out = np.empty(tuple(mesh_shape), dtype=object)
+    for process_ordinal, process_id in enumerate(process_ids):
+        local_devices = sorted(by_process[process_id], key=lambda d: getattr(d, "id", 0))
+        for local_ordinal, device in enumerate(local_devices):
+            data_ordinal = process_ordinal * data_slots_per_process + local_ordinal // model_axis_size
+            model_ordinal = local_ordinal % model_axis_size
+            out[np.unravel_index(data_ordinal, data_shape) + (model_ordinal,)] = device
+    return out
+
+
 def get_spec_dict(tree, mesh: Mesh, param_mode: MeshMode, sharding_mode: str):
     sharding_mode = str(sharding_mode).lower()
     if param_mode == MeshMode.DATA:
-        data_axes = _data_axis_names(mesh, sharding_mode)
-        data_spec = P(data_axes) if data_axes else P()
+        data_spec = _host_input_data_spec(mesh, sharding_mode)
         spec_tree = jax.tree.map(lambda _: data_spec, tree)
     elif sharding_mode == "ddp":
         spec_tree = jax.tree.map(lambda _: P(), tree)
@@ -204,6 +305,7 @@ def get_spec_dict(tree, mesh: Mesh, param_mode: MeshMode, sharding_mode: str):
 
 def get_mesh() -> Mesh:
     global_device_count = jax.device_count()
+    devices = jax.devices()
     device_kind = jax.local_devices()[0].device_kind.lower()
     mesh_shape = None
     for topo_name, topo_shapes in TOPOLOGIES.items():
@@ -218,10 +320,12 @@ def get_mesh() -> Mesh:
         # Local CPU/GPU debug path.
         mesh_shape = (global_device_count,)
 
-    devices = mesh_utils.create_device_mesh(
-        mesh_shape,
-        allow_split_physical_axes=(len(mesh_shape) > 2),
-    )
+    devices = _process_major_model_axis_mesh(mesh_shape, devices)
+    if devices is None:
+        devices = mesh_utils.create_device_mesh(
+            mesh_shape,
+            allow_split_physical_axes=(len(mesh_shape) > 2),
+        )
     return Mesh(devices, tuple(f"AXIS_{i}" for i in range(len(mesh_shape))))
 
 

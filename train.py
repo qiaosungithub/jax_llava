@@ -32,6 +32,11 @@ from utils.ckpt_util import (
     save_checkpoint,
 )
 from utils.data_util import resolve_dataset_roots
+from utils.dataloader_state_util import (
+    restore_dataloader_state,
+    save_dataloader_state,
+    stateful_dataloader_enabled,
+)
 from utils.frozen_util import (
     get_trainable,
     merge_params,
@@ -173,6 +178,15 @@ def sample_step(params, images, prompt_ids, prefix_len, model, max_new_tokens=64
     )
 
 
+def _eval_token_budget(config, key, default, legacy_key=None):
+    value = config.eval.get(key, None)
+    if value is None and legacy_key:
+        value = config.eval.get(legacy_key, None)
+    if value is None:
+        value = default
+    return int(value)
+
+
 def recon_step(params, images, model: PaliGemmaEncDec, num_visible: int):
     return model.apply({'params': params}, images, num_visible, method=model.reconstruct)
 
@@ -209,6 +223,7 @@ def _create_model(config, *, finetune_mode: bool = False):
     model_kwargs.pop('arch', None)
     model_kwargs.pop('image_size', None)
     model_kwargs.pop('lm_checkpoint_variant', None)
+    model_kwargs.pop('rope_scale_when_interpolate', None)
 
     if arch in {'paligemma_enc_dec', 'prefixmae_paligemma'}:
         if finetune_mode and 'use_decoder' not in model_kwargs:
@@ -258,8 +273,21 @@ def _validate_and_get_local_batch_size(config):
     return local_batch_size
 
 
-def _create_train_iterator(config, local_batch_size, step_offset):
-    data_seed_offset = int(getattr(config.dataset, "data_seed_offset", 0)) + int(step_offset)
+def _create_train_iterator(
+    config,
+    local_batch_size,
+    step_offset,
+    *,
+    load_from=None,
+    zone=None,
+    checkpoint_step_for_state=None,
+):
+    if stateful_dataloader_enabled(config):
+        # Exact stateful resume restores iterator cursors/RNG. Do not change the
+        # seed by checkpoint step or the restored stream will not match.
+        data_seed_offset = int(getattr(config.dataset, "data_seed_offset", 0))
+    else:
+        data_seed_offset = int(getattr(config.dataset, "data_seed_offset", 0)) + int(step_offset)
     log_for_0(
         'Creating train loader with batch size: %d, data_seed_offset=%d',
         local_batch_size,
@@ -270,7 +298,26 @@ def _create_train_iterator(config, local_batch_size, step_offset):
         local_batch_size,
         data_seed_offset=data_seed_offset,
     )
+    if stateful_dataloader_enabled(config) and load_from and int(step_offset) > 0:
+        expected_state_step = (
+            int(checkpoint_step_for_state)
+            if checkpoint_step_for_state is not None
+            else int(step_offset)
+        )
+        restore_dataloader_state(
+            train_loader,
+            config,
+            load_from,
+            zone,
+            expected_state_step,
+            local_batch_size,
+        )
     return train_loader, iter(train_loader), tokenizer
+
+
+def _save_training_checkpoint(state, train_loader, config, workdir, step, local_batch_size):
+    save_checkpoint(state, workdir)
+    save_dataloader_state(train_loader, config, workdir, step, local_batch_size)
 
 
 def _flatten_host_local_batch(batch):
@@ -361,47 +408,78 @@ def _build_pjit_fns(config, model, state, mesh_bundle):
         donate_argnums=(0, 1),
     )
 
-    sample_out_spec = get_partition_spec(
-        jax.ShapeDtypeStruct((fake_bs, int(config.sampling.max_new_tokens)), jnp.int32),
-        MeshMode.DATA,
+    default_tokens = int(config.eval.get(
+        'eval_tokens_default',
+        config.sampling.get('max_new_tokens', 64),
+    ))
+    sampling_tokens = int(config.sampling.get('max_new_tokens', default_tokens))
+    default_beam = int(config.sampling.get('beam_size', 1))
+    short_tokens = _eval_token_budget(
+        config,
+        'eval_tokens_shortqa',
+        8,
+        legacy_key='short_answer_max_new_tokens',
     )
-    p_sample_step = pjit_compile(
-        partial(
-            sample_step,
-            model=model,
-            max_new_tokens=int(config.sampling.max_new_tokens),
-            beam_size=int(config.sampling.get('beam_size', 1)),
-        ),
-        in_shardings=(state_spec.params, batch_spec['pixel_values'], batch_spec['input_ids'], batch_spec['prefix_len']),
-        out_shardings=sample_out_spec,
+    mid_tokens = _eval_token_budget(config, 'eval_tokens_mid', 16)
+    ocr_tokens = _eval_token_budget(config, 'eval_tokens_ocr', 32)
+    refcoco_tokens = _eval_token_budget(config, 'eval_tokens_refcoco', mid_tokens)
+    pixelbench_tokens = _eval_token_budget(config, 'eval_tokens_pixelbench', ocr_tokens)
+    mmbench_tokens = _eval_token_budget(
+        config,
+        'eval_tokens_mmbench',
+        short_tokens,
+        legacy_key='mmbench_max_new_tokens',
     )
-    _attach_sample_metadata(p_sample_step, mesh, batch_spec, reduce_scatter)
 
-    # MMBench can need a longer prompt length than training/VQA prompts, so it
-    # gets its own input spec instead of reusing batch_spec['input_ids'].
-    mmbench_new_tokens = int(getattr(config.eval, 'mmbench_max_new_tokens', 8))
-    mmbench_out_spec = get_partition_spec(
-        jax.ShapeDtypeStruct((fake_bs, mmbench_new_tokens), jnp.int32),
-        MeshMode.DATA,
-    )
-    p_sample_step_mmbench = pjit_compile(
-        partial(
-            sample_step,
-            model=model,
-            max_new_tokens=mmbench_new_tokens,
-            beam_size=int(config.sampling.get('beam_size', 1)),
-        ),
-        in_shardings=(
-            state_spec.params,
-            mmbench_batch_spec['pixel_values'],
-            mmbench_batch_spec['input_ids'],
-            mmbench_batch_spec['prefix_len'],
-        ),
-        out_shardings=mmbench_out_spec,
-    )
-    _attach_sample_metadata(p_sample_step_mmbench, mesh, mmbench_batch_spec, reduce_scatter)
+    sample_cache = {}
 
-    return state_spec, batch_spec, p_train_step, p_sample_step, p_sample_step_mmbench
+    def compile_sample_step(max_new_tokens, beam_size=default_beam, sampler_batch_spec=batch_spec, spec_name='default'):
+        max_new_tokens = int(max_new_tokens)
+        beam_size = int(beam_size)
+        cache_key = (max_new_tokens, beam_size, spec_name)
+        if cache_key in sample_cache:
+            return sample_cache[cache_key]
+        sample_out_spec = get_partition_spec(
+            jax.ShapeDtypeStruct((fake_bs, max_new_tokens), jnp.int32),
+            MeshMode.DATA,
+        )
+        fn = pjit_compile(
+            partial(
+                sample_step,
+                model=model,
+                max_new_tokens=max_new_tokens,
+                beam_size=beam_size,
+            ),
+            in_shardings=(
+                state_spec.params,
+                sampler_batch_spec['pixel_values'],
+                sampler_batch_spec['input_ids'],
+                sampler_batch_spec['prefix_len'],
+            ),
+            out_shardings=sample_out_spec,
+        )
+        _attach_sample_metadata(fn, mesh, sampler_batch_spec, reduce_scatter)
+        sample_cache[cache_key] = fn
+        return fn
+
+    p_sample_steps = {
+        'default': compile_sample_step(sampling_tokens, default_beam),
+        'shortqa': compile_sample_step(short_tokens, default_beam),
+        'mid': compile_sample_step(mid_tokens, default_beam),
+        'ocr': compile_sample_step(ocr_tokens, default_beam),
+        'refcoco': compile_sample_step(refcoco_tokens, default_beam),
+        'pixelbench': compile_sample_step(pixelbench_tokens, default_beam),
+        # MMBench can need a longer prompt length than training/VQA prompts, so
+        # it gets its own input spec instead of reusing batch_spec['input_ids'].
+        'mmbench': compile_sample_step(
+            mmbench_tokens,
+            default_beam,
+            sampler_batch_spec=mmbench_batch_spec,
+            spec_name='mmbench',
+        ),
+    }
+
+    return state_spec, batch_spec, p_train_step, p_sample_steps, p_sample_steps['mmbench']
 
 
 def run_p_sample_step(p_sample_step, model, tokenizer, params, images, prompt_ids, prefix_len=None):
@@ -478,6 +556,52 @@ def _maybe_shard_params(params, mesh, params_spec):
     return shard_cpu_tree_to_mesh(params, mesh, params_spec)
 
 
+def _interpolate_patch_pos_embed(params, target_image_size, patch_size):
+    """Interpolate learned patch_pos_embed before restoring at a new resolution."""
+    enc_params = params.get('image_encoder', {})
+    encoder = enc_params.get('encoder', {}) if hasattr(enc_params, 'get') else {}
+    if not hasattr(encoder, 'get') or 'patch_pos_embed' not in encoder:
+        return params
+
+    old_posemb = encoder['patch_pos_embed']
+    t_old = int(old_posemb.shape[1])
+    dim = int(old_posemb.shape[2])
+    grid_old = int(np.sqrt(t_old))
+    if grid_old * grid_old != t_old:
+        raise ValueError(f'patch_pos_embed token count is not square: {t_old}')
+    grid_new = int(target_image_size) // int(patch_size)
+    t_new = grid_new * grid_new
+    if t_old == t_new:
+        return params
+
+    log_for_0(
+        'Interpolating patch_pos_embed: (%d x %d = %d) -> (%d x %d = %d), '
+        'resolution %d -> %d (patch_size=%d)',
+        grid_old,
+        grid_old,
+        t_old,
+        grid_new,
+        grid_new,
+        t_new,
+        grid_old * int(patch_size),
+        int(target_image_size),
+        int(patch_size),
+    )
+
+    import scipy.ndimage
+
+    old_grid = np.asarray(jax.device_get(old_posemb[0])).reshape(grid_old, grid_old, dim)
+    zoom_factors = (grid_new / grid_old, grid_new / grid_old, 1)
+    new_grid = scipy.ndimage.zoom(old_grid, zoom_factors, order=1)
+    new_posemb = new_grid.reshape(1, t_new, dim).astype(old_grid.dtype, copy=False)
+
+    params = dict(params)
+    params['image_encoder'] = dict(params['image_encoder'])
+    params['image_encoder']['encoder'] = dict(params['image_encoder']['encoder'])
+    params['image_encoder']['encoder']['patch_pos_embed'] = new_posemb
+    return params
+
+
 def _load_initial_pretrained_params(state, config, mesh, state_spec, step_offset=0):
     to_fp32 = lambda x: x.astype(jnp.float32) if hasattr(x, 'astype') else x
     params = dict(state.params)
@@ -525,7 +649,7 @@ def _load_initial_pretrained_params(state, config, mesh, state_spec, step_offset
     return state
 
 
-def _restore_params_only(state, params_source, zone, mesh, state_spec, current_step):
+def _restore_params_only(state, params_source, zone, mesh, state_spec, current_step, config=None):
     if isinstance(params_source, str):
         params = restore_checkpoint_params(state.params, params_source, zone=zone)
     else:
@@ -533,6 +657,12 @@ def _restore_params_only(state, params_source, zone, mesh, state_spec, current_s
     if 'image_encoder' in params and isinstance(params['image_encoder'], dict) and 'decoder' in params['image_encoder']:
         params = copy.deepcopy(params)
         params['image_encoder'].pop('decoder')
+    if config is not None and 'patch_size' in config.model:
+        params = _interpolate_patch_pos_embed(
+            params,
+            target_image_size=int(config.dataset.image_size),
+            patch_size=int(config.model.patch_size),
+        )
     params = _maybe_shard_params(params, mesh, state_spec.params)
     state = state.replace(params=params)
     return _replace_state_step(state, current_step)
@@ -568,6 +698,8 @@ def _build_curriculum_stage_config(config, stage_key, *, stage_start_step, stage
                 if target_key not in phase_config.dataset:
                     raise ValueError(f'Unsupported stage dataset override: {key}')
                 phase_config.dataset[target_key] = copy.deepcopy(value)
+    if stage.get('model', None) is not None:
+        phase_config.model.update(copy.deepcopy(stage.model))
 
     training_keys = [
         'batch_size', 'freeze_lm', 'freeze_lm_embed', 'freeze_lm_late',
@@ -627,7 +759,14 @@ def _run_train_phase(
 
     resolve_dataset_roots(config, zone)
     local_batch_size = _validate_and_get_local_batch_size(config)
-    _, train_iter, tokenizer = _create_train_iterator(config, local_batch_size, local_step_offset)
+    train_loader, train_iter, tokenizer = _create_train_iterator(
+        config,
+        local_batch_size,
+        local_step_offset,
+        load_from=config.load_from if restore_mode == 'full' else None,
+        zone=zone,
+        checkpoint_step_for_state=current_step,
+    )
 
     online_eval_tasks = list(config.training.get('online_eval_tasks', []) or [])
     final_eval_tasks = list(config.training.get('final_eval_tasks', []) or [])
@@ -654,13 +793,21 @@ def _run_train_phase(
     elif restore_mode == 'params_only':
         if params_source is None:
             params_source = config.load_from_pretrained or config.load_from
-        state = _restore_params_only(state, params_source, zone, mesh, state_spec, int(current_step))
+        state = _restore_params_only(
+            state,
+            params_source,
+            zone,
+            mesh,
+            state_spec,
+            int(current_step),
+            config=config,
+        )
         log_for_0(f'[{stage_name}] Params-only restore at global step {current_step}; optimizer reinitialized.')
     else:
         raise ValueError(f'Unknown restore_mode: {restore_mode}')
 
     assert _state_step(state) == int(current_step), f'Expected step {current_step}, got {_state_step(state)}'
-    state_spec, batch_spec, p_train_step, p_sample_step, p_sample_step_mmbench = _build_pjit_fns(
+    state_spec, batch_spec, p_train_step, p_sample_steps, p_sample_step_mmbench = _build_pjit_fns(
         config, model, state, mesh_bundle
     )
     del state_spec
@@ -731,7 +878,7 @@ def _run_train_phase(
         ):
             with timer.skip():
                 out_strs = run_p_sample_step(
-                    p_sample_step,
+                    p_sample_steps['default'],
                     model,
                     tokenizer,
                     state.params,
@@ -761,7 +908,14 @@ def _run_train_phase(
             with timer.skip():
                 log_for_0(f'[{stage_name}] Saving checkpoint at global step {step + 1}...')
                 host_state = mu.process_allgather(state, tiled=True)
-                save_checkpoint(host_state, workdir)
+                _save_training_checkpoint(
+                    host_state,
+                    train_loader,
+                    config,
+                    workdir,
+                    step + 1,
+                    local_batch_size,
+                )
                 del host_state
                 mu.sync_global_devices('ckpt')
 
@@ -770,7 +924,7 @@ def _run_train_phase(
             with timer.skip():
                 run_eval_tasks(
                     state,
-                    p_sample_step,
+                    p_sample_steps,
                     online_eval_tasks,
                     step=step + 1,
                     run_p_sample_step=run_p_sample_step,
@@ -792,10 +946,13 @@ def _run_train_phase(
                 )
 
     if final_eval_tasks:
-        log_for_0(f'[{stage_name}] Running final evaluation with beam_size=1...')
+        log_for_0(
+            f'[{stage_name}] Running final evaluation with '
+            f'beam_size={int(config.sampling.get("beam_size", 1))}...'
+        )
         run_eval_tasks(
             state,
-            p_sample_step,
+            p_sample_steps,
             final_eval_tasks,
             step=int(stage_end_step),
             run_p_sample_step=run_p_sample_step,
@@ -1009,7 +1166,7 @@ def just_evaluate(config: ml_collections.ConfigDict, workdir: str):
         log_for_0('Eval-only run has no load_from; initializing pretrained params.')
         state = _load_initial_pretrained_params(state, config, mesh, state_spec, step_offset=0)
     step = _state_step(state)
-    state_spec, batch_spec, _, p_sample_step, p_sample_step_mmbench = _build_pjit_fns(config, model, state, mesh_bundle)
+    state_spec, batch_spec, _, p_sample_steps, p_sample_step_mmbench = _build_pjit_fns(config, model, state, mesh_bundle)
     del state_spec, batch_spec
 
     final_eval_tasks = list(config.training.get('final_eval_tasks', []) or [])
@@ -1017,7 +1174,7 @@ def just_evaluate(config: ml_collections.ConfigDict, workdir: str):
     if final_eval_tasks:
         run_eval_tasks(
             state,
-            p_sample_step,
+            p_sample_steps,
             final_eval_tasks,
             step=step,
             run_p_sample_step=run_p_sample_step,

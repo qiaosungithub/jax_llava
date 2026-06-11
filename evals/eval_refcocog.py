@@ -648,6 +648,27 @@ def collate_fn(batch):
     }
 
 
+def _make_dummy_refcocog_batch(batch_size, image_size, max_len):
+    return {
+        "pixel_values": torch.zeros((batch_size, 3, image_size, image_size), dtype=torch.float32),
+        "input_ids": torch.zeros((batch_size, max_len), dtype=torch.long),
+        "prefix_len": torch.ones((batch_size,), dtype=torch.int32),
+        "aux": [
+            {
+                "id": -1,
+                "phrase": "",
+                "image": "",
+                "gt_bbox_xyxy": [0.0, 0.0, 0.0, 0.0],
+                "img_w": 1,
+                "img_h": 1,
+                "prompt": "",
+            }
+            for _ in range(batch_size)
+        ],
+        "_all_pad": True,
+    }
+
+
 def eval_refcocog(p_sample_step, run_p_sample_step, model, tokenizer, params, config):
     ann_root = config.eval.refcocog_root
     image_root = config.eval.refcocog_image_root
@@ -716,13 +737,50 @@ def eval_refcocog(p_sample_step, run_p_sample_step, model, tokenizer, params, co
         collate_fn=collate_fn,
         drop_last=False,
     )
+    loader_iter = iter(loader)
+    samples_per_process = (len(dataset) + jax.process_count() - 1) // jax.process_count()
+    fixed_num_steps = (samples_per_process + batch_size - 1) // batch_size
+    log_for_0(
+        "RefCOCOg fixed eval schedule: "
+        f"total_samples={len(dataset)}, samples_per_process={samples_per_process}, "
+        f"fixed_num_steps={fixed_num_steps}, batch_size={batch_size}"
+    )
 
     all_outs = []
     vis_outs = []
-    for i, raw_batch in enumerate(loader):
-        if not raw_batch:
-            continue
+    for i in range(fixed_num_steps):
+        try:
+            raw_batch = next(loader_iter)
+            if not raw_batch:
+                raw_batch = _make_dummy_refcocog_batch(
+                    batch_size, config.dataset.image_size, config.dataset.max_txt_len
+                )
+        except StopIteration:
+            raw_batch = _make_dummy_refcocog_batch(
+                batch_size, config.dataset.image_size, config.dataset.max_txt_len
+            )
+
+        if "aux" not in raw_batch:
+            raw_batch["aux"] = []
+        if len(raw_batch["aux"]) < batch_size:
+            raw_batch["aux"].extend(
+                [
+                    {
+                        "id": -1,
+                        "phrase": "",
+                        "image": "",
+                        "gt_bbox_xyxy": [0.0, 0.0, 0.0, 0.0],
+                        "img_w": 1,
+                        "img_h": 1,
+                        "prompt": "",
+                    }
+                    for _ in range(batch_size - len(raw_batch["aux"]))
+                ]
+            )
+
         batch = prepare_batch_data(raw_batch, batch_size=batch_size)
+        if raw_batch.get("_all_pad", False):
+            batch["is_pad"] = np.ones((batch_size,), dtype=bool)
         out_strs = run_p_sample_step(
             p_sample_step,
             model,
@@ -732,7 +790,9 @@ def eval_refcocog(p_sample_step, run_p_sample_step, model, tokenizer, params, co
             batch["input_ids"],
             prefix_len=batch["prefix_len"],
         )
-        for aux, out_str in zip(batch["aux"], out_strs):
+        for aux, out_str, is_pad in zip(batch["aux"], out_strs, batch["is_pad"].tolist()):
+            if is_pad:
+                continue
             pred_loc = _extract_loc_tokens(out_str)
             pred_xyxy = None
             iou = 0.0

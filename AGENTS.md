@@ -77,10 +77,35 @@ Follow these notes when editing the JAX LLaVA training/data code in this repo.
 
 ## HSDP Memory Notes
 
+- `model.prompt_causal` defaults to `True`. This is the standard LLaVA-style
+  mask: image prefix tokens are bidirectional, while prompt/text tokens remain
+  causal. Set it to `False` only to reproduce the older local behavior where the
+  entire image+prompt prefix was bidirectional.
+- The projector/connector is its own optimizer group. Use
+  `training.connector_learning_rate` (or legacy alias
+  `training.projector_learning_rate`) to set its LR separately from the LM main
+  group and vision encoder group.
+- Eval generation uses task-specific token budgets:
+  `eval_tokens_shortqa`, `eval_tokens_mid`, `eval_tokens_ocr`,
+  `eval_tokens_refcoco`, `eval_tokens_pixelbench`, and
+  `eval_tokens_mmbench`. These samplers still respect `sampling.beam_size`, so a
+  deliberate beam-search final eval should set that once rather than patching
+  every task.
 - `utils/pjit_util.py` treats the last mesh axis as the model axis for `hsdp`.
   Batch/data arrays are sharded only over the preceding data axes; do not shard
   batch over every mesh axis or activations can conflict with model sharding and
   get gathered back to global-batch-sized attention buffers.
+- Host-local input/output specs may temporarily fall back to all mesh axes when
+  the current TPU logical mesh does not give each process exactly
+  `1/process_count` of the data-axis positions. This is only an input boundary
+  compatibility fallback for `global_batch/process_count` dataloaders; model
+  activations still use the HSDP data-axis/model-axis constraints.
+- The HSDP mesh must be process-major with the final model axis host-local when
+  possible. `utils/pjit_util.py` now builds such a mesh before falling back to
+  JAX's default `create_device_mesh`; this keeps `global_batch / process_count`
+  dataloader batches compatible with `make_array_from_process_local_data`. The
+  failure signature from the old default mesh was `process data has 32 elements.
+  Process addresses 64 elements and global_shape=(256, 64)` on v5p-64.
 - Training loss should use `token_xent_loss_from_hidden(...)`, not a full
   `embedder.decode(out)` over `(B, K + T, vocab)`. The chunked loss only scans
   labeled text positions and avoids the large Gemma3 full-vocab logits tensor.
@@ -91,6 +116,22 @@ Follow these notes when editing the JAX LLaVA training/data code in this repo.
   not a greedy alias. It keeps EOS beams alive, supports `txt_feature_layer > 0`,
   and decodes only the last prompt hidden state during prefill to avoid a
   `[B, prompt_len, vocab]` logits tensor.
+
+## Stateful Dataloader Resume
+
+- `jax_llava` now carries the same full stateful dataloader infrastructure as
+  `beifen-Paligemma`. Enable it with `dataset.stateful_dataloader: True`;
+  `configs/remote_run_config.yml` enables it by default.
+- This requires `torchdata==0.8.0`. Missing `torchdata.stateful_dataloader`
+  should fail fast instead of silently falling back to non-exact resume.
+- Stateful resume saves sidecars at
+  `checkpoint_<step>/dataloader_state/process_<rank>.pkl` and restores WebDataset
+  cursors, shuffle buffers, RandomMix state, worker RNGs, and topology metadata.
+  It is exact only for the same process count, process-local batch size, worker
+  count, prefetch factor, roots/types, mix weights, and seed offset.
+- `input_pipeline.create_split` validates that training GCS roots match
+  `config.zone` before reading/listing shards. Keep this guard to avoid
+  cross-region transfer and accidental loops over nonexistent paths.
 
 ## TPU Manager & Job Queue
 

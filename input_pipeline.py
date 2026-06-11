@@ -3,7 +3,7 @@ import io
 import json
 import math
 import os
-import re
+import pickle
 import subprocess
 import warnings
 
@@ -27,13 +27,26 @@ try:
 except ImportError:
     RandomMix = getattr(wds, "RandomMix", None)
 
+try:
+    from torchdata.stateful_dataloader import StatefulDataLoader
+    from torchdata.stateful_dataloader.stateful import Stateful
+except ImportError:
+    StatefulDataLoader = None
+
+    class Stateful:
+        pass
+
 # ---------------------------------------------------------------------------
 # Visual Genome Grounded Caption: region annotation cache
 # ---------------------------------------------------------------------------
 _REGION_DESC_LOCAL = "/dev/shm/vg_region_descriptions.json"
 _DATA_SEED_STRIDE = 1_000_003
 _GCS_GLOB_CACHE = {}
-_NUMERIC_BRACE_RE = re.compile(r"\{(\d+)\.\.(\d+)(?:\.\.(\d+))?\}")
+_ALLOWED_ZONE_BUCKETS = {
+    "us-central1": "kmh-gcp-us-central1",
+    "us-east5": "kmh-gcp-us-east5",
+    "asia-northeast1-b": "kmh-gcp-asia-northeast1-b",
+}
 
 
 def _region_desc_gcs_from_root(root_url: str) -> str:
@@ -288,16 +301,31 @@ def _dataset_config_int(dataset_config, field: str, dataset_type: str, default: 
     return max(1, int(value))
 
 
+_SHUFFLE_SIZE_REFERENCE_STREAMS = 32
+
+
+def _scaled_shuffle_size(raw: int, dataset_config) -> int:
+    """Scale a shuffle buffer size relative to the reference stream count (32)."""
+    num_workers = max(1, int(getattr(dataset_config, "num_workers", 1)))
+    total_streams = jax.process_count() * num_workers
+    if total_streams <= _SHUFFLE_SIZE_REFERENCE_STREAMS:
+        return raw
+    return max(1, int(raw * _SHUFFLE_SIZE_REFERENCE_STREAMS / total_streams))
+
+
 def _item_shuffle_size(dataset_config, dataset_type: str, default: int) -> int:
     value = getattr(dataset_config, "item_shuffle_size", None)
     if value is not None:
-        return _dataset_config_int(dataset_config, "item_shuffle_size", dataset_type, default)
-    value = getattr(dataset_config, "shuffle_buffer_size", None)
-    if value is None:
-        return int(default)
-    if hasattr(value, "get") and not isinstance(value, (str, bytes)):
-        value = value.get(dataset_type, value.get("default", default))
-    return max(1, int(value))
+        raw = _dataset_config_int(dataset_config, "item_shuffle_size", dataset_type, default)
+    else:
+        value = getattr(dataset_config, "shuffle_buffer_size", None)
+        if value is None:
+            raw = int(default)
+        else:
+            if hasattr(value, "get") and not isinstance(value, (str, bytes)):
+                value = value.get(dataset_type, value.get("default", default))
+            raw = max(1, int(value))
+    return _scaled_shuffle_size(raw, dataset_config)
 
 
 def _stream_start_skip(dataset_config, dataset_type: str) -> int:
@@ -361,6 +389,140 @@ def make_stop_after_n_errors(max_errors=50, fatal_on_missing=True):
 
 def _max_wds_errors(config):
     return int(getattr(config, "max_wds_errors", 50))
+
+
+def _stateful_enabled(config):
+    return bool(getattr(config, "stateful_dataloader", False))
+
+
+def _expected_bucket_for_zone(zone):
+    if zone in _ALLOWED_ZONE_BUCKETS:
+        return _ALLOWED_ZONE_BUCKETS[zone]
+    return None
+
+
+def _iter_roots(root):
+    if isinstance(root, (list, tuple)):
+        for item in root:
+            yield from _iter_roots(item)
+    else:
+        yield root
+
+
+def _gcs_bucket(url):
+    if not isinstance(url, str) or not url.startswith("gs://"):
+        return None
+    return url[5:].split("/", 1)[0]
+
+
+def _assert_same_zone_roots(roots, zone, local_debug=False):
+    """Fail fast before a loader can silently read another region's bucket."""
+    if local_debug:
+        return
+    expected = _expected_bucket_for_zone(zone)
+    if expected is None:
+        raise ValueError(f"Unsupported training zone for dataset roots: {zone}")
+    for root in _iter_roots(roots):
+        if not isinstance(root, str):
+            continue
+        for expanded in (root.split("::") if "::" in root else [root]):
+            bucket = _gcs_bucket(expanded)
+            if bucket is not None and bucket != expected:
+                raise ValueError(
+                    f"Refusing cross-zone dataset read: root={expanded}, "
+                    f"zone={zone}, expected_bucket={expected}"
+                )
+
+
+def _require_stateful_dependency():
+    if StatefulDataLoader is None:
+        raise ImportError(
+            "dataset.stateful_dataloader=True requires torchdata.stateful_dataloader. "
+            "Install torchdata in the TPU Python environment before exact loader resume."
+        )
+
+
+def _rng_state(rng):
+    return pickle.dumps(rng.getstate(), protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _set_rng_state(rng, state):
+    rng.setstate(pickle.loads(state))
+
+
+def _image_key(sample):
+    for key in ("jpg", "jpeg", "png", "webp"):
+        if key in sample and sample[key] is not None:
+            return key
+    return None
+
+
+def _sample_ref(sample):
+    url = sample.get("__url__")
+    key = sample.get("__key__")
+    if url is None or key is None:
+        return {"inline": sample}
+    return {"url": url, "key": key}
+
+
+def _strip_image_keys(item):
+    item = dict(item)
+    for key in ("jpg", "jpeg", "png", "webp"):
+        item.pop(key, None)
+    return item
+
+
+def _serialize_shuffle_entry(entry):
+    kind, payload = entry
+    if kind == "raw":
+        return {"kind": "raw", "sample": _sample_ref(payload)}
+    if kind == "raw_ref":
+        return {"kind": "raw", "sample": payload}
+    if kind == "pending":
+        raw_sample, items = payload
+        return {
+            "kind": "pending",
+            "sample": _sample_ref(raw_sample),
+            "items": [_strip_image_keys(item) for item in items],
+        }
+    if kind == "pending_ref":
+        raw_ref, items = payload
+        return {"kind": "pending", "sample": raw_ref, "items": items}
+    raise ValueError(f"Unknown shuffle entry kind: {kind}")
+
+
+def _deserialize_shuffle_entry(entry):
+    if entry["kind"] == "raw":
+        sample_ref = entry["sample"]
+        if "inline" in sample_ref:
+            return ("raw", sample_ref["inline"])
+        return ("raw_ref", sample_ref)
+    if entry["kind"] == "pending":
+        sample_ref = entry["sample"]
+        if "inline" in sample_ref:
+            return ("pending", (sample_ref["inline"], entry["items"]))
+        return ("pending_ref", (sample_ref, entry["items"]))
+    raise ValueError(f"Unknown serialized shuffle entry kind: {entry.get('kind')}")
+
+
+def _sample_with_image(raw_sample, item):
+    item = dict(item)
+    key = _image_key(raw_sample)
+    if key is not None:
+        item[key] = raw_sample[key]
+    return item
+
+
+def _with_module_random(rng, fn, *args, **kwargs):
+    """Run legacy preprocessing randomness from a serializable RNG."""
+    old_state = random.getstate()
+    random.setstate(rng.getstate())
+    try:
+        out = fn(*args, **kwargs)
+        rng.setstate(random.getstate())
+        return out
+    finally:
+        random.setstate(old_state)
 
 
 class LetterboxPadTransform:
@@ -923,8 +1085,8 @@ def expand_aokvqa_sample(sample):
 
     The uploaded storage keeps one record per image. LLaVA-1.5 reports the
     A-OKVQA SFT scale after multiple-choice augmentation, so each valid QA is
-    emitted four times with a deterministic cyclic rotation of the choices.
-    The target is the correct option letter after rotation.
+    emitted once per cyclic choice rotation. The target is the correct option
+    letter after rotation.
     """
     j = sample.get("json")
     if j is None:
@@ -1027,7 +1189,6 @@ def _refcoco_phrases(ref):
             text = str(value).strip()
             if text:
                 phrases.append(text)
-    # Preserve order while de-duplicating repeated referring expressions.
     seen = set()
     deduped = []
     for phrase in phrases:
@@ -1202,57 +1363,21 @@ def _expand_gcs_glob_if_needed(root):
             else:
                 urls.append(expanded)
         return urls
-    if not isinstance(root, str):
+    if not (isinstance(root, str) and root.startswith("gs://") and "*" in root):
+        if isinstance(root, str) and "{" in root and "}" in root:
+            return list(wds.shardlists.expand_urls(root))
         return root
 
     if root in _GCS_GLOB_CACHE:
         return list(_GCS_GLOB_CACHE[root])
 
-    urls = []
-    for part in root.split("::"):
-        for expanded_part in _expand_numeric_braces(part):
-            if expanded_part.startswith("gs://") and "*" in expanded_part:
-                fs = fsspec.filesystem("gs")
-                matches = sorted(fs.glob(expanded_part))
-                assert len(matches) > 0, f"No GCS files matched dataset glob: {expanded_part}"
-                urls.extend(
-                    m if str(m).startswith("gs://") else f"gs://{m}"
-                    for m in matches
-                )
-            else:
-                urls.append(expanded_part)
-
-    if len(urls) == 1 and urls[0] == root:
-        return root
-
+    fs = fsspec.filesystem("gs")
+    matches = sorted(fs.glob(root))
+    assert len(matches) > 0, f"No GCS files matched dataset glob: {root}"
+    urls = [m if str(m).startswith("gs://") else f"gs://{m}" for m in matches]
     _GCS_GLOB_CACHE[root] = tuple(urls)
-    log_for_0(f"Expanded dataset URL pattern to {len(urls)} shards: {root}")
+    log_for_0(f"Expanded GCS glob to {len(urls)} shards: {root}")
     return urls
-
-
-def _expand_numeric_braces(url):
-    """Expand numeric shard ranges like shard-{000000..000040}.tar."""
-    match = _NUMERIC_BRACE_RE.search(url)
-    if match is None:
-        return [url]
-
-    start_s, end_s, step_s = match.groups()
-    start = int(start_s)
-    end = int(end_s)
-    step = int(step_s or 1)
-    if step <= 0:
-        raise ValueError(f"Invalid non-positive brace step in URL pattern: {url}")
-
-    width = max(len(start_s), len(end_s))
-    stop = end + 1 if start <= end else end - 1
-    signed_step = step if start <= end else -step
-
-    expanded = []
-    for value in range(start, stop, signed_step):
-        replacement = f"{value:0{width}d}"
-        next_url = url[:match.start()] + replacement + url[match.end():]
-        expanded.extend(_expand_numeric_braces(next_url))
-    return expanded
 
 
 def expand_genome_det_sample(sample, region_lookup: dict) -> list:
@@ -1296,6 +1421,488 @@ def _shuffled_worker_urls(root_url, data_seed_offset: int, epoch: int):
     return selected
 
 
+class _StatefulRawShardIterator(Stateful):
+    """Explicit raw WebDataset cursor for exact resume.
+
+    WebDataset's own iterators do not expose tar cursor state. This wrapper keeps
+    the current epoch, shuffled URL list, URL index, and sample index inside the
+    current tar. On restore it reopens the current shard once and skips only to
+    the saved tar member offset, not from the beginning of training.
+    """
+
+    def __init__(self, root_url, config, data_seed_offset):
+        self.root_url = root_url
+        self.config = config
+        self.data_seed_offset = int(data_seed_offset)
+        self.error_handler = make_stop_after_n_errors(_max_wds_errors(config))
+        self.epoch = 0
+        self.urls = []
+        self.url_idx = 0
+        self.sample_idx_in_url = 0
+        self._raw_iter = None
+        self._url_to_idx = {}
+        self._skip_in_first_url = 0
+        self._sample_cache = {}
+
+    def state_dict(self):
+        return {
+            "epoch": int(self.epoch),
+            "urls": list(self.urls),
+            "url_idx": int(self.url_idx),
+            "sample_idx_in_url": int(self.sample_idx_in_url),
+        }
+
+    def load_state_dict(self, state):
+        self.epoch = int(state["epoch"])
+        self.urls = list(state["urls"])
+        self.url_idx = int(state["url_idx"])
+        self.sample_idx_in_url = int(state["sample_idx_in_url"])
+        self._url_to_idx = {url: i for i, url in enumerate(self.urls)}
+        self._raw_iter = None
+        self._skip_in_first_url = 0
+        self._sample_cache = {}
+
+    def _start_next_epoch(self):
+        while True:
+            urls = _shuffled_worker_urls(self.root_url, self.data_seed_offset, self.epoch)
+            self.epoch += 1
+            if urls:
+                self.urls = list(urls)
+                self._url_to_idx = {url: i for i, url in enumerate(self.urls)}
+                self.url_idx = 0
+                self.sample_idx_in_url = 0
+                self._raw_iter = None
+                return
+
+    def _ensure_raw_iter(self):
+        if not self.urls or self.url_idx >= len(self.urls):
+            self._start_next_epoch()
+        if self._raw_iter is not None:
+            return
+        urls = self.urls[self.url_idx:]
+        self._skip_in_first_url = int(self.sample_idx_in_url)
+        ds = wds.DataPipeline(
+            wds.SimpleShardList(urls),
+            wds.tarfile_to_samples(handler=self.error_handler),
+        )
+        self._raw_iter = iter(ds)
+
+    def __next__(self):
+        while True:
+            self._ensure_raw_iter()
+            try:
+                sample = next(self._raw_iter)
+            except StopIteration:
+                self.urls = []
+                self.url_idx = 0
+                self.sample_idx_in_url = 0
+                self._raw_iter = None
+                continue
+
+            if sample is None:
+                continue
+
+            url = sample.get("__url__")
+            if url in self._url_to_idx:
+                new_url_idx = self._url_to_idx[url]
+                if new_url_idx != self.url_idx:
+                    self.url_idx = new_url_idx
+                    self.sample_idx_in_url = 0
+
+            if self._skip_in_first_url > 0:
+                self._skip_in_first_url -= 1
+                continue
+
+            self.sample_idx_in_url += 1
+            return sample
+
+    def hydrate(self, sample_ref):
+        if "inline" in sample_ref:
+            return sample_ref["inline"]
+        cache_key = (sample_ref["url"], sample_ref["key"])
+        if cache_key in self._sample_cache:
+            return self._sample_cache[cache_key]
+
+        ds = wds.DataPipeline(
+            wds.SimpleShardList([sample_ref["url"]]),
+            wds.tarfile_to_samples(handler=self.error_handler),
+        )
+        for sample in ds:
+            if sample is not None and sample.get("__key__") == sample_ref["key"]:
+                self._sample_cache[cache_key] = sample
+                return sample
+        raise KeyError(f"Could not hydrate WebDataset sample ref: {sample_ref}")
+
+    def batch_hydrate(self, refs):
+        """Hydrate many refs efficiently by grouping by shard URL.
+
+        Opens each shard at most once and caches all requested samples from it.
+        """
+        by_url = {}
+        for ref in refs:
+            if "inline" in ref:
+                continue
+            cache_key = (ref["url"], ref["key"])
+            if cache_key in self._sample_cache:
+                continue
+            by_url.setdefault(ref["url"], set()).add(ref["key"])
+
+        for url, needed_keys in by_url.items():
+            ds = wds.DataPipeline(
+                wds.SimpleShardList([url]),
+                wds.tarfile_to_samples(handler=self.error_handler),
+            )
+            for sample in ds:
+                if sample is None:
+                    continue
+                key = sample.get("__key__")
+                if key in needed_keys:
+                    self._sample_cache[(url, key)] = sample
+                    needed_keys.discard(key)
+                    if not needed_keys:
+                        break
+
+
+class _StatefulBufferedMapIterator(Stateful):
+    def __init__(self, dataset):
+        self.dataset = dataset
+        self.raw_iter = _StatefulRawShardIterator(
+            dataset.root_url,
+            dataset.config,
+            dataset.data_seed_offset,
+        )
+        self.rng = random.Random(_worker_seed(dataset.shuffle_seed, jax.process_index(), dataset.data_seed_offset))
+        self.choice_rng = random.Random(_worker_seed(dataset.choice_seed, jax.process_index(), dataset.data_seed_offset))
+        self.shuffle_buf = []
+
+    def state_dict(self):
+        return {
+            "raw_iter": self.raw_iter.state_dict(),
+            "rng": _rng_state(self.rng),
+            "choice_rng": _rng_state(self.choice_rng),
+            "shuffle_buf": [_serialize_shuffle_entry(entry) for entry in self.shuffle_buf],
+        }
+
+    def load_state_dict(self, state):
+        self.raw_iter.load_state_dict(state["raw_iter"])
+        _set_rng_state(self.rng, state["rng"])
+        _set_rng_state(self.choice_rng, state["choice_rng"])
+        self.shuffle_buf = [_deserialize_shuffle_entry(entry) for entry in state["shuffle_buf"]]
+        self._batch_hydrate_buffer()
+
+    def _batch_hydrate_buffer(self):
+        """Pre-hydrate all ref entries in the shuffle buffer after restore."""
+        refs = []
+        for kind, payload in self.shuffle_buf:
+            if kind == "raw_ref":
+                refs.append(payload)
+        if not refs:
+            return
+        self.raw_iter.batch_hydrate(refs)
+        hydrated = []
+        for kind, payload in self.shuffle_buf:
+            if kind == "raw_ref":
+                sample = self.raw_iter.hydrate(payload)
+                hydrated.append(("raw", sample))
+            else:
+                hydrated.append((kind, payload))
+        self.shuffle_buf = hydrated
+
+    def _pop_random_entry(self):
+        idx = self.rng.randrange(len(self.shuffle_buf))
+        entry = self.shuffle_buf[idx]
+        self.shuffle_buf[idx] = self.shuffle_buf[-1]
+        self.shuffle_buf.pop()
+        return entry
+
+    def _resolve_raw_payload(self, entry):
+        kind, payload = entry
+        if kind == "raw":
+            return payload
+        if kind == "raw_ref":
+            return self.raw_iter.hydrate(payload)
+        raise ValueError(f"Expected raw entry, got {kind}")
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        while True:
+            while len(self.shuffle_buf) < self.dataset.shuffle_size:
+                self.shuffle_buf.append(("raw", next(self.raw_iter)))
+
+            raw_sample = self._resolve_raw_payload(self._pop_random_entry())
+            out = _with_module_random(
+                self.choice_rng,
+                preprocess_fn,
+                raw_sample,
+                self.dataset.transform,
+                self.dataset.tokenizer,
+                self.dataset.max_len,
+                dataset_type=self.dataset.dataset_type,
+                mask_token_category_probs=self.dataset.mask_token_category_probs,
+            )
+            if out is not None:
+                return out
+
+
+class StatefulBufferedWebDataset(IterableDataset, Stateful):
+    """Stateful replacement for the regular WebDataset.shuffle().map() path."""
+
+    def __init__(self, root_url, config, tokenizer, is_train=True, dataset_type="default", data_seed_offset=0):
+        expanded_root = _expand_gcs_glob_if_needed(root_url)
+        self.root_url = expanded_root.rstrip("/") if isinstance(expanded_root, str) else list(expanded_root)
+        self.config = config
+        self.tokenizer = tokenizer
+        self.dataset_type = dataset_type
+        self.data_seed_offset = int(data_seed_offset)
+        self.transform = get_transforms(
+            config.image_size,
+            is_train=is_train,
+            resize_mode=_resize_mode_from_config(config),
+        )
+        self.max_len = config.max_txt_len
+        self.mask_token_category_probs = _build_mask_category_distribution(config, dataset_type)
+        self.shuffle_size = _scaled_shuffle_size(
+            int(getattr(config, "webdataset_shuffle_size", 10000)), config
+        )
+        self.shuffle_seed = 115 + jax.process_index() * 514
+        self.choice_seed = 1193
+
+    def __iter__(self):
+        return _StatefulBufferedMapIterator(self)
+
+
+class _StatefulVQAIterator(Stateful):
+    def __init__(self, dataset):
+        self.dataset = dataset
+        self.raw_iter = _StatefulRawShardIterator(
+            dataset.root_url,
+            dataset.config,
+            dataset.data_seed_offset,
+        )
+        self.rng = random.Random(_worker_seed(2027, dataset.shard_rank, dataset.data_seed_offset))
+        self.choice_rng = random.Random(_worker_seed(2039, dataset.shard_rank, dataset.data_seed_offset))
+        self.expand_fn = _EXPAND_FN.get(dataset.dataset_type, expand_vqa_sample)
+        self.shuffle_buf = []
+        start_skip_max = _stream_start_skip(dataset.config, dataset.dataset_type)
+        self.start_skip_remaining = self.rng.randrange(start_skip_max + 1) if start_skip_max > 0 else 0
+
+    def state_dict(self):
+        return {
+            "raw_iter": self.raw_iter.state_dict(),
+            "rng": _rng_state(self.rng),
+            "choice_rng": _rng_state(self.choice_rng),
+            "shuffle_buf": [_serialize_shuffle_entry(entry) for entry in self.shuffle_buf],
+            "start_skip_remaining": int(self.start_skip_remaining),
+        }
+
+    def load_state_dict(self, state):
+        self.raw_iter.load_state_dict(state["raw_iter"])
+        _set_rng_state(self.rng, state["rng"])
+        _set_rng_state(self.choice_rng, state["choice_rng"])
+        self.shuffle_buf = [_deserialize_shuffle_entry(entry) for entry in state["shuffle_buf"]]
+        self.start_skip_remaining = int(state["start_skip_remaining"])
+        self._batch_hydrate_buffer()
+
+    def _batch_hydrate_buffer(self):
+        """Pre-hydrate all ref entries in the shuffle buffer after restore."""
+        refs = []
+        for kind, payload in self.shuffle_buf:
+            if kind == "raw_ref":
+                refs.append(payload)
+            elif kind == "pending_ref":
+                raw_ref, _items = payload
+                refs.append(raw_ref)
+        if not refs:
+            return
+        self.raw_iter.batch_hydrate(refs)
+        hydrated = []
+        for kind, payload in self.shuffle_buf:
+            if kind == "raw_ref":
+                sample = self.raw_iter.hydrate(payload)
+                hydrated.append(("raw", sample))
+            elif kind == "pending_ref":
+                raw_ref, items = payload
+                sample = self.raw_iter.hydrate(raw_ref)
+                hydrated.append(("pending", (sample, items)))
+            else:
+                hydrated.append((kind, payload))
+        self.shuffle_buf = hydrated
+
+    def __iter__(self):
+        return self
+
+    def _pop_random_entry(self):
+        idx = self.rng.randrange(len(self.shuffle_buf))
+        entry = self.shuffle_buf[idx]
+        self.shuffle_buf[idx] = self.shuffle_buf[-1]
+        self.shuffle_buf.pop()
+        return entry
+
+    def _emit_one_from_buffer(self):
+        kind, payload = self._pop_random_entry()
+        if kind == "pending":
+            raw_sample, items = payload
+        elif kind == "pending_ref":
+            raw_ref, items = payload
+            raw_sample = self.raw_iter.hydrate(raw_ref)
+        else:
+            raw_sample = payload if kind == "raw" else self.raw_iter.hydrate(payload)
+            items = _with_module_random(self.choice_rng, self.expand_fn, raw_sample)
+            if not items:
+                return None
+            self.rng.shuffle(items)
+
+        chosen = items.pop()
+        if items:
+            self.shuffle_buf.append(("pending", (raw_sample, items)))
+
+        chosen = _sample_with_image(raw_sample, chosen)
+        return _with_module_random(
+            self.choice_rng,
+            preprocess_fn,
+            chosen,
+            self.dataset.transform,
+            self.dataset.tokenizer,
+            self.dataset.max_len,
+            dataset_type=self.dataset.dataset_type,
+            mask_token_category_probs=self.dataset.mask_token_category_probs,
+        )
+
+    def __next__(self):
+        while True:
+            while len(self.shuffle_buf) < self.dataset.shuffle_size:
+                sample = next(self.raw_iter)
+                if sample is None:
+                    continue
+                if self.start_skip_remaining > 0:
+                    self.start_skip_remaining -= 1
+                    continue
+                self.shuffle_buf.append(("raw", sample))
+
+            out = self._emit_one_from_buffer()
+            if out is not None:
+                return out
+
+
+class _StatefulGenomeIterator(Stateful):
+    def __init__(self, dataset, expand_fn, output_dataset_type):
+        self.dataset = dataset
+        self.expand_fn = expand_fn
+        self.output_dataset_type = output_dataset_type
+        self.raw_iter = _StatefulRawShardIterator(
+            dataset.root_url,
+            dataset.config,
+            dataset.data_seed_offset,
+        )
+        seed = 2027 if output_dataset_type == "genome_gcap" else 2029
+        self.rng = random.Random(_worker_seed(seed, jax.process_index(), dataset.data_seed_offset))
+        self.choice_rng = random.Random(_worker_seed(seed + 37, jax.process_index(), dataset.data_seed_offset))
+        self.shuffle_buf = []
+
+    def state_dict(self):
+        entries = []
+        for kind, payload in self.shuffle_buf:
+            if kind == "item":
+                raw_sample, item = payload
+                entries.append({
+                    "kind": "item",
+                    "sample": _sample_ref(raw_sample),
+                    "item": _strip_image_keys(item),
+                })
+            elif kind == "item_ref":
+                raw_ref, item = payload
+                entries.append({"kind": "item", "sample": raw_ref, "item": item})
+            else:
+                raise ValueError(f"Unknown genome buffer kind: {kind}")
+        return {
+            "raw_iter": self.raw_iter.state_dict(),
+            "rng": _rng_state(self.rng),
+            "choice_rng": _rng_state(self.choice_rng),
+            "shuffle_buf": entries,
+        }
+
+    def load_state_dict(self, state):
+        self.raw_iter.load_state_dict(state["raw_iter"])
+        _set_rng_state(self.rng, state["rng"])
+        _set_rng_state(self.choice_rng, state["choice_rng"])
+        self.shuffle_buf = []
+        for entry in state["shuffle_buf"]:
+            sample_ref = entry["sample"]
+            if "inline" in sample_ref:
+                self.shuffle_buf.append(("item", (sample_ref["inline"], entry["item"])))
+            else:
+                self.shuffle_buf.append(("item_ref", (sample_ref, entry["item"])))
+        self._batch_hydrate_buffer()
+
+    def _batch_hydrate_buffer(self):
+        """Pre-hydrate all ref entries in the shuffle buffer after restore."""
+        refs = []
+        for kind, payload in self.shuffle_buf:
+            if kind == "item_ref":
+                raw_ref, _item = payload
+                refs.append(raw_ref)
+        if not refs:
+            return
+        self.raw_iter.batch_hydrate(refs)
+        hydrated = []
+        for kind, payload in self.shuffle_buf:
+            if kind == "item_ref":
+                raw_ref, item = payload
+                sample = self.raw_iter.hydrate(raw_ref)
+                hydrated.append(("item", (sample, item)))
+            else:
+                hydrated.append((kind, payload))
+        self.shuffle_buf = hydrated
+
+    def __iter__(self):
+        return self
+
+    def _pop_random_entry(self):
+        idx = self.rng.randrange(len(self.shuffle_buf))
+        entry = self.shuffle_buf[idx]
+        self.shuffle_buf[idx] = self.shuffle_buf[-1]
+        self.shuffle_buf.pop()
+        return entry
+
+    def __next__(self):
+        while True:
+            while len(self.shuffle_buf) < self.dataset.shuffle_size:
+                raw_sample = next(self.raw_iter)
+                items = self.expand_fn(raw_sample, self.dataset.region_lookup)
+                if not items:
+                    continue
+                self.rng.shuffle(items)
+                if (
+                    self.output_dataset_type == "genome_det"
+                    and getattr(self.dataset, "max_regions_per_image", 0) > 0
+                ):
+                    items = items[: self.dataset.max_regions_per_image]
+                for item in items:
+                    self.shuffle_buf.append(("item", (raw_sample, _strip_image_keys(item))))
+
+            kind, payload = self._pop_random_entry()
+            if kind == "item":
+                raw_sample, item = payload
+            else:
+                raw_ref, item = payload
+                raw_sample = self.raw_iter.hydrate(raw_ref)
+            item = _sample_with_image(raw_sample, item)
+            out = _with_module_random(
+                self.choice_rng,
+                preprocess_fn,
+                item,
+                self.dataset.transform,
+                self.dataset.tokenizer,
+                self.dataset.max_len,
+                dataset_type=self.output_dataset_type,
+                mask_token_category_probs=self.dataset.mask_token_category_probs,
+            )
+            if out is not None:
+                return out
+
+
 class VQAv2IterableDataset(IterableDataset):
     """IterableDataset over VQA-style WebDataset shards.
     Shuffles raw image samples first, then expands one chosen image sample into
@@ -1322,25 +1929,31 @@ class VQAv2IterableDataset(IterableDataset):
         self.dataset_type = dataset_type
         self.data_seed_offset = int(data_seed_offset)
         self.mask_token_category_probs = _build_mask_category_distribution(config, dataset_type)
-
-    def __iter__(self):
-        rng = random.Random(_worker_seed(2027, self.shard_rank, self.data_seed_offset))
-        expand_fn = _EXPAND_FN.get(self.dataset_type, expand_vqa_sample)
-
-        # Shuffle raw image samples before expansion. This keeps the buffer at
-        # image granularity; one image with many QA pairs occupies one slot.
-        shuffle_buf = []
         shuffle_sizes = {
             "textvqa": 2000,
             "ocrvqa": 2000,
             "dvqa": 20000,
             "tallyqa": 50000,
         }
-        SHUFFLE_SIZE = _item_shuffle_size(
+        self.shuffle_size = _item_shuffle_size(
             self.config,
             self.dataset_type,
             shuffle_sizes.get(self.dataset_type, 10000),
         )
+
+    def __iter__(self):
+        if _stateful_enabled(self.config):
+            return _StatefulVQAIterator(self)
+        return self._legacy_iter()
+
+    def _legacy_iter(self):
+        rng = random.Random(_worker_seed(2027, self.shard_rank, self.data_seed_offset))
+        expand_fn = _EXPAND_FN.get(self.dataset_type, expand_vqa_sample)
+
+        # Shuffle raw image samples before expansion. This keeps the buffer at
+        # image granularity; one image with many QA pairs occupies one slot.
+        shuffle_buf = []
+        SHUFFLE_SIZE = self.shuffle_size
         # Many VLM shards are internally ordered by source/length. If every
         # worker starts at sample 0 of its first shard, the global batch gets an
         # accidental length curriculum. A per-worker random offset desynchronizes
@@ -1423,7 +2036,8 @@ class GenomeGCapIterableDataset(IterableDataset):
     """
 
     def __init__(self, root_url: str, config, tokenizer, data_seed_offset=0):
-        self.root_url    = root_url.rstrip("/")
+        expanded_root = _expand_gcs_glob_if_needed(root_url)
+        self.root_url    = expanded_root.rstrip("/") if isinstance(expanded_root, str) else list(expanded_root)
         self.config      = config
         self.tokenizer   = tokenizer
         self.transform   = get_transforms(
@@ -1434,12 +2048,18 @@ class GenomeGCapIterableDataset(IterableDataset):
         self.max_len     = config.max_txt_len
         self.data_seed_offset = int(data_seed_offset)
         self.mask_token_category_probs = _build_mask_category_distribution(config, "genome_gcap")
+        self.shuffle_size = _item_shuffle_size(self.config, "genome_gcap", 10000)
         # Derive annotation path from shard root (same bucket, /annotations/ subdir).
         region_json_gcs = _region_desc_gcs_from_root(root_url)
         # Load once in the main process; workers inherit via fork (copy-on-write).
         self.region_lookup = _load_region_lookup(region_json_gcs)
 
     def __iter__(self):
+        if _stateful_enabled(self.config):
+            return _StatefulGenomeIterator(self, expand_genome_gcap_sample, "genome_gcap")
+        return self._legacy_iter()
+
+    def _legacy_iter(self):
         rng = random.Random(_worker_seed(2027, jax.process_index(), self.data_seed_offset))
         region_lookup = self.region_lookup  # local ref inside worker
 
@@ -1490,12 +2110,13 @@ class GenomeGCapIterableDataset(IterableDataset):
 class GenomeDetIterableDataset(IterableDataset):
     """Grounded detection dataset from Visual Genome region_descriptions.
 
-    Each sample is one region: prompt = "detect en\\n{phrase}\\n"
+    Each sample is one region: prompt names the phrase and requests four loc tokens.
                                 label  = "<loc_ymin><loc_xmin><loc_ymax><loc_xmax>"
     """
 
     def __init__(self, root_url: str, config, tokenizer, data_seed_offset=0):
-        self.root_url = root_url.rstrip("/")
+        expanded_root = _expand_gcs_glob_if_needed(root_url)
+        self.root_url = expanded_root.rstrip("/") if isinstance(expanded_root, str) else list(expanded_root)
         self.config = config
         self.tokenizer = tokenizer
         self.transform = get_transforms(
@@ -1506,11 +2127,20 @@ class GenomeDetIterableDataset(IterableDataset):
         self.max_len = config.max_txt_len
         self.data_seed_offset = int(data_seed_offset)
         self.mask_token_category_probs = _build_mask_category_distribution(config, "genome_det")
-        self.max_regions_per_image = max(0, int(getattr(config, "genome_det_regions_per_image", 0)))
+        self.shuffle_size = _item_shuffle_size(self.config, "genome_det", 10000)
+        self.max_regions_per_image = max(
+            0,
+            int(getattr(config, "genome_det_regions_per_image", 0)),
+        )
         region_json_gcs = _region_desc_gcs_from_root(root_url)
         self.region_lookup = _load_region_lookup(region_json_gcs)
 
     def __iter__(self):
+        if _stateful_enabled(self.config):
+            return _StatefulGenomeIterator(self, expand_genome_det_sample, "genome_det")
+        return self._legacy_iter()
+
+    def _legacy_iter(self):
         rng = random.Random(_worker_seed(2029, jax.process_index(), self.data_seed_offset))
         region_lookup = self.region_lookup
 
@@ -1582,6 +2212,18 @@ def make_dataset(root, dataset_config, tokenizer, is_train=True, dataset_type="d
         log_for_0("GenomeDetIterableDataset created.")
         return ds
 
+    if _stateful_enabled(dataset_config):
+        ds = StatefulBufferedWebDataset(
+            root,
+            dataset_config,
+            tokenizer,
+            is_train=is_train,
+            dataset_type=dataset_type,
+            data_seed_offset=data_seed_offset,
+        )
+        log_for_0("StatefulBufferedWebDataset created.")
+        return ds
+
     img_transform = get_transforms(
         dataset_config.image_size,
         is_train=is_train,
@@ -1599,7 +2241,7 @@ def make_dataset(root, dataset_config, tokenizer, is_train=True, dataset_type="d
             shardshuffle=True,
         )
         .shuffle(
-            int(getattr(dataset_config, "webdataset_shuffle_size", 10000)),
+            _scaled_shuffle_size(int(getattr(dataset_config, "webdataset_shuffle_size", 10000)), dataset_config),
             rng=random.Random(_fold_data_seed(115 + rank * 514, data_seed_offset)),
         )
         .decode("pil")
@@ -1641,13 +2283,101 @@ def worker_init_fn(worker_id, rank, data_seed_offset=0):
     np.random.seed(seed % (2**32 - 1))
 
 
+class _StatefulRandomMixIterator(Stateful):
+    def __init__(self, dataset):
+        self.dataset = dataset
+        self.sources = [iter(d) for d in dataset.datasets]
+        self.probs = list(dataset.probs)
+        self.active = [True] * len(self.sources)
+        self.rng = random.Random(_worker_seed(4073, jax.process_index(), dataset.data_seed_offset))
+
+    def state_dict(self):
+        source_states = []
+        for source in self.sources:
+            if not hasattr(source, "state_dict"):
+                raise TypeError(
+                    "StatefulRandomMix requires every child iterator to implement state_dict()."
+                )
+            source_states.append(source.state_dict())
+        return {
+            "source_states": source_states,
+            "active": list(self.active),
+            "rng": _rng_state(self.rng),
+        }
+
+    def load_state_dict(self, state):
+        if len(state["source_states"]) != len(self.sources):
+            raise ValueError("StatefulRandomMix source count changed during resume.")
+        for source, source_state in zip(self.sources, state["source_states"]):
+            if not hasattr(source, "load_state_dict"):
+                raise TypeError(
+                    "StatefulRandomMix requires every child iterator to implement load_state_dict()."
+                )
+            source.load_state_dict(source_state)
+        self.active = list(state["active"])
+        _set_rng_state(self.rng, state["rng"])
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        while any(self.active):
+            active_indices = [i for i, active in enumerate(self.active) if active]
+            active_probs = [self.probs[i] for i in active_indices]
+            total = float(sum(active_probs))
+            if total <= 0:
+                raise StopIteration
+            threshold = self.rng.random() * total
+            running = 0.0
+            chosen = active_indices[-1]
+            for idx, prob in zip(active_indices, active_probs):
+                running += float(prob)
+                if threshold <= running:
+                    chosen = idx
+                    break
+            try:
+                return next(self.sources[chosen])
+            except StopIteration:
+                if self.dataset.longest:
+                    self.active[chosen] = False
+                    continue
+                raise
+        raise StopIteration
+
+
+class StatefulRandomMix(IterableDataset, Stateful):
+    def __init__(self, datasets, probs=None, longest=False, data_seed_offset=0):
+        self.datasets = datasets
+        self.probs = [1.0] * len(datasets) if probs is None else list(probs)
+        self.longest = longest
+        self.data_seed_offset = int(data_seed_offset)
+
+    def __iter__(self):
+        return _StatefulRandomMixIterator(self)
+
+
 def create_split(config, batch_size, data_seed_offset=0):
     rank = jax.process_index()
     data_seed_offset = int(data_seed_offset)
+    _assert_same_zone_roots(
+        getattr(config.dataset, "root", []),
+        getattr(config, "zone", None),
+        local_debug=bool(getattr(config, "local_debug", False)),
+    )
+    if _stateful_enabled(config.dataset):
+        _require_stateful_dependency()
     tokenizer = create_tokenizer(config.model.lm_backbone_str)
     log_for_0("Tokenizer loaded.")
 
     log_for_0(f"Creating dataset with data_seed_offset={data_seed_offset}...")
+    num_workers = max(1, int(getattr(config.dataset, "num_workers", 1)))
+    total_streams = jax.process_count() * num_workers
+    log_for_0(
+        f"Shuffle buffer scaling: total_streams={total_streams} "
+        f"(processes={jax.process_count()} x workers={num_workers}), "
+        f"reference={_SHUFFLE_SIZE_REFERENCE_STREAMS}, "
+        f"scale={'1.0 (no scaling)' if total_streams <= _SHUFFLE_SIZE_REFERENCE_STREAMS else f'{_SHUFFLE_SIZE_REFERENCE_STREAMS}/{total_streams}={_SHUFFLE_SIZE_REFERENCE_STREAMS/total_streams:.4f}'}"
+    )
     datasets = []
     roots = config.dataset.root
     assert isinstance(roots, list), f"Root must be a list, got {type(roots)}"
@@ -1678,10 +2408,14 @@ def create_split(config, batch_size, data_seed_offset=0):
     if len(roots) == 1:
         dataset = datasets[0]
     else:
-        if RandomMix is None:
+        if _stateful_enabled(config.dataset):
+            dataset = StatefulRandomMix(datasets, weights, data_seed_offset=data_seed_offset)
+            log_for_0(f"StatefulRandomMix dataset created with roots {roots} and weights {weights}.")
+        elif RandomMix is None:
             raise ImportError("webdataset RandomMix is unavailable in current environment")
-        dataset = RandomMix(datasets, weights)
-        log_for_0(f"RandomMix dataset created with roots {roots} and weights {weights}.")
+        else:
+            dataset = RandomMix(datasets, weights)
+            log_for_0(f"RandomMix dataset created with roots {roots} and weights {weights}.")
 
     dl_kwargs = dict(
         dataset=dataset,
@@ -1697,7 +2431,8 @@ def create_split(config, batch_size, data_seed_offset=0):
         dl_kwargs["prefetch_factor"] = config.dataset.prefetch_factor
         dl_kwargs["timeout"] = int(getattr(config.dataset, "dataloader_timeout", 0))
 
-    loader = DataLoader(**dl_kwargs)
+    loader_cls = StatefulDataLoader if _stateful_enabled(config.dataset) else DataLoader
+    loader = loader_cls(**dl_kwargs)
     return loader, tokenizer
 
 
