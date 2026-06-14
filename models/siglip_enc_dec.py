@@ -75,15 +75,18 @@ class Attention(nn.Module):
             return z.reshape(B, T, H, Dh).transpose(0, 2, 1, 3)  # (B,H,T,Dh)
 
         q, k, v = heads(q), heads(k), heads(v)
-        q = constrain_batch_model(q, model_dim=1)
-        k = constrain_batch_model(k, model_dim=1)
-        v = constrain_batch_model(v, model_dim=1)
+        # HSDP fix: do NOT pin the model axis onto the attention head dim here.
+        # Flipping the model axis feature-dim -> head-dim -> feature-dim every
+        # block forced an all-to-all reshard per layer. Removing these per-block
+        # head-axis constraints measured ~+37% steps/s (0.85 -> ~1.17 on v5p-64,
+        # matching the full no-op). q/k/v/attn are left unconstrained; XLA
+        # propagates the feature-dim model sharding from x (re-anchored on `out`).
+        # Param/optimizer sharding is unaffected (get_spec_dict / NamedSharding).
         attn = jnp.einsum('bhqd,bhkd->bhqk',
                           q.astype(jnp.float32),
                           k.astype(jnp.float32)) * (Dh ** -0.5)
         if mask is not None:
             attn = jnp.where(mask[:, None, :, :], attn, -1e9)
-        attn = constrain_batch_model(attn, model_dim=1)
         attn = jax.nn.softmax(attn, axis=-1).astype(x.dtype)
         out = jnp.einsum('bhqk,bhkd->bhqd', attn, v)
         out = out.transpose(0, 2, 1, 3).reshape(B, T, inner)
@@ -118,13 +121,12 @@ class CrossAttention(nn.Module):
             return z.reshape(B, T, H, Dh).transpose(0, 2, 1, 3)
 
         q, k, v = heads(q, Tq), heads(k, Tk), heads(v, Tk)
-        q = constrain_batch_model(q, model_dim=1)
-        k = constrain_batch_model(k, model_dim=1)
-        v = constrain_batch_model(v, model_dim=1)
+        # HSDP fix: see SelfAttention above — no per-block model-axis->head-dim
+        # flip (it caused an all-to-all reshard every layer). Leave q/k/v/attn
+        # unconstrained; the feature-dim model sharding propagates from query.
         attn = jnp.einsum('bhqd,bhkd->bhqk',
                           q.astype(jnp.float32),
                           k.astype(jnp.float32)) * (Dh ** -0.5)
-        attn = constrain_batch_model(attn, model_dim=1)
         attn = jax.nn.softmax(attn, axis=-1).astype(query.dtype)
         if qmask is not None:
             # No read from any patch for dropped query rows (equiv. row-wise attention mask)

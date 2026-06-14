@@ -530,15 +530,20 @@ def _sample_with_image(raw_sample, item):
 
 
 def _with_module_random(rng, fn, *args, **kwargs):
-    """Run legacy preprocessing randomness from a serializable RNG."""
-    old_state = random.getstate()
+    """Run legacy preprocessing randomness from a serializable RNG.
+
+    The global `random` module is consumed only inside `fn` (preprocessing);
+    every other stochastic step in the stateful pipeline uses a dedicated
+    `random.Random` instance. So we load `rng` into the global module, run `fn`,
+    and persist the advanced state back to `rng`, without saving/restoring the
+    previous global state. The draws `fn` sees and the state persisted to `rng`
+    are byte-identical to the save/restore version, so exact stateful resume is
+    unchanged; only the (unused) post-call global state differs.
+    """
     random.setstate(rng.getstate())
-    try:
-        out = fn(*args, **kwargs)
-        rng.setstate(random.getstate())
-        return out
-    finally:
-        random.setstate(old_state)
+    out = fn(*args, **kwargs)
+    rng.setstate(random.getstate())
+    return out
 
 
 class LetterboxPadTransform:
@@ -2306,6 +2311,10 @@ class _StatefulRandomMixIterator(Stateful):
         self.probs = list(dataset.probs)
         self.active = [True] * len(self.sources)
         self.rng = random.Random(_worker_seed(4073, jax.process_index(), dataset.data_seed_offset))
+        # Cached weighted-choice distribution over currently-active sources,
+        # invalidated only when `self.active` changes (source exhaustion in
+        # longest mode, or restore). Avoids rebuilding indices/probs/sum per sample.
+        self._dist = None
 
     def state_dict(self):
         source_states = []
@@ -2331,31 +2340,41 @@ class _StatefulRandomMixIterator(Stateful):
                 )
             source.load_state_dict(source_state)
         self.active = list(state["active"])
+        self._dist = None
         _set_rng_state(self.rng, state["rng"])
 
     def __iter__(self):
         return self
 
+    def _active_distribution(self):
+        # (active_indices, cumulative_weights, total) over active sources.
+        if self._dist is None:
+            indices = [i for i, active in enumerate(self.active) if active]
+            cum = []
+            running = 0.0
+            for i in indices:
+                running += float(self.probs[i])
+                cum.append(running)
+            self._dist = (indices, cum, running)
+        return self._dist
+
     def __next__(self):
         while any(self.active):
-            active_indices = [i for i, active in enumerate(self.active) if active]
-            active_probs = [self.probs[i] for i in active_indices]
-            total = float(sum(active_probs))
+            indices, cum, total = self._active_distribution()
             if total <= 0:
                 raise StopIteration
             threshold = self.rng.random() * total
-            running = 0.0
-            chosen = active_indices[-1]
-            for idx, prob in zip(active_indices, active_probs):
-                running += float(prob)
+            chosen = indices[-1]
+            for j, running in enumerate(cum):
                 if threshold <= running:
-                    chosen = idx
+                    chosen = indices[j]
                     break
             try:
                 return next(self.sources[chosen])
             except StopIteration:
                 if self.dataset.longest:
                     self.active[chosen] = False
+                    self._dist = None
                     continue
                 raise
         raise StopIteration

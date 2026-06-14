@@ -19,11 +19,12 @@ from gemma.gm.nn._transformer import _Inputs
 
 from models.clip_vit import CLIP_L14_336, CLIPVisionTower
 from models.gemma import load_LM
-from models.paligemma import token_xent_loss_from_hidden
+from models.paligemma import token_xent_loss, token_xent_loss_from_hidden
 from utils.pjit_util import constrain_batch, constrain_batch_model
 
 Array = jnp.ndarray
 PyTree = Any
+_IMAGE_TEXT_STAT_EPS = 1e-6
 
 
 def _mean_square(x: Array) -> Array:
@@ -41,6 +42,49 @@ def _masked_mean_square(x: Array, mask: Optional[Array]) -> Array:
     denom = jnp.maximum(jnp.sum(mask) * x.shape[-1], 1.0)
     mask = mask[..., None]
     return jnp.sum(x.astype(jnp.float32) ** 2 * mask) / denom
+
+
+def _prompt_mask(text_embeds: Array, prefix_len: Array, attention_mask: Optional[Array]) -> Array:
+    B, T = text_embeds.shape[:2]
+    prefix_len = jnp.asarray(prefix_len, dtype=jnp.int32)
+    if prefix_len.ndim == 0:
+        prefix_len = jnp.broadcast_to(prefix_len, (B,))
+    mask = jnp.arange(T, dtype=jnp.int32)[None, :] < prefix_len[:, None]
+    if attention_mask is not None:
+        mask = mask & attention_mask.astype(bool)
+    return mask
+
+
+def _sample_moments(
+    x: Array,
+    axes: str,
+    mask: Optional[Array] = None,
+) -> tuple[Array, Array]:
+    x = x.astype(jnp.float32)
+    if axes == "scalar":
+        if mask is None:
+            mean = jnp.mean(x, axis=(1, 2), keepdims=True)
+            var = jnp.mean((x - mean) ** 2, axis=(1, 2), keepdims=True)
+        else:
+            mask = mask.astype(jnp.float32)[..., None]
+            denom = jnp.maximum(
+                jnp.sum(mask, axis=(1, 2), keepdims=True) * x.shape[-1],
+                1.0,
+            )
+            mean = jnp.sum(x * mask, axis=(1, 2), keepdims=True) / denom
+            var = jnp.sum((x - mean) ** 2 * mask, axis=(1, 2), keepdims=True) / denom
+    elif axes == "per_channel":
+        if mask is None:
+            mean = jnp.mean(x, axis=1, keepdims=True)
+            var = jnp.mean((x - mean) ** 2, axis=1, keepdims=True)
+        else:
+            mask = mask.astype(jnp.float32)[..., None]
+            denom = jnp.maximum(jnp.sum(mask, axis=1, keepdims=True), 1.0)
+            mean = jnp.sum(x * mask, axis=1, keepdims=True) / denom
+            var = jnp.sum((x - mean) ** 2 * mask, axis=1, keepdims=True) / denom
+    else:
+        raise ValueError(f"Unsupported image_text_stat_axes: {axes}")
+    return mean, jnp.sqrt(jnp.maximum(var, 0.0))
 
 
 class LlavaProjector(nn.Module):
@@ -98,6 +142,11 @@ class LlavaGemma(nn.Module):
     # parameter update, which makes late-fusion HSDP runs much slower.
     stop_gradient_text_features: bool = False
     image_post_connector_scale: float = 1.0
+    image_post_connector_transform: str = "fixed_scale"
+    image_text_stat_source: str = "prompt"
+    image_text_stat_axes: str = "scalar"
+    token_loss_mode: str = "hidden_scan"
+    token_loss_chunk_size: int = 8192
     # Standard LLaVA behavior: image prefix tokens are bidirectional, while
     # prompt/text tokens remain causal. Set False to restore the old full
     # image+prompt bidirectional prefix.
@@ -128,6 +177,38 @@ class LlavaGemma(nn.Module):
                 f"txt_feature_layer={self.txt_feature_layer} exceeds "
                 f"LM depth {len(self.lm_backbone.blocks)}"
             )
+        if self._image_post_connector_transform() not in {"fixed_scale", "match_text_stats"}:
+            raise ValueError(
+                "image_post_connector_transform must be 'fixed_scale' or "
+                f"'match_text_stats', got {self.image_post_connector_transform!r}"
+            )
+        if self._image_text_stat_source() != "prompt":
+            raise ValueError(
+                "Only image_text_stat_source='prompt' is currently supported, got "
+                f"{self.image_text_stat_source!r}"
+            )
+        if self._image_text_stat_axes() not in {"scalar", "per_channel"}:
+            raise ValueError(
+                "image_text_stat_axes must be 'scalar' or 'per_channel', got "
+                f"{self.image_text_stat_axes!r}"
+            )
+        if self._token_loss_mode() not in {"hidden_scan", "full_decode"}:
+            raise ValueError(
+                "token_loss_mode must be 'hidden_scan' or 'full_decode', got "
+                f"{self.token_loss_mode!r}"
+            )
+
+    def _image_post_connector_transform(self) -> str:
+        return str(self.image_post_connector_transform or "fixed_scale").lower().replace("-", "_")
+
+    def _image_text_stat_source(self) -> str:
+        return str(self.image_text_stat_source or "prompt").lower().replace("-", "_")
+
+    def _image_text_stat_axes(self) -> str:
+        return str(self.image_text_stat_axes or "scalar").lower().replace("-", "_").replace(" ", "_")
+
+    def _token_loss_mode(self) -> str:
+        return str(self.token_loss_mode or "hidden_scan").lower().replace("-", "_")
 
     def encode_image(self, images: Array, train: bool = False) -> Array:
         """Encode images into CLIP patch tokens."""
@@ -140,6 +221,43 @@ class LlavaGemma(nn.Module):
         if scale == 1.0:
             return img_embeds
         return img_embeds * jnp.asarray(scale, dtype=img_embeds.dtype)
+
+    def _image_post_connector_scale_value(self) -> float:
+        if self.image_post_connector_scale is None:
+            return 1.0
+        return float(self.image_post_connector_scale)
+
+    def _transform_image_embeds(
+        self,
+        img_embeds: Array,
+        text_embeds: Array,
+        prefix_len: Array,
+        attention_mask: Optional[Array],
+    ) -> tuple[Array, Dict[str, Array]]:
+        transform = self._image_post_connector_transform()
+        if transform == "fixed_scale":
+            return self._scale_image_embeds(img_embeds), {}
+        if transform != "match_text_stats":
+            raise ValueError(f"Unsupported image_post_connector_transform: {transform}")
+
+        axes = self._image_text_stat_axes()
+        text_mask = _prompt_mask(text_embeds, prefix_len, attention_mask)
+        img_mean, img_std = _sample_moments(img_embeds, axes)
+        text_mean, text_std = _sample_moments(text_embeds, axes, text_mask)
+        matched = (
+            (img_embeds.astype(jnp.float32) - img_mean)
+            / jnp.maximum(img_std, _IMAGE_TEXT_STAT_EPS)
+            * jax.lax.stop_gradient(text_std)
+            + jax.lax.stop_gradient(text_mean)
+        )
+        log_dict = {
+            "image_text_stat_prompt_tokens": jnp.sum(text_mask.astype(jnp.float32)),
+            "image_text_stat_img_mean": jnp.mean(img_mean),
+            "image_text_stat_img_std": jnp.mean(img_std),
+            "image_text_stat_text_mean": jnp.mean(text_mean),
+            "image_text_stat_text_std": jnp.mean(text_std),
+        }
+        return matched.astype(img_embeds.dtype), log_dict
 
     def make_causal_with_prefix_block(
         self,
@@ -262,20 +380,12 @@ class LlavaGemma(nn.Module):
             img_embeds = constrain_batch_model(img_embeds)
             raw_img_embeds_norm = _mean_square(img_embeds)
             raw_img_embeds_rms = _rms_from_mean_square(raw_img_embeds_norm)
-            img_embeds = self._scale_image_embeds(img_embeds)
-            img_embeds = constrain_batch_model(img_embeds)
-            img_embeds_norm = _mean_square(img_embeds)
-            img_embeds_rms = _rms_from_mean_square(img_embeds_norm)
             # Explicit post-connector metrics. img_embeds_norm is kept for
             # backward-compatible W&B curves.
             log_dict["image_post_connector_scale"] = jnp.asarray(
-                self.image_post_connector_scale, dtype=jnp.float32
+                self._image_post_connector_scale_value(), dtype=jnp.float32
             )
             log_dict["img_embeds_pre_scale_rms"] = raw_img_embeds_rms
-            log_dict["img_embeds_post_connector_rms"] = img_embeds_rms
-            log_dict["img_token_txt_embeds_valid_ratio"] = (
-                img_embeds_rms / jnp.maximum(token_embeds_valid_rms, 1e-12)
-            )
 
             split_txt_cache = {}
             if self.txt_feature_layer > 0:
@@ -293,6 +403,22 @@ class LlavaGemma(nn.Module):
                     txt_feature_embeds_valid_norm
                 )
                 log_dict["txt_feature_embeds_valid_rms"] = txt_feature_embeds_valid_rms
+
+            img_embeds, stat_log_dict = self._transform_image_embeds(
+                img_embeds,
+                token_embeds,
+                jnp.asarray(prefix_len, dtype=jnp.int32),
+                text_mask,
+            )
+            log_dict.update(stat_log_dict)
+            img_embeds = constrain_batch_model(img_embeds)
+            img_embeds_norm = _mean_square(img_embeds)
+            img_embeds_rms = _rms_from_mean_square(img_embeds_norm)
+            log_dict["img_embeds_post_connector_rms"] = img_embeds_rms
+            log_dict["img_token_txt_embeds_valid_ratio"] = (
+                img_embeds_rms / jnp.maximum(token_embeds_valid_rms, 1e-12)
+            )
+            if self.txt_feature_layer > 0:
                 log_dict["img_txt_feature_valid_rms_ratio"] = (
                     img_embeds_rms / jnp.maximum(txt_feature_embeds_valid_rms, 1e-12)
                 )
@@ -350,12 +476,20 @@ class LlavaGemma(nn.Module):
 
         assert cache is None
         lm_hidden = out[:, K:, :] if K > 0 else out
-        loss, pred_ids = token_xent_loss_from_hidden(
-            lm_hidden,
-            self.lm_backbone.embedder.input_embedding_table,
-            labels,
-            final_logit_softcap=self.final_logit_softcap,
-        )
+        if self._token_loss_mode() == "full_decode":
+            logits = self.lm_backbone.embedder.decode(lm_hidden)
+            if self.final_logit_softcap != 0.0:
+                logits = jnp.tanh(logits / self.final_logit_softcap) * self.final_logit_softcap
+            loss = token_xent_loss(logits, labels)
+            pred_ids = jnp.argmax(logits, axis=-1)
+        else:
+            loss, pred_ids = token_xent_loss_from_hidden(
+                lm_hidden,
+                self.lm_backbone.embedder.input_embedding_table,
+                labels,
+                final_logit_softcap=self.final_logit_softcap,
+                chunk_size=int(self.token_loss_chunk_size),
+            )
 
         valid = labels != -100
         valid_count = valid.sum()
@@ -394,8 +528,6 @@ class LlavaGemma(nn.Module):
         if images is not None:
             clip_tokens = self.encode_image(images, train=False)
             img_embeds = self.projector(clip_tokens)
-            img_embeds = self._scale_image_embeds(img_embeds)
-            img_embeds = constrain_batch_model(img_embeds)
             K = img_embeds.shape[1]
         else:
             img_embeds = None
@@ -422,6 +554,13 @@ class LlavaGemma(nn.Module):
                 cache,
             )
         if img_embeds is not None:
+            img_embeds, _ = self._transform_image_embeds(
+                img_embeds,
+                token_embeds,
+                prefix_len,
+                attention_mask=None,
+            )
+            img_embeds = constrain_batch_model(img_embeds)
             token_embeds = jnp.concatenate([img_embeds, token_embeds], axis=1)
 
         L = token_embeds.shape[1]
@@ -579,8 +718,6 @@ class LlavaGemma(nn.Module):
         if images is not None:
             clip_tokens = self.encode_image(images, train=False)
             img_embeds = self.projector(clip_tokens)
-            img_embeds = self._scale_image_embeds(img_embeds)
-            img_embeds = constrain_batch_model(img_embeds)
             K = img_embeds.shape[1]
         else:
             img_embeds = None
@@ -607,6 +744,13 @@ class LlavaGemma(nn.Module):
                 cache,
             )
         if img_embeds is not None:
+            img_embeds, _ = self._transform_image_embeds(
+                img_embeds,
+                token_embeds,
+                prefix_len,
+                attention_mask=None,
+            )
+            img_embeds = constrain_batch_model(img_embeds)
             token_embeds = jnp.concatenate([img_embeds, token_embeds], axis=1)
 
         L = token_embeds.shape[1]

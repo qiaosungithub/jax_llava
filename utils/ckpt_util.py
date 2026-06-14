@@ -186,21 +186,25 @@ def copy_latest_checkpoint_to_pretrained(checkpoint_or_workdir, zone=None):
     log_for_0("Durable pretrained checkpoint saved to %s.", dst)
     return True
 
-def save_checkpoint(state, workdir):
+def save_checkpoint(state, workdir, *, log_completion=True):
     """
     Saves the model state to a checkpoint in the specified working directory.
     """
     assert not workdir.startswith('gs://'), f'workdir {workdir} must not start with gs://'
     # Save a host tree, matching the text-jit HSDP path. This avoids baking a
     # TPU topology-specific sharding into checkpoints that may later be resumed
-    # on a different v5p/v6e layout.
+    # on a different v5p/v6e layout. save_checkpoint_multiprocess must still be
+    # called by every JAX host; otherwise its internal barriers get out of sync
+    # with the training loop's explicit checkpoint barrier.
     state = jax.tree.map(lambda x: jax.device_get(x), state)
     step = int(state.step)
     print0(f'{Emoji.ROCKET} Saving checkpoint at step {step} ...')
     gs_path = convert_to_gs(workdir)
     with _orbax_set_mesh_context_compat():
         checkpoints.save_checkpoint_multiprocess(gs_path, state, step, keep=3)
-    print0(f'{Emoji.GOOD} Checkpoint at step {step} saved to {gs_path}.')
+    if log_completion:
+        print0(f'{Emoji.GOOD} Checkpoint at step {step} saved to {gs_path}.')
+    return step, gs_path
 
 
 @contextlib.contextmanager

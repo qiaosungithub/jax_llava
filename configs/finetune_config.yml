@@ -30,6 +30,9 @@ model:
     use_2l_mlp: True
 
     txt_feature_layer: 15 # gemma3-270M has 18 layers
+    image_post_connector_transform: "fixed_scale"
+    image_text_stat_source: "prompt"
+    image_text_stat_axes: "scalar"
 
     # Loss weights (only normal loss for SFT)
     vlm_loss_weight: 1.0 # the normal image-conditioned NTP

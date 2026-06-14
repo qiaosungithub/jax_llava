@@ -166,7 +166,14 @@ def get_config():
     # backward compute. Set False if you intentionally train through that path.
     model.stop_gradient_text_features = None
     model.image_post_connector_scale = 1.0
+    # fixed_scale keeps legacy behavior. match_text_stats normalizes projected
+    # image tokens per sample and matches prompt text-token mean/std before concat.
+    model.image_post_connector_transform = "fixed_scale"
+    model.image_text_stat_source = "prompt"
+    model.image_text_stat_axes = "scalar"  # scalar or per_channel
     model.prompt_causal = True
+    model.token_loss_mode = "hidden_scan"  # hidden_scan or full_decode
+    model.token_loss_chunk_size = 8192
 
     # ------------------------------------------------------------
     # Sampling
@@ -291,8 +298,11 @@ def get_config():
     config.load_from_pretrained = ''
     config.eval_all = False
     config.eval_only = False
-    # jit sharding mode: "ddp", "hsdp", or "fsdp". HSDP is the default
-    # production path; it shards model/optimizer states over the last mesh axis.
+    # jit sharding mode: "ddp", "hsdp", "hsdp_legacy_data", or "fsdp".
+    # HSDP is the default production path; it shards model/optimizer states over
+    # the last mesh axis. "hsdp_legacy_data" keeps HSDP parameter sharding but
+    # shards DATA inputs on every mesh axis, matching the older fast stage1
+    # layout.
     config.sharding = "hsdp"
     config.wandb_resume_id = ""
     config.local_debug = False

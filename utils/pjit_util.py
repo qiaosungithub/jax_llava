@@ -13,6 +13,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 _mesh = None
 _mode = "hsdp"
 _logged_data_layout_fallback = False
+_HSDP_LEGACY_DATA_MODE = "hsdp_legacy_data"
 
 
 def log_for_0(*args, **kwargs):
@@ -265,7 +266,7 @@ def get_spec_dict(tree, mesh: Mesh, param_mode: MeshMode, sharding_mode: str):
         spec_tree = jax.tree.map(lambda _: data_spec, tree)
     elif sharding_mode == "ddp":
         spec_tree = jax.tree.map(lambda _: P(), tree)
-    elif sharding_mode == "hsdp":
+    elif sharding_mode in {"hsdp", _HSDP_LEGACY_DATA_MODE}:
         model_shard = P(mesh.axis_names[-1])
         spec_tree = jax.tree.map(lambda leaf: apply_spec_to_last_dims(leaf, model_shard), tree)
     elif sharding_mode == "fsdp":

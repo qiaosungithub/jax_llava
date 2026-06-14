@@ -15,6 +15,10 @@ model:
     final_logit_softcap: 0.0
     txt_feature_layer: 0
     image_post_connector_scale: 1.0
+    image_post_connector_transform: "fixed_scale"
+    # image_post_connector_transform: "match_text_stats"
+    image_text_stat_source: "prompt"
+    image_text_stat_axes: "scalar"
     prompt_causal: True
     recon_loss_weight: 0.0
 
@@ -28,17 +32,17 @@ dataset:
     stateful_dataloader: True
     stateful_dataloader_strict: True
     item_shuffle_size:
-        default: 512
-        llava_ov15: 50000
-        vqav2: 512
-        okvqa: 512
-        aokvqa: 512
-        ocrvqa: 512
-        gqa: 512
-        textvqa: 512
-        genome: 512
-        genome_det: 512
-        refcoco: 512
+        default: 2048
+        llava_ov15: 200000
+        vqav2: 2048
+        okvqa: 2048
+        aokvqa: 2048
+        ocrvqa: 2048
+        gqa: 2048
+        textvqa: 2048
+        genome: 2048
+        genome_det: 2048
+        refcoco: 2048
     # LLaVA-1.5 samples 10 Visual Genome region annotations per image.
     genome_det_regions_per_image: 10
 
@@ -48,8 +52,10 @@ training:
     # Global checkpoint stream in one workdir:
     # stage-1 [0, 2180), stage-2 [2180, 7375).
     stage1_steps: 2180
-    stage2_steps: 5195
-    num_steps: 7375
+    # stage2_steps: 5195 # baseline
+    stage2_steps: 15000
+    # num_steps: 7375 # baseline
+    num_steps: 17180
 
     vision_tower_from_scratch: False
     clip_from_pt: True
@@ -69,11 +75,12 @@ training:
     stage1:
         name: "stage1_projector_pretrain"
         dataset:
-            max_txt_len: 64
+            # max_txt_len: 64 # baseline
+            max_txt_len: 160
         dataset_items:
             # - blip3o-short
-            # - cc12m
-            - laion-aes
+            - cc12m
+            # - laion-aes
         mix_weights: [1]
         batch_size: 256
         freeze_lm: True
@@ -128,10 +135,13 @@ training:
             weight_decay: 0.0
         vision_encoder_learning_rate: 0.00002
         connector_learning_rate: 0.0005
-        warmup_steps: 156
+        # warmup_steps: 156 # baseline
+        warmup_steps: 450
         lr_schedule: cos
-        sample_per_step: 200
-        online_eval_per_step: 1200
+        # sample_per_step: 200 # baseline
+        # online_eval_per_step: 1200 # baseline
+        sample_per_step: 500
+        online_eval_per_step: 2500
         online_eval_tasks: [vqav2, mme, textvqa, refcocog, pixelbench, gqa, vizwiz, scienceqa_img, seed_bench]
         final_eval_tasks: [vqav2, mme, textvqa, pope, refcocog, pixelbench, mmbench, gqa, vizwiz, scienceqa_img, seed_bench]
 
@@ -152,16 +162,16 @@ eval:
     online_vqav2_sample_fraction: 0.1
 
 finetune: False
-sharding: hsdp
+sharding: hsdp_legacy_data
 
-# Continue the original LLaVA curriculum run from the last complete checkpoint
-# before window 7034 hit the old topology-specific Orbax restore bug.
-# load_from: /kmh-nfs-ssd-us-mount/logs/sqa/paligemma-baseline/20260530_031225_726dru_kmh-tpuvm-v5p-64-spot-keya-lax60d_us-central1-a__b_lr_ep_eval
-# wandb_resume_id: q043krc3
+# Run this queue entry from scratch. Keep these empty so the run cannot restore
+# an old checkpoint/dataloader state after monitor requeues it.
+load_from: ''
+wandb_resume_id: ''
 
 logging:
     use_wandb: True
     wandb_project: "jax-llava"
     wandb_entity: "sqa24-massachusetts-institute-of-technology"
     wandb_tags: ["llava1.5", "curriculum", "hsdp"]
-    wandb_notes: "[prompt causal baseline] [laion-aes pretrain] LLaVA-1.5 reproduction two-stage curriculum using jit/HSDP. Stage-1 trains connector only; stage-2 trains connector + LM. Adam original LR: stage1 connector 1e-3, stage2 LM 2e-5, connector 5e-4. Stage-2 data: LLaVA-OV1.5-Instruct plus VQAv2/OKVQA/A-OKVQA/OCRVQA/GQA/TextCaps/Visual Genome QA, VG detection, and RefCOCO grounding."
+    wandb_notes: "[shuffle more] [ablation: stage 2 train 3x longer] [rerun baseline with cc12m, 160 length] LLaVA-1.5 reproduction two-stage curriculum using jit/HSDP. Stage-1 trains connector only; stage-2 trains connector + LM. Adam original LR: stage1 connector 1e-3, stage2 LM 2e-5, connector 5e-4. Stage-2 data: LLaVA-OV1.5-Instruct plus VQAv2/OKVQA/A-OKVQA/OCRVQA/GQA/TextCaps/Visual Genome QA, VG detection, and RefCOCO grounding."

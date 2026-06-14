@@ -40,6 +40,66 @@ from utils.pjit_util import constrain_batch_model
 
 Array = jnp.ndarray
 PyTree = Any
+_IMAGE_TEXT_STAT_EPS = 1e-6
+
+
+def _mean_square(x: Array) -> Array:
+    return jnp.mean(x.astype(jnp.float32) ** 2)
+
+
+def _rms_from_mean_square(x_ms: Array) -> Array:
+    return jnp.sqrt(jnp.maximum(x_ms, 0.0))
+
+
+def _masked_mean_square(x: Array, mask: Optional[Array]) -> Array:
+    if mask is None:
+        return _mean_square(x)
+    mask = mask.astype(jnp.float32)
+    denom = jnp.maximum(jnp.sum(mask) * x.shape[-1], 1.0)
+    return jnp.sum(x.astype(jnp.float32) ** 2 * mask[..., None]) / denom
+
+
+def _prompt_mask(text_embeds: Array, prefix_len: Array, attention_mask: Optional[Array]) -> Array:
+    B, T = text_embeds.shape[:2]
+    prefix_len = jnp.asarray(prefix_len, dtype=jnp.int32)
+    if prefix_len.ndim == 0:
+        prefix_len = jnp.broadcast_to(prefix_len, (B,))
+    mask = jnp.arange(T, dtype=jnp.int32)[None, :] < prefix_len[:, None]
+    if attention_mask is not None:
+        mask = mask & attention_mask.astype(bool)
+    return mask
+
+
+def _sample_moments(
+    x: Array,
+    axes: str,
+    mask: Optional[Array] = None,
+) -> tuple[Array, Array]:
+    x = x.astype(jnp.float32)
+    if axes == "scalar":
+        if mask is None:
+            mean = jnp.mean(x, axis=(1, 2), keepdims=True)
+            var = jnp.mean((x - mean) ** 2, axis=(1, 2), keepdims=True)
+        else:
+            mask = mask.astype(jnp.float32)[..., None]
+            denom = jnp.maximum(
+                jnp.sum(mask, axis=(1, 2), keepdims=True) * x.shape[-1],
+                1.0,
+            )
+            mean = jnp.sum(x * mask, axis=(1, 2), keepdims=True) / denom
+            var = jnp.sum((x - mean) ** 2 * mask, axis=(1, 2), keepdims=True) / denom
+    elif axes == "per_channel":
+        if mask is None:
+            mean = jnp.mean(x, axis=1, keepdims=True)
+            var = jnp.mean((x - mean) ** 2, axis=1, keepdims=True)
+        else:
+            mask = mask.astype(jnp.float32)[..., None]
+            denom = jnp.maximum(jnp.sum(mask, axis=1, keepdims=True), 1.0)
+            mean = jnp.sum(x * mask, axis=1, keepdims=True) / denom
+            var = jnp.sum((x - mean) ** 2 * mask, axis=1, keepdims=True) / denom
+    else:
+        raise ValueError(f"Unsupported image_text_stat_axes: {axes}")
+    return mean, jnp.sqrt(jnp.maximum(var, 0.0))
 
 
 class PaliGemmaEncDec(nn.Module):
@@ -131,6 +191,10 @@ class PaliGemmaEncDec(nn.Module):
     # Treat text features from frozen prefix LM layers as constants. This keeps
     # late-fusion runs from spending backward compute on frozen text-only blocks.
     stop_gradient_text_features: bool = False
+    image_post_connector_scale: float = 1.0
+    image_post_connector_transform: str = "fixed_scale"
+    image_text_stat_source: str = "prompt"
+    image_text_stat_axes: str = "scalar"
     # Standard LLaVA behavior: image prefix tokens are bidirectional, while
     # prompt/text tokens remain causal. Set False to restore the old full
     # image+prompt bidirectional prefix.
@@ -165,6 +229,28 @@ class PaliGemmaEncDec(nn.Module):
             use_ln=self.projector_use_ln,
             use_2l_mlp=self.use_2l_mlp,
         )
+        if self.txt_feature_layer < 0:
+            raise ValueError(f"txt_feature_layer must be >= 0, got {self.txt_feature_layer}")
+        if self.txt_feature_layer > len(self.lm_backbone.blocks):
+            raise ValueError(
+                f"txt_feature_layer={self.txt_feature_layer} exceeds "
+                f"LM depth {len(self.lm_backbone.blocks)}"
+            )
+        if self._image_post_connector_transform() not in {"fixed_scale", "match_text_stats"}:
+            raise ValueError(
+                "image_post_connector_transform must be 'fixed_scale' or "
+                f"'match_text_stats', got {self.image_post_connector_transform!r}"
+            )
+        if self._image_text_stat_source() != "prompt":
+            raise ValueError(
+                "Only image_text_stat_source='prompt' is currently supported, got "
+                f"{self.image_text_stat_source!r}"
+            )
+        if self._image_text_stat_axes() not in {"scalar", "per_channel"}:
+            raise ValueError(
+                "image_text_stat_axes must be 'scalar' or 'per_channel', got "
+                f"{self.image_text_stat_axes!r}"
+            )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -177,6 +263,58 @@ class PaliGemmaEncDec(nn.Module):
     ) -> Array:
         """(B, H, W, 3) → (B, K, feature_dim)"""
         return self.image_encoder.encode(images, vis_mask)
+
+    def _image_post_connector_scale_value(self) -> float:
+        if self.image_post_connector_scale is None:
+            return 1.0
+        return float(self.image_post_connector_scale)
+
+    def _image_post_connector_transform(self) -> str:
+        return str(self.image_post_connector_transform or "fixed_scale").lower().replace("-", "_")
+
+    def _image_text_stat_source(self) -> str:
+        return str(self.image_text_stat_source or "prompt").lower().replace("-", "_")
+
+    def _image_text_stat_axes(self) -> str:
+        return str(self.image_text_stat_axes or "scalar").lower().replace("-", "_").replace(" ", "_")
+
+    def _scale_image_embeds(self, img_embeds: Array) -> Array:
+        scale = self._image_post_connector_scale_value()
+        if scale == 1.0:
+            return img_embeds
+        return img_embeds * jnp.asarray(scale, dtype=img_embeds.dtype)
+
+    def _transform_image_embeds(
+        self,
+        img_embeds: Array,
+        text_embeds: Array,
+        prefix_len: Array,
+        attention_mask: Optional[Array],
+    ) -> tuple[Array, Dict[str, Array]]:
+        transform = self._image_post_connector_transform()
+        if transform == "fixed_scale":
+            return self._scale_image_embeds(img_embeds), {}
+        if transform != "match_text_stats":
+            raise ValueError(f"Unsupported image_post_connector_transform: {transform}")
+
+        axes = self._image_text_stat_axes()
+        text_mask = _prompt_mask(text_embeds, prefix_len, attention_mask)
+        img_mean, img_std = _sample_moments(img_embeds, axes)
+        text_mean, text_std = _sample_moments(text_embeds, axes, text_mask)
+        matched = (
+            (img_embeds.astype(jnp.float32) - img_mean)
+            / jnp.maximum(img_std, _IMAGE_TEXT_STAT_EPS)
+            * jax.lax.stop_gradient(text_std)
+            + jax.lax.stop_gradient(text_mean)
+        )
+        log_dict = {
+            'image_text_stat_prompt_tokens': jnp.sum(text_mask.astype(jnp.float32)),
+            'image_text_stat_img_mean': jnp.mean(img_mean),
+            'image_text_stat_img_std': jnp.mean(img_std),
+            'image_text_stat_text_mean': jnp.mean(text_mean),
+            'image_text_stat_text_std': jnp.mean(text_std),
+        }
+        return matched.astype(img_embeds.dtype), log_dict
 
     def make_causal_with_prefix_block(
         self,
@@ -241,6 +379,7 @@ class PaliGemmaEncDec(nn.Module):
         mask_token_category_probs: Optional[Array] = None,  # (B, 7) over [4,8,...,256]
         cache: Optional[PyTree] = None,
         use_cache: bool = False,
+        return_hidden: bool = False,
     ) -> Any:
         """
         Training (labels is not None)
@@ -258,7 +397,20 @@ class PaliGemmaEncDec(nn.Module):
         # ── Text embeddings ────────────────────────────────────────────────
         token_embeds = self.lm_backbone.embedder.encode(input_ids)   # (B, T_text, D_lm)
         token_embeds = constrain_batch_model(token_embeds)
-        log_dict['token_embeds_norm'] = jnp.mean(token_embeds ** 2)
+        token_embeds_norm = _mean_square(token_embeds)
+        token_embeds_rms = _rms_from_mean_square(token_embeds_norm)
+        token_embeds_valid_norm = _masked_mean_square(token_embeds, attention_mask)
+        token_embeds_valid_rms = _rms_from_mean_square(token_embeds_valid_norm)
+        log_dict['token_embeds_norm'] = token_embeds_norm
+        log_dict['token_embeds_rms'] = token_embeds_rms
+        log_dict['token_embeds_valid_rms'] = token_embeds_valid_rms
+        if attention_mask is not None:
+            valid_text_tokens = jnp.sum(attention_mask.astype(jnp.float32))
+            total_text_tokens = jnp.asarray(attention_mask.size, dtype=jnp.float32)
+            log_dict['valid_text_tokens'] = valid_text_tokens
+            log_dict['text_padding_fraction'] = (
+                1.0 - valid_text_tokens / jnp.maximum(total_text_tokens, 1.0)
+            )
 
         # ── Image encoding + optional reconstruction loss ──────────────────
         if images is not None:
@@ -317,7 +469,9 @@ class PaliGemmaEncDec(nn.Module):
                 vis_mask=prefix_mask if _use_enc_mid_mask else None,
             )                                                        # (B, K, D_enc)
             enc_tokens = constrain_batch_model(enc_tokens)
-            log_dict['enc_tokens_norm'] = jnp.mean(enc_tokens ** 2)
+            enc_tokens_norm = _mean_square(enc_tokens)
+            log_dict['enc_tokens_norm'] = enc_tokens_norm
+            log_dict['enc_tokens_rms'] = _rms_from_mean_square(enc_tokens_norm)
 
             # reconstruction loss
             if labels is not None and self.recon_loss_weight > 0.0:
@@ -368,7 +522,13 @@ class PaliGemmaEncDec(nn.Module):
             # Project K encoder tokens to LM hidden dim
             img_embeds = self.projector(enc_tokens)                  # (B, K, D_lm)
             img_embeds = constrain_batch_model(img_embeds)
-            log_dict['img_embeds_norm'] = jnp.mean(img_embeds ** 2)
+            img_embeds_pre_scale_norm = _mean_square(img_embeds)
+            img_embeds_pre_scale_rms = _rms_from_mean_square(img_embeds_pre_scale_norm)
+            log_dict['image_post_connector_scale'] = jnp.asarray(
+                self._image_post_connector_scale_value(), dtype=jnp.float32
+            )
+            log_dict['img_embeds_pre_scale_norm'] = img_embeds_pre_scale_norm
+            log_dict['img_embeds_pre_scale_rms'] = img_embeds_pre_scale_rms
 
             # Optional split: run text through first txt_feature_layer LM blocks
             # to produce "text features" before concatenating with image features.
@@ -397,6 +557,44 @@ class PaliGemmaEncDec(nn.Module):
                 token_embeds = _x  # (B, T_text, D_lm) – text features after N blocks
                 if self.stop_gradient_text_features:
                     token_embeds = jax.lax.stop_gradient(token_embeds)
+                txt_feature_embeds_norm = _mean_square(token_embeds)
+                txt_feature_embeds_rms = _rms_from_mean_square(txt_feature_embeds_norm)
+                txt_feature_embeds_valid_norm = _masked_mean_square(
+                    token_embeds, attention_mask
+                )
+                txt_feature_embeds_valid_rms = _rms_from_mean_square(
+                    txt_feature_embeds_valid_norm
+                )
+                log_dict['txt_feature_layer'] = jnp.asarray(_N, dtype=jnp.float32)
+                log_dict['txt_feature_embeds_norm'] = txt_feature_embeds_norm
+                log_dict['txt_feature_embeds_rms'] = txt_feature_embeds_rms
+                log_dict['txt_feature_embeds_valid_rms'] = txt_feature_embeds_valid_rms
+
+            img_embeds, stat_log_dict = self._transform_image_embeds(
+                img_embeds,
+                token_embeds,
+                prefix_len,
+                attention_mask,
+            )
+            log_dict.update(stat_log_dict)
+            img_embeds = constrain_batch_model(img_embeds)
+            img_embeds_norm = _mean_square(img_embeds)
+            img_embeds_rms = _rms_from_mean_square(img_embeds_norm)
+            log_dict['img_embeds_norm'] = img_embeds_norm
+            log_dict['img_embeds_post_connector_rms'] = img_embeds_rms
+            log_dict['img_token_txt_embeds_valid_ratio'] = (
+                img_embeds_rms / jnp.maximum(token_embeds_valid_rms, 1e-12)
+            )
+            log_dict['txt_embeds_valid_img_rms_ratio'] = (
+                token_embeds_valid_rms / jnp.maximum(img_embeds_rms, 1e-12)
+            )
+            if self.txt_feature_layer > 0:
+                log_dict['img_txt_feature_valid_rms_ratio'] = (
+                    img_embeds_rms / jnp.maximum(txt_feature_embeds_valid_rms, 1e-12)
+                )
+                log_dict['txt_feature_valid_img_rms_ratio'] = (
+                    txt_feature_embeds_valid_rms / jnp.maximum(img_embeds_rms, 1e-12)
+                )
 
             # Prepend image embeddings to text embeddings (or text features)
             T_text_seq = token_embeds.shape[1]
@@ -509,6 +707,8 @@ class PaliGemmaEncDec(nn.Module):
             out = constrain_batch_model(out)
 
         if labels is None:
+            if return_hidden:
+                return {'hidden': out, 'cache': new_cache}
             logits = self.lm_backbone.embedder.decode(out)           # (B, L, V)
             return {'logits': logits, 'cache': new_cache}
 
@@ -703,16 +903,19 @@ class PaliGemmaEncDec(nn.Module):
             batch_size=B, dtype=jnp.bfloat16, cache_length=max_total_len
         )
 
-        # Prefill
+        # Prefill. Decode only the last prompt hidden state; decoding the full
+        # prefill would materialize [B, prompt_len, vocab] logits.
         out_dict = self(
             input_ids=prompt_ids, images=images,
             prefix_len=prefix_len, cache=cache, use_cache=False,
+            return_hidden=True,
         )
-        logits_at_last = jnp.take_along_axis(
-            out_dict['logits'],
+        hidden_at_last = jnp.take_along_axis(
+            out_dict['hidden'],
             (prefix_total - 1)[:, None, None],
             axis=1,
-        ).squeeze(1)                                                 # (B, V)
+        ).squeeze(1)
+        logits_at_last = self.lm_backbone.embedder.decode(hidden_at_last)  # (B, V)
         first_token = jnp.argmax(logits_at_last, axis=-1, keepdims=True)
 
         tokens_out = jnp.zeros((B, max_new_tokens), dtype=jnp.int32)
@@ -829,13 +1032,15 @@ class PaliGemmaEncDec(nn.Module):
         out_dict = self(
             input_ids=prompt_ids, images=images,
             prefix_len=prefix_len, cache=cache_single, use_cache=False,
+            return_hidden=True,
         )
 
-        logits_at_last = jnp.take_along_axis(
-            out_dict['logits'],
+        hidden_at_last = jnp.take_along_axis(
+            out_dict['hidden'],
             (prefix_total - 1)[:, None, None],
             axis=1,
         ).squeeze(1)
+        logits_at_last = self.lm_backbone.embedder.decode(hidden_at_last)
         top_scores, top_tokens = jax.lax.top_k(
             jax.nn.log_softmax(logits_at_last), beam_size
         )

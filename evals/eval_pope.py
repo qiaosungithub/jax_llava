@@ -1,4 +1,5 @@
 import glob
+import hashlib
 import io
 import json
 import os
@@ -169,7 +170,7 @@ def load_pope_questions(path: str, split: str):
     return rows
 
 
-def load_pope_image_record_rows(root: str, splits):
+def load_pope_image_record_rows(root: str, splits, max_samples_per_split: int = 0):
     wanted_splits = set(splits)
     tar_paths = _glob_tar_shards(root)
     if not tar_paths:
@@ -177,6 +178,7 @@ def load_pope_image_record_rows(root: str, splits):
 
     start = time.time()
     rows = []
+    rows_per_split = {split: 0 for split in wanted_splits}
     image_records = 0
     for tar_path in tar_paths:
         with fsspec.open(tar_path, "rb").open() as f:
@@ -209,6 +211,11 @@ def load_pope_image_record_rows(root: str, splits):
                         split = str(q.get("split", "")).strip()
                         if split not in wanted_splits:
                             continue
+                        if (
+                            max_samples_per_split > 0
+                            and rows_per_split[split] >= max_samples_per_split
+                        ):
+                            continue
                         question = str(q.get("question", "")).strip()
                         image = str(record.get("image", "")).strip()
                         label = str(q.get("label", "")).strip().lower()
@@ -225,6 +232,22 @@ def load_pope_image_record_rows(root: str, splits):
                                 "_image_record": image_ref,
                             }
                         )
+                        rows_per_split[split] += 1
+                    if (
+                        max_samples_per_split > 0
+                        and all(rows_per_split[s] >= max_samples_per_split for s in wanted_splits)
+                    ):
+                        break
+                if (
+                    max_samples_per_split > 0
+                    and all(rows_per_split[s] >= max_samples_per_split for s in wanted_splits)
+                ):
+                    break
+        if (
+            max_samples_per_split > 0
+            and all(rows_per_split[s] >= max_samples_per_split for s in wanted_splits)
+        ):
+            break
 
     if not rows:
         raise ValueError(f"No valid POPE rows found in image-record root: {root}")
@@ -232,6 +255,52 @@ def load_pope_image_record_rows(root: str, splits):
         f"POPE image-record rows loaded: {len(rows)} questions, "
         f"{image_records} images from {len(tar_paths)} shards in {time.time() - start:.1f}s"
     )
+    return rows
+
+
+def _pope_image_record_rows_cache_path(config, pope_root, splits, max_samples_per_split):
+    base_dir = getattr(
+        config.eval,
+        "pope_cache_dir",
+        "/kmh-nfs-ssd-us-mount/data/cached/zhh/pope_eval",
+    )
+    ensure_eval_result_base_dir(base_dir)
+    payload = json.dumps(
+        {
+            "pope_root": pope_root,
+            "splits": list(splits),
+            "max_samples_per_split": int(max_samples_per_split),
+        },
+        sort_keys=True,
+    )
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(base_dir, f"pope_image_record_rows_{digest}.json")
+
+
+def load_pope_image_record_rows_once(config, pope_root, splits, max_samples_per_split):
+    """Loads tar metadata on host 0 only, then shares small row refs via NFS."""
+    cache_path = _pope_image_record_rows_cache_path(
+        config, pope_root, splits, max_samples_per_split
+    )
+    rows = None
+    if jax.process_index() == 0:
+        if os.path.exists(cache_path):
+            with open(cache_path, "r", encoding="utf-8") as f:
+                rows = json.load(f)
+            log_for_0(f"POPE image-record rows loaded from cache: {cache_path}")
+        else:
+            rows = load_pope_image_record_rows(
+                pope_root, splits, max_samples_per_split=max_samples_per_split
+            )
+            tmp_path = f"{cache_path}.tmp.{os.getpid()}"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(rows, f, ensure_ascii=False)
+            os.replace(tmp_path, cache_path)
+            log_for_0(f"POPE image-record rows cache written: {cache_path}")
+    mu.sync_global_devices("pope image-record rows cache ready")
+    if rows is None:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            rows = json.load(f)
     return rows
 
 
@@ -502,8 +571,15 @@ def eval_pope(p_sample_step, run_p_sample_step, model, tokenizer, params, config
     sample_outputs = []
     image_record_rows = None
     image_record_shards = [] if _is_json_annotation_path(pope_root) else _glob_tar_shards(pope_root)
+    max_samples = int(
+        getattr(config.eval, "pope_max_samples_per_split", 0)
+        or getattr(config.eval, "debug_max_samples", 0)
+        or 0
+    )
     if image_record_shards:
-        image_record_rows = load_pope_image_record_rows(pope_root, splits)
+        image_record_rows = load_pope_image_record_rows_once(
+            config, pope_root, splits, max_samples_per_split=max_samples
+        )
         log_for_0(
             f"POPE eval using image-record tar package with "
             f"{len(image_record_shards)} shards"
@@ -516,11 +592,6 @@ def eval_pope(p_sample_step, run_p_sample_step, model, tokenizer, params, config
         else:
             split_file = resolve_pope_split_file(pope_root, split, dataset_name)
             rows = load_pope_questions(split_file, split)
-        max_samples = int(
-            getattr(config.eval, "pope_max_samples_per_split", 0)
-            or getattr(config.eval, "debug_max_samples", 0)
-            or 0
-        )
         if max_samples > 0 and len(rows) > max_samples:
             rows = rows[:max_samples]
             log_for_0(f"POPE/{split}: capped to {len(rows)} samples")

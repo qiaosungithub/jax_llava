@@ -1,5 +1,5 @@
-# Minimal remote integration test for the LLaVA curriculum path.
-# Goal: compile/run stage-1 train, stage-2 train, online eval, and every final eval task.
+# Resume half of the full remote debug smoke.
+# Run after remote_debug_full_pipeline writes checkpoint_3 in the same workdir.
 model:
     arch: llava
     lm_backbone_str: "gemma3_270M"
@@ -47,8 +47,8 @@ dataset:
 training:
     curriculum: llava15_two_stage
     stage1_steps: 1
-    stage2_steps: 2
-    num_steps: 3
+    stage2_steps: 3
+    num_steps: 4
     copy_final_checkpoint_to_pretrained: False
 
     vision_tower_from_scratch: False
@@ -87,10 +87,10 @@ training:
         lr_schedule: cos
         online_eval_per_step: -1
         online_eval_tasks: []
-        final_eval_tasks: [vqav2]
+        final_eval_tasks: []
 
     stage2:
-        name: "debug_stage2_visual_instruction_sft"
+        name: "debug_stage2_visual_instruction_sft_resume"
         dataset:
             max_txt_len: 256
         dataset_items:
@@ -116,9 +116,9 @@ training:
         warmup_steps: 1
         lr_schedule: cos
         sample_per_step: -1
-        online_eval_per_step: 2
-        online_eval_tasks: [vqav2, mme, textvqa, pope]
-        final_eval_tasks: []
+        online_eval_per_step: -1
+        online_eval_tasks: []
+        final_eval_tasks: [vqav2, pope]
 
 sampling:
     max_new_tokens: 8
@@ -126,7 +126,7 @@ sampling:
 
 eval:
     device_batch_size: 1
-    debug_max_samples: 16
+    debug_max_samples: 4
     vqav2_num_samples: 4
     online_vqav2_num_samples: 4
     textvqa_num_samples: 4
@@ -134,13 +134,13 @@ eval:
     vizwiz_num_samples: 4
     scienceqa_img_num_samples: 4
     seed_bench_num_samples: 4
-    mme_max_samples: 16
+    mme_max_samples: 4
     pope_max_samples_per_split: 4
-    refcocog_max_samples: 16
-    pixelbench_max_samples: 16
-    mmbench_max_samples: 16
-    pixelbench_samples_per_benchmark: 3
-    refcocog_num_vis: 3
+    refcocog_max_samples: 4
+    pixelbench_max_samples: 4
+    mmbench_max_samples: 4
+    pixelbench_samples_per_benchmark: 2
+    refcocog_num_vis: 2
     short_answer_max_new_tokens: 4
     mmbench_max_new_tokens: 4
     mmbench_max_txt_len: 512
@@ -158,5 +158,5 @@ logging:
     use_tensorboard: False
     wandb_project: "jax-llava"
     wandb_entity: "sqa24-massachusetts-institute-of-technology"
-    wandb_tags: ["remote-debug", "llava", "full-pipeline"]
-    wandb_notes: "Full pipeline smoke test: stage1 train, stage2 train, representative online eval, final eval, checkpoint, and dataloader resume."
+    wandb_tags: ["remote-debug", "llava", "full-pipeline", "resume"]
+    wandb_notes: "Resume half of full pipeline smoke: exact stateful dataloader restore, one more SFT step, and representative final eval."

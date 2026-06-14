@@ -36,6 +36,7 @@ from utils.dataloader_state_util import (
     restore_dataloader_state,
     save_dataloader_state,
     stateful_dataloader_enabled,
+    validate_dataloader_state_save,
 )
 from utils.frozen_util import (
     get_trainable,
@@ -304,6 +305,7 @@ def _create_train_iterator(
     local_batch_size,
     step_offset,
     *,
+    workdir,
     load_from=None,
     zone=None,
     checkpoint_step_for_state=None,
@@ -338,12 +340,19 @@ def _create_train_iterator(
             expected_state_step,
             local_batch_size,
         )
+    validate_dataloader_state_save(train_loader, config, workdir, local_batch_size)
     return train_loader, iter(train_loader), tokenizer
 
 
 def _save_training_checkpoint(state, train_loader, config, workdir, step, local_batch_size):
-    save_checkpoint(state, workdir)
+    # Orbax owns checkpoint_N creation, so write model files before placing
+    # dataloader sidecars under checkpoint_N/dataloader_state. Keep the final
+    # "saved to" log after sidecars are durable; the monitor treats that line as
+    # the completed-resume-point marker.
+    ckpt_step, ckpt_path = save_checkpoint(state, workdir, log_completion=False)
     save_dataloader_state(train_loader, config, workdir, step, local_batch_size)
+    mu.sync_global_devices(f'dataloader_state_{int(step)}')
+    log_for_0('Checkpoint at step %d saved to %s.', ckpt_step, ckpt_path)
 
 
 def _flatten_host_local_batch(batch):
@@ -790,6 +799,7 @@ def _run_train_phase(
         config,
         local_batch_size,
         local_step_offset,
+        workdir=workdir,
         load_from=config.load_from if restore_mode == 'full' else None,
         zone=zone,
         checkpoint_step_for_state=current_step,
