@@ -72,9 +72,10 @@ def vqa_accuracy_one(answer: str, gt_answers: list) -> float:
         return 0.0
     gt_answers = [stripspace_vqav2(a) for a in gt_answers[:10]]
     answer = stripspace_vqav2(answer)
-    if len(set(gt_answers)) > 1:
-        answer = postprocess_vqav2_text(answer)
-        gt_answers = [postprocess_vqav2_text(a) for a in gt_answers]
+    # Always apply VQA normalization. Unanimous GT answers still need case,
+    # punctuation, article, and number-word normalization, e.g. "Two." vs "2".
+    answer = postprocess_vqav2_text(answer)
+    gt_answers = [postprocess_vqav2_text(a) for a in gt_answers]
     gt_arr = np.array(gt_answers)
     matches = (answer == gt_arr)
     accs = []

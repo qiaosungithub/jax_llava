@@ -1070,6 +1070,73 @@ def _single_stage_train(config, workdir, *, finetune_mode=False):
     return state
 
 
+def _run_eval_from_checkpoint(
+    *,
+    config,
+    workdir,
+    writer,
+    rng,
+    zone,
+    mesh_bundle,
+    task_suffix='_final',
+    finetune_mode=False,
+):
+    """Run eval from a model checkpoint without touching the train dataloader."""
+    resolve_dataset_roots(config, zone)
+    final_eval_tasks = list(config.training.get('final_eval_tasks', []) or [])
+    knn_data_dir = _prepare_knn_if_needed(config, zone, final_eval_tasks)
+
+    tokenizer = create_tokenizer(config.model.lm_backbone_str)
+    model = _create_model(config, finetune_mode=finetune_mode)
+    state, _, _, _ = create_train_state(rng, config, model, mesh_bundle=mesh_bundle)
+    if config.load_from:
+        state = restore_checkpoint(state, config.load_from, zone=zone)
+    else:
+        mesh, get_partition_spec, _, _, _ = mesh_bundle
+        state_spec = get_partition_spec(state, MeshMode.MODEL)
+        log_for_0('Eval-only run has no load_from; initializing pretrained params.')
+        state = _load_initial_pretrained_params(state, config, mesh, state_spec, step_offset=0)
+
+    step = _state_step(state)
+    state_spec, batch_spec, _, p_sample_steps, p_sample_step_mmbench = _build_pjit_fns(
+        config, model, state, mesh_bundle
+    )
+    del state_spec, batch_spec
+
+    if final_eval_tasks:
+        log_for_0(
+            f'Running checkpoint evaluation with '
+            f'beam_size={int(config.sampling.get("beam_size", 1))}, '
+            f'task_suffix={task_suffix!r}.'
+        )
+        run_eval_tasks(
+            state,
+            p_sample_steps,
+            final_eval_tasks,
+            step=step,
+            run_p_sample_step=run_p_sample_step,
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            writer=writer,
+            p_sample_step_mmbench=p_sample_step_mmbench,
+            task_suffix=task_suffix,
+            extra_args={
+                'knn_imagenet_data_dir': knn_data_dir,
+                'knn_imagenet_root': knn_data_dir,
+                'p_recon_steps': {},
+                'patch_size': _model_patch_size(config),
+                'image_size': config.dataset.image_size,
+                'run_eval_recon_psnr': run_eval_recon_psnr,
+            },
+        )
+
+    if config.eval.get('mmbench_export_test', False):
+        export_mmbench_test_xlsx(p_sample_step_mmbench, run_p_sample_step, model, tokenizer, state.params, config)
+    log_for_0('Eval Over.')
+    return state
+
+
 def _train_llava_curriculum(config: ml_collections.ConfigDict, workdir: str):
     assert not config.finetune, 'Curriculum training expects finetune=False'
     stage1_steps = int(config.training.get('stage1_steps', 0))
@@ -1155,18 +1222,17 @@ def _train_llava_curriculum(config: ml_collections.ConfigDict, workdir: str):
         )
         final_stage2_config.load_from = config.load_from
         if config.load_from and list(final_stage2_config.training.get('final_eval_tasks', []) or []):
-            state = _run_train_phase(
+            # Training is already complete. Do not call _run_train_phase here:
+            # that would restore exact train-loader state and make final eval
+            # depend on the checkpoint's original TPU topology.
+            state = _run_eval_from_checkpoint(
                 config=final_stage2_config,
                 workdir=workdir,
                 writer=writer,
                 rng=random.fold_in(rng, 2),
                 zone=zone,
                 mesh_bundle=mesh_bundle,
-                stage_key='stage2',
-                stage_start_step=stage1_steps,
-                current_step=current_step,
-                stage_end_step=total_steps,
-                restore_mode='full',
+                task_suffix='_stage2_final',
             )
 
     jax.random.normal(jax.random.key(0), ()).block_until_ready()
@@ -1188,44 +1254,18 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
 
 
 def just_evaluate(config: ml_collections.ConfigDict, workdir: str):
-    config.workdir_hash = md5(workdir.encode()).hexdigest()[:8]
     rng = random.PRNGKey(config.training.seed)
     zone, mesh_bundle, writer = _init_run(config, workdir)
-    resolve_dataset_roots(config, zone)
-    tokenizer = create_tokenizer(config.model.lm_backbone_str)
-    model = _create_model(config)
-    state, _, _, _ = create_train_state(rng, config, model, mesh_bundle=mesh_bundle)
-    if config.load_from:
-        state = restore_checkpoint(state, config.load_from, zone=zone)
-    else:
-        mesh, get_partition_spec, _, _, _ = mesh_bundle
-        state_spec = get_partition_spec(state, MeshMode.MODEL)
-        log_for_0('Eval-only run has no load_from; initializing pretrained params.')
-        state = _load_initial_pretrained_params(state, config, mesh, state_spec, step_offset=0)
-    step = _state_step(state)
-    state_spec, batch_spec, _, p_sample_steps, p_sample_step_mmbench = _build_pjit_fns(config, model, state, mesh_bundle)
-    del state_spec, batch_spec
-
-    final_eval_tasks = list(config.training.get('final_eval_tasks', []) or [])
-    knn_data_dir = _prepare_knn_if_needed(config, zone, final_eval_tasks)
-    if final_eval_tasks:
-        run_eval_tasks(
-            state,
-            p_sample_steps,
-            final_eval_tasks,
-            step=step,
-            run_p_sample_step=run_p_sample_step,
-            model=model,
-            tokenizer=tokenizer,
-            config=config,
-            writer=writer,
-            p_sample_step_mmbench=p_sample_step_mmbench,
-            task_suffix='_final',
-            extra_args={'knn_imagenet_data_dir': knn_data_dir, 'knn_imagenet_root': knn_data_dir},
-        )
-    if config.eval.get('mmbench_export_test', False):
-        export_mmbench_test_xlsx(p_sample_step_mmbench, run_p_sample_step, model, tokenizer, state.params, config)
-    log_for_0('Eval Over.')
+    _run_eval_from_checkpoint(
+        config=config,
+        workdir=workdir,
+        writer=writer,
+        rng=rng,
+        zone=zone,
+        mesh_bundle=mesh_bundle,
+        task_suffix='_final',
+        finetune_mode=bool(getattr(config, 'finetune', False)),
+    )
     return 'Eval Over.'
 
 

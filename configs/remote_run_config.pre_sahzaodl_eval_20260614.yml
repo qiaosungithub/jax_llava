@@ -1,22 +1,22 @@
-# Eval-only-through-curriculum config for W&B run sahzaodl / earthy-field-61.
-# Purpose: rerun only VQA-normalization-affected final metrics with latest code:
-# VQAv2, TextVQA, and VizWiz (including the existing VizWiz beam5 side eval).
-# Keep queue zone us-central1 so checkpoint and eval data resolve to the same region.
 model:
     arch: llava
     lm_backbone_str: "gemma3_1B"
     lm_checkpoint_variant: "it"
+
     vision_tower_str: "openai/clip-vit-large-patch14-336"
     vision_feature_layer: -2
     vision_select_feature: "patch"
     clip_input_format: "minus_one_to_one"
+
     projector_type: "mlp2x_gelu"
     projector_use_ln: False
+
     attn_logits_soft_cap: 0.0
     final_logit_softcap: 0.0
     txt_feature_layer: 0
     image_post_connector_scale: 1.0
     image_post_connector_transform: "fixed_scale"
+    # image_post_connector_transform: "match_text_stats"
     image_text_stat_source: "prompt"
     image_text_stat_axes: "scalar"
     prompt_causal: True
@@ -29,13 +29,11 @@ dataset:
     num_workers: 16
     prefetch_factor: 4
     dataloader_timeout: 900
-    # This run enters the completed-curriculum final-eval path and never builds
-    # the train loader. Keep stateful disabled as an extra guard.
-    stateful_dataloader: False
-    stateful_dataloader_strict: False
+    stateful_dataloader: True
+    stateful_dataloader_strict: True
     item_shuffle_size:
         default: 2048
-        llava_ov15: 200000
+        llava_ov15: 400000
         vqav2: 2048
         okvqa: 2048
         aokvqa: 2048
@@ -45,13 +43,19 @@ dataset:
         genome: 2048
         genome_det: 2048
         refcoco: 2048
+    # LLaVA-1.5 samples 10 Visual Genome region annotations per image.
     genome_det_regions_per_image: 10
 
 training:
-    curriculum: llava15_two_stage
+    curriculum: llava15_two_stage # train 2 stages together.
+
+    # Global checkpoint stream in one workdir:
+    # stage-1 [0, 2180), stage-2 [2180, 7375).
     stage1_steps: 2180
-    stage2_steps: 5195
-    num_steps: 7375
+    # stage2_steps: 5195 # baseline
+    # num_steps: 7375 # baseline
+    stage2_steps: 15000
+    num_steps: 17180
 
     vision_tower_from_scratch: False
     clip_from_pt: True
@@ -71,14 +75,17 @@ training:
     stage1:
         name: "stage1_projector_pretrain"
         dataset:
+            # max_txt_len: 64 # baseline
             max_txt_len: 160
         dataset_items:
+            # - blip3o-short
             - cc12m
+            # - laion-aes
         mix_weights: [1]
         batch_size: 256
         freeze_lm: True
         freeze_image_encoder: True
-        optimizer: adam
+        optimizer: adam # TODO: ablate muon
         adam:
             learning_rate: 0.001
             adam_b2: 0.95
@@ -88,6 +95,7 @@ training:
         warmup_steps: 65
         lr_schedule: cos
         sample_per_step: -1
+        # CLIP is frozen in stage 1, so ImageNet kNN cannot track training progress.
         online_eval_per_step: -1
         online_eval_tasks: []
         final_eval_tasks: []
@@ -107,26 +115,40 @@ training:
             - visual-genome
             - visual-genome-det
             - refcoco-train
+        # Approximate current loader sample units in millions:
+        # LLaVA-OV1.5 22M, VQAv2 ~0.4M QA, OKVQA ~0.009M QA,
+        # A-OKVQA ~0.068M MC-augmented QA, OCRVQA sampled as ~0.08M QA,
+        # GQA train ~0.94M QA,
+        # TextCaps ~0.022M captions, Visual Genome ~1.7M QA,
+        # Visual Genome detection ~0.86M phrase-to-box samples after 10 regions/image,
+        # RefCOCO ~0.048M phrase-to-box samples.
         mix_weights: [22, 0.4, 0.009, 0.068, 0.08, 0.94, 0.022, 1.7, 0.86, 0.048]
-        batch_size: 512
+        # batch_size: 128 # baseline
+        batch_size: 1024
         freeze_lm: False
         freeze_lm_embed: False
         freeze_lm_late: False
         freeze_image_encoder: True
         optimizer: adam
         adam:
-            learning_rate: 0.00004
+            # learning_rate: 0.00002 # baseline
+            learning_rate: 0.00005
             adam_b2: 0.95
             weight_decay: 0.0
-        vision_encoder_learning_rate: 0.00004
-        connector_learning_rate: 0.001
-        warmup_steps: 156
+        # vision_encoder_learning_rate: 0.00002 # baseline
+        # connector_learning_rate: 0.0005 # baseline
+        vision_encoder_learning_rate: 0.00005
+        connector_learning_rate: 0.0012
+
+        # warmup_steps: 156 # baseline
+        warmup_steps: 450
         lr_schedule: cos
-        sample_per_step: 200
-        online_eval_per_step: -1
-        online_eval_tasks: []
-        # Only these scorer paths changed in the VQA normalization fix.
-        final_eval_tasks: [vqav2, textvqa, vizwiz]
+        # sample_per_step: 200 # baseline
+        # online_eval_per_step: 1200 # baseline
+        sample_per_step: 500
+        online_eval_per_step: 2500
+        online_eval_tasks: [vqav2, mme, textvqa, refcocog, pixelbench, gqa, vizwiz, scienceqa_img, seed_bench]
+        final_eval_tasks: [vqav2, mme, textvqa, pope, refcocog, pixelbench, mmbench, gqa, vizwiz, scienceqa_img, seed_bench]
 
 sampling:
     max_new_tokens: 64
@@ -145,17 +167,16 @@ eval:
     online_vqav2_sample_fraction: 0.1
 
 finetune: False
-# Must stay False: curriculum completed-checkpoint path logs *_stage2_final.
-eval_only: False
 sharding: hsdp_legacy_data
 
-load_from: /kmh-nfs-ssd-us-mount/logs/sqa/paligemma-baseline/20260614_055101_lxas6k_kmh-tpuvm-v5p-64-spot-llqylsn66_us-central1-a__b_lr_ep_eval
-load_from_pretrained: ""
-wandb_resume_id: "sahzaodl"
+# Run this queue entry from scratch. Keep these empty so the run cannot restore
+# an old checkpoint/dataloader state after monitor requeues it.
+load_from: ''
+wandb_resume_id: ''
 
 logging:
     use_wandb: True
     wandb_project: "jax-llava"
     wandb_entity: "sqa24-massachusetts-institute-of-technology"
-    wandb_tags: ["llava1.5", "curriculum", "hsdp", "eval-rerun", "vqa-normalization-fix"]
-    wandb_notes: "[eval rerun] [vqa normalization fix] [llava-1.5 reproduction] Resume W&B run sahzaodl and rerun only VQAv2, TextVQA, and VizWiz stage2_final metrics from checkpoint_7375. Unchanged benchmarks are intentionally not rerun. Source run notes: [shuffle more] [ablation: stage 2 4x batch size] [rerun baseline with cc12m, 160 length]."
+    wandb_tags: ["llava1.5", "curriculum", "hsdp"]
+    wandb_notes: "[shuffle more] [stage 2 8x batch size 3x steps] [rerun baseline with cc12m, 160 length] LLaVA-1.5 reproduction two-stage curriculum using jit/HSDP. Stage-1 trains connector only; stage-2 trains connector + LM. Adam original LR: stage1 connector 1e-3, stage2 LM 5e-5, connector 1.2e-3. Stage-2 data: LLaVA-OV1.5-Instruct plus VQAv2/OKVQA/A-OKVQA/OCRVQA/GQA/TextCaps/Visual Genome QA, VG detection, and RefCOCO grounding."

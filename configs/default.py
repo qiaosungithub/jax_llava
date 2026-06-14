@@ -219,6 +219,9 @@ def get_config():
     eval.pixelbench_root = "gs://kmh-gcp-💣/data/eval/pixelbench"
     eval.pixelbench_benchmarks = ["mmvp", "vstar", "ocrbench", "countbenchqa"]
     eval.pixelbench_cache_dir = "/kmh-nfs-ssd-us-mount/data/cached/zhh/pixelbench_eval"
+    # PixelBench also runs VStar with beam_size=5; using the global eval batch
+    # can beam-expand into a huge generation batch and OOM during decode.
+    eval.pixelbench_device_batch_size = 4
     eval.pixelbench_num_workers = 0
     eval.mmbench_root = "https://opencompass.openxlab.space/utils/VLMEval/MMBench_DEV_EN.tsv"
     eval.mmbench_test_root = "https://opencompass.openxlab.space/utils/VLMEval/MMBench_TEST_EN.tsv"

@@ -1,0 +1,922 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLaVA Weekly Progress Report - June 14, 2026</title>
+<style>
+:root {
+  --ink:#17211f; --muted:#5e6d68; --line:#d8dfda; --paper:#fbf8ef; --panel:#fffdf7;
+  --green:#23685a; --orange:#a95f2c; --blue:#315f9f; --purple:#8a4e95; --red:#9f332b;
+}
+* { box-sizing:border-box; }
+body { margin:0; color:var(--ink); font-family: Georgia, 'Times New Roman', serif; background:linear-gradient(135deg,#fbf7ed 0%,#eef4f1 100%); }
+main { max-width:1220px; margin:0 auto; padding:42px 28px 68px; }
+.hero { border-bottom:2px solid var(--ink); padding-bottom:22px; margin-bottom:26px; }
+h1 { margin:0 0 12px; font-size:clamp(34px,5vw,58px); line-height:0.98; letter-spacing:0; }
+h2 { margin:0 0 12px; font-size:27px; letter-spacing:0; }
+h3 { margin:0 0 10px; font-size:18px; }
+section { margin-top:34px; }
+p, li { font-size:16px; line-height:1.52; }
+ul { margin:0; padding-left:21px; }
+li { margin:8px 0; }
+.subtitle { max-width:980px; font-size:18px; line-height:1.5; color:#33413d; margin:0; }
+.meta-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:14px; margin:26px 0; }
+.card { background:rgba(255,253,247,0.9); border:1px solid var(--line); border-radius:8px; padding:15px 16px; box-shadow:0 10px 24px rgba(23,33,31,0.06); }
+.card h3 { margin:0 0 7px; font:700 12px ui-sans-serif,system-ui,sans-serif; color:var(--muted); text-transform:uppercase; letter-spacing:0.08em; }
+.card p { margin:0; font-size:16px; line-height:1.35; }
+.callout { background:#fff8dc; border:1px solid #e1d38f; border-radius:8px; padding:14px 16px; font:14px ui-sans-serif,system-ui,sans-serif; line-height:1.5; }
+.plot-wrap { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; overflow-x:auto; margin:14px 0; }
+.comparison-chart { width:100%; min-width:940px; height:auto; display:block; }
+.chart-title { font:700 15px ui-sans-serif,system-ui,sans-serif; fill:var(--ink); }
+.metric-label { font:13px ui-sans-serif,system-ui,sans-serif; fill:var(--ink); }
+.legend-text,.bar-value { font:12px ui-sans-serif,system-ui,sans-serif; fill:var(--ink); }
+.axis-note,.axis-label { font:11px ui-sans-serif,system-ui,sans-serif; fill:var(--muted); }
+.full-line { stroke:#17211f; stroke-width:1.2; stroke-dasharray:4 4; opacity:0.55; }
+.bar-bg { fill:#e8eeea; }
+table { width:100%; border-collapse:collapse; background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; font-family:ui-sans-serif,system-ui,sans-serif; margin:12px 0; }
+th,td { padding:10px 11px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; font-size:13px; line-height:1.36; }
+th { background:#eaf0eb; color:#3e4f4a; text-transform:uppercase; letter-spacing:0.055em; font-size:11px; }
+tr:last-child td { border-bottom:0; }
+.positive { color:#12633f; font-weight:700; }
+.negative { color:var(--red); font-weight:700; }
+.muted { color:var(--muted); }
+code { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:0.92em; }
+a { color:#174ea6; }
+.two-col { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
+@media (max-width:880px) { main { padding:28px 16px 48px; } .meta-grid,.two-col { grid-template-columns:1fr; } table { display:block; overflow-x:auto; } }
+</style>
+</head>
+<body>
+<main>
+  <div class="hero">
+    <h1>LLaVA Weekly Progress Report</h1>
+    <p class="subtitle">Updated June 14, 2026. This report summarizes the cleaned spreadsheet rows 163-179 for the JAX LLaVA reproduction block. Benchmark values come from <code>PaliGemma-baseline-cleaned-20260608</code>; run identity, config checks, image/text RMS ratios, and speed come from W&B summaries or local <code>output.log</code> text. No benchmark datasets or checkpoints were scanned.</p>
+  </div>
+
+  <div class="meta-grid">
+    <div class="card"><h3>Core Message</h3><p>More SFT helps; late fusion does not yet.</p></div>
+    <div class="card"><h3>Best Current Direction</h3><p>Standard LLaVA-style fusion, stronger SFT recipe.</p></div>
+    <div class="card"><h3>Main Risk</h3><p>Late-fusion scale can make image tokens ineffective.</p></div>
+    <div class="card"><h3>Speed Finding</h3><p>Late fusion was slower in the measured runs.</p></div>
+  </div>
+
+  <section>
+    <h2>Executive Readout</h2>
+    <ul>
+      <li><strong>Beam search is not a clean global win.</strong> Row 164 beam search improves VisWiz strongly and helps several QA-style metrics, but drops MME from row 163's <code>1064 / 1243</code> to <code>976 / 1189</code>. VQAv2 in row 164 is capped to about 10%, so that cell should be read with caution.</li>
+      <li><strong>Training the vision encoder in stage 1 did not help.</strong> Row 166 collapses with the original stage-1 vision LR. Row 167 manually lowers LR and recovers, but still does not beat the row 165 laion-aes baseline overall.</li>
+      <li><strong>The stage-2 connector can tolerate and benefits from a larger LR.</strong> Row 168 with connector LR <code>5e-4</code> is much stronger than row 166 and is competitive with or better than the row 165 laion baseline on many metrics.</li>
+      <li><strong>Late fusion is very scale-sensitive.</strong> Rows 175-177 show that fixed bad scales or automatic stat matching can dramatically change behavior. The prompt-stat scale is the best of the layer-13 group on OCR/Text/VisWiz-style tasks, but all layer-13 rows are still far below the non-late-fusion baseline.</li>
+      <li><strong>Late fusion has not shown a quality or speed advantage.</strong> Row 165 beats rows 177 and 179 on most benchmarks and training loss. Stage-2 median speed is about <code>3.57</code> steps/s for row 165, versus <code>0.87</code> for row 177 and <code>1.14</code> for row 179.</li>
+      <li><strong>More SFT data/compute helps the LLaVA-style path.</strong> Row 171 improves VQAv2, TextVQA, MMBench, OCRBench, VisWiz, ScienceQA, GQA, and loss through 4x batch plus sqrt-style LR scaling. Row 172 improves MME, CountBench, ScienceQA, and several robustness probes by training stage 2 much longer.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Rows And Runs</h2>
+    <table><thead><tr><th>Row</th><th>Setting</th><th>Run</th><th>Details</th></tr></thead><tbody><tr><td>163</td><td>2, cc12m pretrain + SFT more data</td><td><code>u38ukpdo</code><br>sleek-morning-11</td><td>cc12m pretrain, stage2 batch 128, LM lr 2e-5</td></tr><tr><td>164</td><td>- eval beam size=5 (fixed true beam search)</td><td><code>60a2x3bk</code><br>avid-lion-10</td><td>eval-only beam_size=5 on row 163 checkpoint; VQAv2 capped to about 10%</td></tr><tr><td>165</td><td>laion-aes pretrain</td><td><code>oc5p312v</code><br>amber-fire-13</td><td>laion-aes pretrain, stage1 image encoder frozen, stage2 connector+LM</td></tr><tr><td>166</td><td>laion-aes pretrain + 1st stage train vision encoder</td><td><code>n4lf745r</code><br>comfy-wind-15</td><td>laion-aes, stage1 trains vision encoder at original LR</td></tr><tr><td>167</td><td>- smaller lr</td><td><code>xpah5az9</code><br>efficient-wind-5</td><td>same idea as row 166, but manually smaller vision LR; eval-only row</td></tr><tr><td>168</td><td>- stage2 connector lr 5e-4</td><td><code>wvhzr03q</code><br>usual-oath-7</td><td>laion-aes, stage2 connector lr 5e-4; eval-only row</td></tr><tr><td>170</td><td>cc12m pretrain, 160 txt</td><td><code>4k5j3pg8</code><br>soft-snowball-57</td><td>cc12m max_txt_len=160, stage2 batch 128, LM lr 2e-5, connector lr 5e-4</td></tr><tr><td>171</td><td>cc12m pretrain, 160 txt, stage2 4x batch size</td><td><code>sahzaodl</code><br>earthy-field-61</td><td>cc12m max_txt_len=160, stage2 batch 512, LM lr 4e-5, connector lr 1e-3</td></tr><tr><td>172</td><td>cc12m pretrain, 160 txt, stage2 train 3x longer</td><td><code>vtwqn8cw</code><br>fresh-bee-58</td><td>cc12m max_txt_len=160, stage2 trained 15000 steps, batch 128</td></tr><tr><td>175</td><td>- late-fusion txt_feature_layer=13, train LM freeze encoder + scale 1</td><td><code>n88hp1fs</code><br>glamorous-night-44</td><td>late fusion layer 13, fixed scale 1</td></tr><tr><td>176</td><td>- late-fusion txt_feature_layer=13, train LM freeze encoder + scale 100</td><td><code>3z61nmo1</code><br>swift-durian-55</td><td>late fusion layer 13, fixed scale 100</td></tr><tr><td>177</td><td>- late-fusion txt_feature_layer=13, train LM freeze encoder + prompt-stat scale</td><td><code>5q9p85l8</code><br>dauntless-armadillo-56</td><td>late fusion layer 13, match_text_stats from prompt</td></tr><tr><td>179</td><td>- late-fusion txt_feature_layer=22, train LM freeze encoder + scale 470</td><td><code>6hidfm8i</code><br>cosmic-eon-26</td><td>late fusion layer 22, fixed scale 470</td></tr></tbody></table>
+  </section>
+
+  <section>
+    <h2>Chart Scale</h2>
+    <div class="callout">All comparison charts now use an absolute scale. Percentage/F1/accuracy benchmarks are plotted on a fixed <code>0-100%</code> axis, so a full bar means 100%, not the best run in that panel. MME is not a percentage metric, so its bars use a fixed <code>0-2000</code> score axis.</div>
+  </section>
+
+  <section>
+    <h2>1. Beam Search: Row 163 vs Row 164</h2>
+    <p>Beam search helps instruction-following/open-ended style metrics, especially VisWiz, but it is not uniformly better. The large MME drop means beam should not become the default eval protocol without a benchmark-specific reason.</p>
+    <div class="plot-wrap"><svg class="comparison-chart" viewBox="0 0 1120 808" role="img" aria-label="Beam search comparison: row 163 greedy vs row 164 beam=5">
+<text x="0" y="18" class="chart-title">Beam search comparison: row 163 greedy vs row 164 beam=5</text>
+<text x="0" y="42" class="axis-note">Full width = 100% for accuracy/F1 benchmarks; MME uses a fixed 0-2000 score axis.</text>
+<rect x="178" y="54" width="12" height="12" rx="2" fill="#23685a"/>
+<text x="196" y="66" class="legend-text">163 cc12m+SFT</text>
+<rect x="408" y="54" width="12" height="12" rx="2" fill="#a95f2c"/>
+<text x="426" y="66" class="legend-text">164 beam=5</text>
+<text x="0" y="94" class="metric-label">MME-P</text>
+<rect x="178" y="76" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="76" x2="938" y2="105" class="full-line"/>
+<text x="945" y="86" class="axis-label">2000</text>
+<rect x="178" y="78" width="404.3" height="10" rx="3" fill="#23685a"/>
+<text x="589.3" y="87" class="bar-value">1064 (53%)</text>
+<rect x="178" y="91" width="370.9" height="10" rx="3" fill="#a95f2c"/>
+<text x="555.9" y="100" class="bar-value">976 (49%)</text>
+<text x="0" y="140" class="metric-label">MME-S</text>
+<rect x="178" y="122" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="122" x2="938" y2="151" class="full-line"/>
+<text x="945" y="132" class="axis-label">2000</text>
+<rect x="178" y="124" width="472.3" height="10" rx="3" fill="#23685a"/>
+<text x="657.3" y="133" class="bar-value">1243 (62%)</text>
+<rect x="178" y="137" width="451.8" height="10" rx="3" fill="#a95f2c"/>
+<text x="636.8" y="146" class="bar-value">1189 (59%)</text>
+<text x="0" y="186" class="metric-label">VQAv2</text>
+<rect x="178" y="168" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="168" x2="938" y2="197" class="full-line"/>
+<text x="945" y="178" class="axis-label">100%</text>
+<rect x="178" y="170" width="416.9" height="10" rx="3" fill="#23685a"/>
+<text x="601.9" y="179" class="bar-value">54.86%</text>
+<rect x="178" y="183" width="430.0" height="10" rx="3" fill="#a95f2c"/>
+<text x="615.0" y="192" class="bar-value">56.58%</text>
+<text x="0" y="232" class="metric-label">TextVQA</text>
+<rect x="178" y="214" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="214" x2="938" y2="243" class="full-line"/>
+<text x="945" y="224" class="axis-label">100%</text>
+<rect x="178" y="216" width="257.0" height="10" rx="3" fill="#23685a"/>
+<text x="442.0" y="225" class="bar-value">33.82%</text>
+<rect x="178" y="229" width="270.2" height="10" rx="3" fill="#a95f2c"/>
+<text x="455.2" y="238" class="bar-value">35.55%</text>
+<text x="0" y="278" class="metric-label">RefCOCOg</text>
+<rect x="178" y="260" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="260" x2="938" y2="289" class="full-line"/>
+<text x="945" y="270" class="axis-label">100%</text>
+<rect x="178" y="262" width="30.3" height="10" rx="3" fill="#23685a"/>
+<text x="215.3" y="271" class="bar-value">3.99%</text>
+<rect x="178" y="275" width="29.2" height="10" rx="3" fill="#a95f2c"/>
+<text x="214.2" y="284" class="bar-value">3.84%</text>
+<text x="0" y="324" class="metric-label">MMBench</text>
+<rect x="178" y="306" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="306" x2="938" y2="335" class="full-line"/>
+<text x="945" y="316" class="axis-label">100%</text>
+<rect x="178" y="308" width="322.5" height="10" rx="3" fill="#23685a"/>
+<text x="507.5" y="317" class="bar-value">42.44%</text>
+<rect x="178" y="321" width="320.6" height="10" rx="3" fill="#a95f2c"/>
+<text x="505.6" y="330" class="bar-value">42.18%</text>
+<text x="0" y="370" class="metric-label">POPE adv F1</text>
+<rect x="178" y="352" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="352" x2="938" y2="381" class="full-line"/>
+<text x="945" y="362" class="axis-label">100%</text>
+<rect x="178" y="354" width="608.4" height="10" rx="3" fill="#23685a"/>
+<text x="793.4" y="363" class="bar-value">80.05%</text>
+<rect x="178" y="367" width="609.6" height="10" rx="3" fill="#a95f2c"/>
+<text x="794.6" y="376" class="bar-value">80.21%</text>
+<text x="0" y="416" class="metric-label">VStar</text>
+<rect x="178" y="398" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="398" x2="938" y2="427" class="full-line"/>
+<text x="945" y="408" class="axis-label">100%</text>
+<rect x="178" y="400" width="238.7" height="10" rx="3" fill="#23685a"/>
+<text x="423.7" y="409" class="bar-value">31.41%</text>
+<rect x="178" y="413" width="270.6" height="10" rx="3" fill="#a95f2c"/>
+<text x="455.6" y="422" class="bar-value">35.6%</text>
+<text x="0" y="462" class="metric-label">OCRBench</text>
+<rect x="178" y="444" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="444" x2="938" y2="473" class="full-line"/>
+<text x="945" y="454" class="axis-label">100%</text>
+<rect x="178" y="446" width="210.5" height="10" rx="3" fill="#23685a"/>
+<text x="395.5" y="455" class="bar-value">27.7%</text>
+<rect x="178" y="459" width="221.9" height="10" rx="3" fill="#a95f2c"/>
+<text x="406.9" y="468" class="bar-value">29.2%</text>
+<text x="0" y="508" class="metric-label">MMVP</text>
+<rect x="178" y="490" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="490" x2="938" y2="519" class="full-line"/>
+<text x="945" y="500" class="axis-label">100%</text>
+<rect x="178" y="492" width="397.7" height="10" rx="3" fill="#23685a"/>
+<text x="582.7" y="501" class="bar-value">52.33%</text>
+<rect x="178" y="505" width="400.3" height="10" rx="3" fill="#a95f2c"/>
+<text x="585.3" y="514" class="bar-value">52.67%</text>
+<text x="0" y="554" class="metric-label">CountBench</text>
+<rect x="178" y="536" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="536" x2="938" y2="565" class="full-line"/>
+<text x="945" y="546" class="axis-label">100%</text>
+<rect x="178" y="538" width="337.4" height="10" rx="3" fill="#23685a"/>
+<text x="522.4" y="547" class="bar-value">44.4%</text>
+<rect x="178" y="551" width="342.1" height="10" rx="3" fill="#a95f2c"/>
+<text x="527.1" y="560" class="bar-value">45.01%</text>
+<text x="0" y="600" class="metric-label">VisWiz</text>
+<rect x="178" y="582" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="582" x2="938" y2="611" class="full-line"/>
+<text x="945" y="592" class="axis-label">100%</text>
+<rect x="178" y="584" width="105.6" height="10" rx="3" fill="#23685a"/>
+<text x="290.6" y="593" class="bar-value">13.89%</text>
+<rect x="178" y="597" width="266.4" height="10" rx="3" fill="#a95f2c"/>
+<text x="451.4" y="606" class="bar-value">35.05%</text>
+<text x="0" y="646" class="metric-label">SEED-Bench</text>
+<rect x="178" y="628" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="628" x2="938" y2="657" class="full-line"/>
+<text x="945" y="638" class="axis-label">100%</text>
+<rect x="178" y="630" width="401.0" height="10" rx="3" fill="#23685a"/>
+<text x="586.0" y="639" class="bar-value">52.76%</text>
+<rect x="178" y="643" width="401.7" height="10" rx="3" fill="#a95f2c"/>
+<text x="586.7" y="652" class="bar-value">52.86%</text>
+<text x="0" y="692" class="metric-label">ScienceQA-IMG</text>
+<rect x="178" y="674" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="674" x2="938" y2="703" class="full-line"/>
+<text x="945" y="684" class="axis-label">100%</text>
+<rect x="178" y="676" width="424.3" height="10" rx="3" fill="#23685a"/>
+<text x="609.3" y="685" class="bar-value">55.83%</text>
+<rect x="178" y="689" width="426.5" height="10" rx="3" fill="#a95f2c"/>
+<text x="611.5" y="698" class="bar-value">56.12%</text>
+<text x="0" y="738" class="metric-label">GQA</text>
+<rect x="178" y="720" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="720" x2="938" y2="749" class="full-line"/>
+<text x="945" y="730" class="axis-label">100%</text>
+<rect x="178" y="722" width="367.5" height="10" rx="3" fill="#23685a"/>
+<text x="552.5" y="731" class="bar-value">48.36%</text>
+<rect x="178" y="735" width="369.7" height="10" rx="3" fill="#a95f2c"/>
+<text x="554.7" y="744" class="bar-value">48.64%</text>
+</svg></div>
+    <table><thead><tr><th>Metric</th><th>163 cc12m+SFT</th><th>164 beam=5</th><th>Delta</th></tr></thead><tbody><tr><td>MME-P</td><td>1064</td><td>976</td><td class="negative">-88</td></tr><tr><td>MME-S</td><td>1243</td><td>1189</td><td class="negative">-54</td></tr><tr><td>VQAv2</td><td>54.86</td><td>56.58</td><td class="positive">+1.72</td></tr><tr><td>TextVQA</td><td>33.82</td><td>35.55</td><td class="positive">+1.73</td></tr><tr><td>RefCOCOg</td><td>3.99</td><td>3.84</td><td class="negative">-0.15</td></tr><tr><td>MMBench</td><td>42.44</td><td>42.18</td><td class="negative">-0.26</td></tr><tr><td>POPE adv F1</td><td>80.05</td><td>80.21</td><td class="positive">+0.16</td></tr><tr><td>VStar</td><td>31.41</td><td>35.6</td><td class="positive">+4.19</td></tr><tr><td>OCRBench</td><td>27.7</td><td>29.2</td><td class="positive">+1.5</td></tr><tr><td>MMVP</td><td>52.33</td><td>52.67</td><td class="positive">+0.34</td></tr><tr><td>CountBench</td><td>44.4</td><td>45.01</td><td class="positive">+0.61</td></tr><tr><td>VisWiz</td><td>13.89</td><td>35.05</td><td class="positive">+21.16</td></tr><tr><td>SEED-Bench</td><td>52.76</td><td>52.86</td><td class="positive">+0.1</td></tr><tr><td>ScienceQA-IMG</td><td>55.83</td><td>56.12</td><td class="positive">+0.29</td></tr><tr><td>GQA</td><td>48.36</td><td>48.64</td><td class="positive">+0.28</td></tr></tbody></table>
+    <div class="callout">Caveat: row 164 is an eval-only beam run and its VQAv2 eval was capped to about 10%. The main conclusion is therefore strongest for the full non-VQAv2 benchmarks and for the directional VisWiz gain.</div>
+  </section>
+
+  <section>
+    <h2>2. Vision Encoder And Connector LR</h2>
+    <p>Stage-1 vision-encoder training is not a free improvement. With the original LR it collapses badly (row 166). Lower LR makes it usable (row 167), but the laion-aes baseline (row 165) still looks stronger overall. Separately, row 168 supports using a larger stage-2 connector LR: it recovers MME, VQAv2, TextVQA, MMBench, POPE, OCRBench, MMVP, CountBench, SEED, ScienceQA, and GQA versus row 166.</p>
+    <div class="plot-wrap"><svg class="comparison-chart" viewBox="0 0 1120 670" role="img" aria-label="Stage-1 train vision encoder: row 165 baseline vs row 167 smaller LR">
+<text x="0" y="18" class="chart-title">Stage-1 train vision encoder: row 165 baseline vs row 167 smaller LR</text>
+<text x="0" y="42" class="axis-note">Full width = 100% for accuracy/F1 benchmarks; MME uses a fixed 0-2000 score axis.</text>
+<rect x="178" y="54" width="12" height="12" rx="2" fill="#23685a"/>
+<text x="196" y="66" class="legend-text">165 laion base</text>
+<rect x="408" y="54" width="12" height="12" rx="2" fill="#a95f2c"/>
+<text x="426" y="66" class="legend-text">167 vision small LR</text>
+<text x="0" y="94" class="metric-label">MME-P</text>
+<rect x="178" y="76" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="76" x2="938" y2="105" class="full-line"/>
+<text x="945" y="86" class="axis-label">2000</text>
+<rect x="178" y="78" width="349.2" height="10" rx="3" fill="#23685a"/>
+<text x="534.2" y="87" class="bar-value">919 (46%)</text>
+<rect x="178" y="91" width="345.8" height="10" rx="3" fill="#a95f2c"/>
+<text x="530.8" y="100" class="bar-value">910 (46%)</text>
+<text x="0" y="140" class="metric-label">MME-S</text>
+<rect x="178" y="122" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="122" x2="938" y2="151" class="full-line"/>
+<text x="945" y="132" class="axis-label">2000</text>
+<rect x="178" y="124" width="407.7" height="10" rx="3" fill="#23685a"/>
+<text x="592.7" y="133" class="bar-value">1073 (54%)</text>
+<rect x="178" y="137" width="426.7" height="10" rx="3" fill="#a95f2c"/>
+<text x="611.7" y="146" class="bar-value">1123 (56%)</text>
+<text x="0" y="186" class="metric-label">VQAv2</text>
+<rect x="178" y="168" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="168" x2="938" y2="197" class="full-line"/>
+<text x="945" y="178" class="axis-label">100%</text>
+<rect x="178" y="170" width="410.9" height="10" rx="3" fill="#23685a"/>
+<text x="595.9" y="179" class="bar-value">54.06%</text>
+<rect x="178" y="183" width="361.5" height="10" rx="3" fill="#a95f2c"/>
+<text x="546.5" y="192" class="bar-value">47.57%</text>
+<text x="0" y="232" class="metric-label">TextVQA</text>
+<rect x="178" y="214" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="214" x2="938" y2="243" class="full-line"/>
+<text x="945" y="224" class="axis-label">100%</text>
+<rect x="178" y="216" width="216.7" height="10" rx="3" fill="#23685a"/>
+<text x="401.7" y="225" class="bar-value">28.51%</text>
+<rect x="178" y="229" width="86.3" height="10" rx="3" fill="#a95f2c"/>
+<text x="271.3" y="238" class="bar-value">11.36%</text>
+<text x="0" y="278" class="metric-label">MMBench</text>
+<rect x="178" y="260" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="260" x2="938" y2="289" class="full-line"/>
+<text x="945" y="270" class="axis-label">100%</text>
+<rect x="178" y="262" width="321.3" height="10" rx="3" fill="#23685a"/>
+<text x="506.3" y="271" class="bar-value">42.27%</text>
+<rect x="178" y="275" width="291.2" height="10" rx="3" fill="#a95f2c"/>
+<text x="476.2" y="284" class="bar-value">38.32%</text>
+<text x="0" y="324" class="metric-label">POPE adv F1</text>
+<rect x="178" y="306" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="306" x2="938" y2="335" class="full-line"/>
+<text x="945" y="316" class="axis-label">100%</text>
+<rect x="178" y="308" width="610.2" height="10" rx="3" fill="#23685a"/>
+<text x="795.2" y="317" class="bar-value">80.29%</text>
+<rect x="178" y="321" width="572.2" height="10" rx="3" fill="#a95f2c"/>
+<text x="757.2" y="330" class="bar-value">75.29%</text>
+<text x="0" y="370" class="metric-label">OCRBench</text>
+<rect x="178" y="352" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="352" x2="938" y2="381" class="full-line"/>
+<text x="945" y="362" class="axis-label">100%</text>
+<rect x="178" y="354" width="184.7" height="10" rx="3" fill="#23685a"/>
+<text x="369.7" y="363" class="bar-value">24.3%</text>
+<rect x="178" y="367" width="42.6" height="10" rx="3" fill="#a95f2c"/>
+<text x="227.6" y="376" class="bar-value">5.6%</text>
+<text x="0" y="416" class="metric-label">CountBench</text>
+<rect x="178" y="398" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="398" x2="938" y2="427" class="full-line"/>
+<text x="945" y="408" class="axis-label">100%</text>
+<rect x="178" y="400" width="294.1" height="10" rx="3" fill="#23685a"/>
+<text x="479.1" y="409" class="bar-value">38.7%</text>
+<rect x="178" y="413" width="171.8" height="10" rx="3" fill="#a95f2c"/>
+<text x="356.8" y="422" class="bar-value">22.61%</text>
+<text x="0" y="462" class="metric-label">VisWiz</text>
+<rect x="178" y="444" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="444" x2="938" y2="473" class="full-line"/>
+<text x="945" y="454" class="axis-label">100%</text>
+<rect x="178" y="446" width="175.0" height="10" rx="3" fill="#23685a"/>
+<text x="360.0" y="455" class="bar-value">23.03%</text>
+<rect x="178" y="459" width="150.9" height="10" rx="3" fill="#a95f2c"/>
+<text x="335.9" y="468" class="bar-value">19.86%</text>
+<text x="0" y="508" class="metric-label">SEED-Bench</text>
+<rect x="178" y="490" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="490" x2="938" y2="519" class="full-line"/>
+<text x="945" y="500" class="axis-label">100%</text>
+<rect x="178" y="492" width="389.1" height="10" rx="3" fill="#23685a"/>
+<text x="574.1" y="501" class="bar-value">51.2%</text>
+<rect x="178" y="505" width="350.8" height="10" rx="3" fill="#a95f2c"/>
+<text x="535.8" y="514" class="bar-value">46.16%</text>
+<text x="0" y="554" class="metric-label">ScienceQA-IMG</text>
+<rect x="178" y="536" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="536" x2="938" y2="565" class="full-line"/>
+<text x="945" y="546" class="axis-label">100%</text>
+<rect x="178" y="538" width="445.0" height="10" rx="3" fill="#23685a"/>
+<text x="630.0" y="547" class="bar-value">58.55%</text>
+<rect x="178" y="551" width="438.2" height="10" rx="3" fill="#a95f2c"/>
+<text x="623.2" y="560" class="bar-value">57.66%</text>
+<text x="0" y="600" class="metric-label">GQA</text>
+<rect x="178" y="582" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="582" x2="938" y2="611" class="full-line"/>
+<text x="945" y="592" class="axis-label">100%</text>
+<rect x="178" y="584" width="363.2" height="10" rx="3" fill="#23685a"/>
+<text x="548.2" y="593" class="bar-value">47.79%</text>
+<rect x="178" y="597" width="331.1" height="10" rx="3" fill="#a95f2c"/>
+<text x="516.1" y="606" class="bar-value">43.57%</text>
+</svg></div>
+    <table><thead><tr><th>Metric</th><th>165 laion base</th><th>167 vision small LR</th><th>Delta</th></tr></thead><tbody><tr><td>MME-P</td><td>919</td><td>910</td><td class="negative">-9</td></tr><tr><td>MME-S</td><td>1073</td><td>1123</td><td class="positive">+50</td></tr><tr><td>VQAv2</td><td>54.06</td><td>47.57</td><td class="negative">-6.49</td></tr><tr><td>TextVQA</td><td>28.51</td><td>11.36</td><td class="negative">-17.15</td></tr><tr><td>MMBench</td><td>42.27</td><td>38.32</td><td class="negative">-3.95</td></tr><tr><td>POPE adv F1</td><td>80.29</td><td>75.29</td><td class="negative">-5</td></tr><tr><td>OCRBench</td><td>24.3</td><td>5.6</td><td class="negative">-18.7</td></tr><tr><td>CountBench</td><td>38.7</td><td>22.61</td><td class="negative">-16.09</td></tr><tr><td>VisWiz</td><td>23.03</td><td>19.86</td><td class="negative">-3.17</td></tr><tr><td>SEED-Bench</td><td>51.2</td><td>46.16</td><td class="negative">-5.04</td></tr><tr><td>ScienceQA-IMG</td><td>58.55</td><td>57.66</td><td class="negative">-0.89</td></tr><tr><td>GQA</td><td>47.79</td><td>43.57</td><td class="negative">-4.22</td></tr></tbody></table>
+    <table><thead><tr><th>Scalar</th><th>165 laion base</th><th>167 vision small LR</th></tr></thead><tbody><tr><td>Train acc</td><td>0.679</td><td>0.671</td></tr><tr><td>Train loss</td><td>1.32</td><td>1.38</td></tr></tbody></table>
+    <div class="plot-wrap"><svg class="comparison-chart" viewBox="0 0 1120 670" role="img" aria-label="Stage-2 connector LR: row 166 weak run vs row 168 connector lr=5e-4">
+<text x="0" y="18" class="chart-title">Stage-2 connector LR: row 166 weak run vs row 168 connector lr=5e-4</text>
+<text x="0" y="42" class="axis-note">Full width = 100% for accuracy/F1 benchmarks; MME uses a fixed 0-2000 score axis.</text>
+<rect x="178" y="54" width="12" height="12" rx="2" fill="#23685a"/>
+<text x="196" y="66" class="legend-text">166 train vision</text>
+<rect x="408" y="54" width="12" height="12" rx="2" fill="#a95f2c"/>
+<text x="426" y="66" class="legend-text">168 conn lr 5e-4</text>
+<text x="0" y="94" class="metric-label">MME-P</text>
+<rect x="178" y="76" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="76" x2="938" y2="105" class="full-line"/>
+<text x="945" y="86" class="axis-label">2000</text>
+<rect x="178" y="78" width="230.3" height="10" rx="3" fill="#23685a"/>
+<text x="415.3" y="87" class="bar-value">606 (30%)</text>
+<rect x="178" y="91" width="383.4" height="10" rx="3" fill="#a95f2c"/>
+<text x="568.4" y="100" class="bar-value">1009 (50%)</text>
+<text x="0" y="140" class="metric-label">MME-S</text>
+<rect x="178" y="122" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="122" x2="938" y2="151" class="full-line"/>
+<text x="945" y="132" class="axis-label">2000</text>
+<rect x="178" y="124" width="307.0" height="10" rx="3" fill="#23685a"/>
+<text x="492.0" y="133" class="bar-value">808 (40%)</text>
+<rect x="178" y="137" width="461.7" height="10" rx="3" fill="#a95f2c"/>
+<text x="646.7" y="146" class="bar-value">1215 (61%)</text>
+<text x="0" y="186" class="metric-label">VQAv2</text>
+<rect x="178" y="168" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="168" x2="938" y2="197" class="full-line"/>
+<text x="945" y="178" class="axis-label">100%</text>
+<rect x="178" y="170" width="277.0" height="10" rx="3" fill="#23685a"/>
+<text x="462.0" y="179" class="bar-value">36.45%</text>
+<rect x="178" y="183" width="419.7" height="10" rx="3" fill="#a95f2c"/>
+<text x="604.7" y="192" class="bar-value">55.23%</text>
+<text x="0" y="232" class="metric-label">TextVQA</text>
+<rect x="178" y="214" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="214" x2="938" y2="243" class="full-line"/>
+<text x="945" y="224" class="axis-label">100%</text>
+<rect x="178" y="216" width="66.6" height="10" rx="3" fill="#23685a"/>
+<text x="251.6" y="225" class="bar-value">8.76%</text>
+<rect x="178" y="229" width="282.2" height="10" rx="3" fill="#a95f2c"/>
+<text x="467.2" y="238" class="bar-value">37.13%</text>
+<text x="0" y="278" class="metric-label">MMBench</text>
+<rect x="178" y="260" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="260" x2="938" y2="289" class="full-line"/>
+<text x="945" y="270" class="axis-label">100%</text>
+<rect x="178" y="262" width="63.3" height="10" rx="3" fill="#23685a"/>
+<text x="248.3" y="271" class="bar-value">8.33%</text>
+<rect x="178" y="275" width="356.5" height="10" rx="3" fill="#a95f2c"/>
+<text x="541.5" y="284" class="bar-value">46.91%</text>
+<text x="0" y="324" class="metric-label">POPE adv F1</text>
+<rect x="178" y="306" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="306" x2="938" y2="335" class="full-line"/>
+<text x="945" y="316" class="axis-label">100%</text>
+<rect x="178" y="308" width="110.0" height="10" rx="3" fill="#23685a"/>
+<text x="295.0" y="317" class="bar-value">14.48%</text>
+<rect x="178" y="321" width="617.1" height="10" rx="3" fill="#a95f2c"/>
+<text x="802.1" y="330" class="bar-value">81.2%</text>
+<text x="0" y="370" class="metric-label">OCRBench</text>
+<rect x="178" y="352" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="352" x2="938" y2="381" class="full-line"/>
+<text x="945" y="362" class="axis-label">100%</text>
+<rect x="178" y="354" width="16.0" height="10" rx="3" fill="#23685a"/>
+<text x="201.0" y="363" class="bar-value">2.1%</text>
+<rect x="178" y="367" width="252.3" height="10" rx="3" fill="#a95f2c"/>
+<text x="437.3" y="376" class="bar-value">33.2%</text>
+<text x="0" y="416" class="metric-label">CountBench</text>
+<rect x="178" y="398" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="398" x2="938" y2="427" class="full-line"/>
+<text x="945" y="408" class="axis-label">100%</text>
+<rect x="178" y="400" width="26.3" height="10" rx="3" fill="#23685a"/>
+<text x="211.3" y="409" class="bar-value">3.46%</text>
+<rect x="178" y="413" width="308.0" height="10" rx="3" fill="#a95f2c"/>
+<text x="493.0" y="422" class="bar-value">40.53%</text>
+<text x="0" y="462" class="metric-label">VisWiz</text>
+<rect x="178" y="444" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="444" x2="938" y2="473" class="full-line"/>
+<text x="945" y="454" class="axis-label">100%</text>
+<rect x="178" y="446" width="48.3" height="10" rx="3" fill="#23685a"/>
+<text x="233.3" y="455" class="bar-value">6.36%</text>
+<rect x="178" y="459" width="54.9" height="10" rx="3" fill="#a95f2c"/>
+<text x="239.9" y="468" class="bar-value">7.23%</text>
+<text x="0" y="508" class="metric-label">SEED-Bench</text>
+<rect x="178" y="490" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="490" x2="938" y2="519" class="full-line"/>
+<text x="945" y="500" class="axis-label">100%</text>
+<rect x="178" y="492" width="245.3" height="10" rx="3" fill="#23685a"/>
+<text x="430.3" y="501" class="bar-value">32.27%</text>
+<rect x="178" y="505" width="409.9" height="10" rx="3" fill="#a95f2c"/>
+<text x="594.9" y="514" class="bar-value">53.93%</text>
+<text x="0" y="554" class="metric-label">ScienceQA-IMG</text>
+<rect x="178" y="536" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="536" x2="938" y2="565" class="full-line"/>
+<text x="945" y="546" class="axis-label">100%</text>
+<rect x="178" y="538" width="322.6" height="10" rx="3" fill="#23685a"/>
+<text x="507.6" y="547" class="bar-value">42.45%</text>
+<rect x="178" y="551" width="454.4" height="10" rx="3" fill="#a95f2c"/>
+<text x="639.4" y="560" class="bar-value">59.79%</text>
+<text x="0" y="600" class="metric-label">GQA</text>
+<rect x="178" y="582" width="760" height="29" rx="5" class="bar-bg"/>
+<line x1="938" y1="582" x2="938" y2="611" class="full-line"/>
+<text x="945" y="592" class="axis-label">100%</text>
+<rect x="178" y="584" width="268.7" height="10" rx="3" fill="#23685a"/>
+<text x="453.7" y="593" class="bar-value">35.36%</text>
+<rect x="178" y="597" width="366.6" height="10" rx="3" fill="#a95f2c"/>
+<text x="551.6" y="606" class="bar-value">48.24%</text>
+</svg></div>
+    <table><thead><tr><th>Metric</th><th>166 train vision</th><th>168 conn lr 5e-4</th><th>Delta</th></tr></thead><tbody><tr><td>MME-P</td><td>606</td><td>1009</td><td class="positive">+403</td></tr><tr><td>MME-S</td><td>808</td><td>1215</td><td class="positive">+407</td></tr><tr><td>VQAv2</td><td>36.45</td><td>55.23</td><td class="positive">+18.78</td></tr><tr><td>TextVQA</td><td>8.76</td><td>37.13</td><td class="positive">+28.37</td></tr><tr><td>MMBench</td><td>8.33</td><td>46.91</td><td class="positive">+38.58</td></tr><tr><td>POPE adv F1</td><td>14.48</td><td>81.2</td><td class="positive">+66.72</td></tr><tr><td>OCRBench</td><td>2.1</td><td>33.2</td><td class="positive">+31.1</td></tr><tr><td>CountBench</td><td>3.46</td><td>40.53</td><td class="positive">+37.07</td></tr><tr><td>VisWiz</td><td>6.36</td><td>7.23</td><td class="positive">+0.87</td></tr><tr><td>SEED-Bench</td><td>32.27</td><td>53.93</td><td class="positive">+21.66</td></tr><tr><td>ScienceQA-IMG</td><td>42.45</td><td>59.79</td><td class="positive">+17.34</td></tr><tr><td>GQA</td><td>35.36</td><td>48.24</td><td class="positive">+12.88</td></tr></tbody></table>
+    <table><thead><tr><th>Scalar</th><th>166 train vision</th><th>168 conn lr 5e-4</th></tr></thead><tbody><tr><td>Train acc</td><td>0.67</td><td>0.682</td></tr><tr><td>Train loss</td><td>1.42</td><td>1.31</td></tr></tbody></table>
+  </section>
+
+  <section>
+    <h2>3. Late-Fusion Init Scale: Rows 175-177</h2>
+    <p>Layer-13 late fusion depends strongly on image-token scale. Fixed scale 1 leaves the model weak on most text/QA benchmarks; fixed scale 100 changes the image/text RMS ratio by two orders of magnitude and still underperforms. Prompt-stat matching is the best of these three on TextVQA, OCRBench, CountBench, VisWiz, and loss, but the absolute results remain poor. The practical message is that late fusion needs a principled init scale; otherwise image tokens can be ignored or over-amplified.</p>
+    <div class="plot-wrap"><svg class="comparison-chart" viewBox="0 0 1120 716" role="img" aria-label="Late-fusion layer 13 scale ablation: rows 175-177">
+<text x="0" y="18" class="chart-title">Late-fusion layer 13 scale ablation: rows 175-177</text>
+<text x="0" y="42" class="axis-note">Full width = 100% for accuracy/F1 benchmarks; MME uses a fixed 0-2000 score axis.</text>
+<rect x="178" y="54" width="12" height="12" rx="2" fill="#23685a"/>
+<text x="196" y="66" class="legend-text">175 L13 scale1</text>
+<rect x="408" y="54" width="12" height="12" rx="2" fill="#a95f2c"/>
+<text x="426" y="66" class="legend-text">176 L13 scale100</text>
+<rect x="638" y="54" width="12" height="12" rx="2" fill="#315f9f"/>
+<text x="656" y="66" class="legend-text">177 L13 prompt-stat</text>
+<text x="0" y="94" class="metric-label">MME-P</text>
+<rect x="178" y="76" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="76" x2="938" y2="118" class="full-line"/>
+<text x="945" y="86" class="axis-label">2000</text>
+<rect x="178" y="78" width="241.7" height="10" rx="3" fill="#23685a"/>
+<text x="426.7" y="87" class="bar-value">636 (32%)</text>
+<rect x="178" y="91" width="228.8" height="10" rx="3" fill="#a95f2c"/>
+<text x="413.8" y="100" class="bar-value">602 (30%)</text>
+<rect x="178" y="104" width="204.8" height="10" rx="3" fill="#315f9f"/>
+<text x="389.8" y="113" class="bar-value">539 (27%)</text>
+<text x="0" y="140" class="metric-label">MME-S</text>
+<rect x="178" y="122" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="122" x2="938" y2="164" class="full-line"/>
+<text x="945" y="132" class="axis-label">2000</text>
+<rect x="178" y="124" width="334.8" height="10" rx="3" fill="#23685a"/>
+<text x="519.8" y="133" class="bar-value">881 (44%)</text>
+<rect x="178" y="137" width="313.5" height="10" rx="3" fill="#a95f2c"/>
+<text x="498.5" y="146" class="bar-value">825 (41%)</text>
+<rect x="178" y="150" width="281.6" height="10" rx="3" fill="#315f9f"/>
+<text x="466.6" y="159" class="bar-value">741 (37%)</text>
+<text x="0" y="186" class="metric-label">VQAv2</text>
+<rect x="178" y="168" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="168" x2="938" y2="210" class="full-line"/>
+<text x="945" y="178" class="axis-label">100%</text>
+<rect x="178" y="170" width="305.4" height="10" rx="3" fill="#23685a"/>
+<text x="490.4" y="179" class="bar-value">40.18%</text>
+<rect x="178" y="183" width="322.5" height="10" rx="3" fill="#a95f2c"/>
+<text x="507.5" y="192" class="bar-value">42.44%</text>
+<rect x="178" y="196" width="324.3" height="10" rx="3" fill="#315f9f"/>
+<text x="509.3" y="205" class="bar-value">42.67%</text>
+<text x="0" y="232" class="metric-label">TextVQA</text>
+<rect x="178" y="214" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="214" x2="938" y2="256" class="full-line"/>
+<text x="945" y="224" class="axis-label">100%</text>
+<rect x="178" y="216" width="68.9" height="10" rx="3" fill="#23685a"/>
+<text x="253.9" y="225" class="bar-value">9.07%</text>
+<rect x="178" y="229" width="110.0" height="10" rx="3" fill="#a95f2c"/>
+<text x="295.0" y="238" class="bar-value">14.47%</text>
+<rect x="178" y="242" width="165.0" height="10" rx="3" fill="#315f9f"/>
+<text x="350.0" y="251" class="bar-value">21.71%</text>
+<text x="0" y="278" class="metric-label">MMBench</text>
+<rect x="178" y="260" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="260" x2="938" y2="302" class="full-line"/>
+<text x="945" y="270" class="axis-label">100%</text>
+<rect x="178" y="262" width="4.6" height="10" rx="3" fill="#23685a"/>
+<text x="189.6" y="271" class="bar-value">0.6%</text>
+<rect x="178" y="275" width="16.3" height="10" rx="3" fill="#a95f2c"/>
+<text x="201.3" y="284" class="bar-value">2.15%</text>
+<rect x="178" y="288" width="11.8" height="10" rx="3" fill="#315f9f"/>
+<text x="196.8" y="297" class="bar-value">1.55%</text>
+<text x="0" y="324" class="metric-label">POPE adv F1</text>
+<rect x="178" y="306" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="306" x2="938" y2="348" class="full-line"/>
+<text x="945" y="316" class="axis-label">100%</text>
+<rect x="178" y="308" width="482.7" height="10" rx="3" fill="#23685a"/>
+<text x="667.7" y="317" class="bar-value">63.51%</text>
+<rect x="178" y="321" width="506.7" height="10" rx="3" fill="#a95f2c"/>
+<text x="691.7" y="330" class="bar-value">66.67%</text>
+<rect x="178" y="334" width="504.2" height="10" rx="3" fill="#315f9f"/>
+<text x="689.2" y="343" class="bar-value">66.34%</text>
+<text x="0" y="370" class="metric-label">VStar</text>
+<rect x="178" y="352" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="352" x2="938" y2="394" class="full-line"/>
+<text x="945" y="362" class="axis-label">100%</text>
+<rect x="178" y="354" width="286.5" height="10" rx="3" fill="#23685a"/>
+<text x="471.5" y="363" class="bar-value">37.7%</text>
+<rect x="178" y="367" width="278.5" height="10" rx="3" fill="#a95f2c"/>
+<text x="463.5" y="376" class="bar-value">36.65%</text>
+<rect x="178" y="380" width="282.5" height="10" rx="3" fill="#315f9f"/>
+<text x="467.5" y="389" class="bar-value">37.17%</text>
+<text x="0" y="416" class="metric-label">OCRBench</text>
+<rect x="178" y="398" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="398" x2="938" y2="440" class="full-line"/>
+<text x="945" y="408" class="axis-label">100%</text>
+<rect x="178" y="400" width="33.4" height="10" rx="3" fill="#23685a"/>
+<text x="218.4" y="409" class="bar-value">4.4%</text>
+<rect x="178" y="413" width="114.0" height="10" rx="3" fill="#a95f2c"/>
+<text x="299.0" y="422" class="bar-value">15%</text>
+<rect x="178" y="426" width="156.6" height="10" rx="3" fill="#315f9f"/>
+<text x="341.6" y="435" class="bar-value">20.6%</text>
+<text x="0" y="462" class="metric-label">CountBench</text>
+<rect x="178" y="444" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="444" x2="938" y2="486" class="full-line"/>
+<text x="945" y="454" class="axis-label">100%</text>
+<rect x="178" y="446" width="82.0" height="10" rx="3" fill="#23685a"/>
+<text x="267.0" y="455" class="bar-value">10.79%</text>
+<rect x="178" y="459" width="109.9" height="10" rx="3" fill="#a95f2c"/>
+<text x="294.9" y="468" class="bar-value">14.46%</text>
+<rect x="178" y="472" width="137.8" height="10" rx="3" fill="#315f9f"/>
+<text x="322.8" y="481" class="bar-value">18.13%</text>
+<text x="0" y="508" class="metric-label">VisWiz</text>
+<rect x="178" y="490" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="490" x2="938" y2="532" class="full-line"/>
+<text x="945" y="500" class="axis-label">100%</text>
+<rect x="178" y="492" width="31.7" height="10" rx="3" fill="#23685a"/>
+<text x="216.7" y="501" class="bar-value">4.17%</text>
+<rect x="178" y="505" width="22.5" height="10" rx="3" fill="#a95f2c"/>
+<text x="207.5" y="514" class="bar-value">2.96%</text>
+<rect x="178" y="518" width="77.4" height="10" rx="3" fill="#315f9f"/>
+<text x="262.4" y="527" class="bar-value">10.19%</text>
+<text x="0" y="554" class="metric-label">SEED-Bench</text>
+<rect x="178" y="536" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="536" x2="938" y2="578" class="full-line"/>
+<text x="945" y="546" class="axis-label">100%</text>
+<rect x="178" y="538" width="181.4" height="10" rx="3" fill="#23685a"/>
+<text x="366.4" y="547" class="bar-value">23.87%</text>
+<rect x="178" y="551" width="176.2" height="10" rx="3" fill="#a95f2c"/>
+<text x="361.2" y="560" class="bar-value">23.19%</text>
+<rect x="178" y="564" width="184.5" height="10" rx="3" fill="#315f9f"/>
+<text x="369.5" y="573" class="bar-value">24.28%</text>
+<text x="0" y="600" class="metric-label">ScienceQA-IMG</text>
+<rect x="178" y="582" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="582" x2="938" y2="624" class="full-line"/>
+<text x="945" y="592" class="axis-label">100%</text>
+<rect x="178" y="584" width="265.6" height="10" rx="3" fill="#23685a"/>
+<text x="450.6" y="593" class="bar-value">34.95%</text>
+<rect x="178" y="597" width="267.9" height="10" rx="3" fill="#a95f2c"/>
+<text x="452.9" y="606" class="bar-value">35.25%</text>
+<rect x="178" y="610" width="274.3" height="10" rx="3" fill="#315f9f"/>
+<text x="459.3" y="619" class="bar-value">36.09%</text>
+<text x="0" y="646" class="metric-label">GQA</text>
+<rect x="178" y="628" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="628" x2="938" y2="670" class="full-line"/>
+<text x="945" y="638" class="axis-label">100%</text>
+<rect x="178" y="630" width="305.2" height="10" rx="3" fill="#23685a"/>
+<text x="490.2" y="639" class="bar-value">40.16%</text>
+<rect x="178" y="643" width="314.4" height="10" rx="3" fill="#a95f2c"/>
+<text x="499.4" y="652" class="bar-value">41.37%</text>
+<rect x="178" y="656" width="314.6" height="10" rx="3" fill="#315f9f"/>
+<text x="499.6" y="665" class="bar-value">41.4%</text>
+</svg></div>
+    <table><thead><tr><th>Metric</th><th>175 L13 scale1</th><th>176 L13 scale100</th><th>177 L13 prompt-stat</th></tr></thead><tbody><tr><td>MME-P</td><td>636</td><td>602</td><td>539</td></tr><tr><td>MME-S</td><td>881</td><td>825</td><td>741</td></tr><tr><td>VQAv2</td><td>40.18</td><td>42.44</td><td>42.67</td></tr><tr><td>TextVQA</td><td>9.07</td><td>14.47</td><td>21.71</td></tr><tr><td>MMBench</td><td>0.6</td><td>2.15</td><td>1.55</td></tr><tr><td>POPE adv F1</td><td>63.51</td><td>66.67</td><td>66.34</td></tr><tr><td>VStar</td><td>37.7</td><td>36.65</td><td>37.17</td></tr><tr><td>OCRBench</td><td>4.4</td><td>15</td><td>20.6</td></tr><tr><td>CountBench</td><td>10.79</td><td>14.46</td><td>18.13</td></tr><tr><td>VisWiz</td><td>4.17</td><td>2.96</td><td>10.19</td></tr><tr><td>SEED-Bench</td><td>23.87</td><td>23.19</td><td>24.28</td></tr><tr><td>ScienceQA-IMG</td><td>34.95</td><td>35.25</td><td>36.09</td></tr><tr><td>GQA</td><td>40.16</td><td>41.37</td><td>41.4</td></tr></tbody></table>
+    <table><thead><tr><th>Scalar</th><th>175 L13 scale1</th><th>176 L13 scale100</th><th>177 L13 prompt-stat</th></tr></thead><tbody><tr><td>Train acc</td><td>0.619</td><td>0.619</td><td>0.624</td></tr><tr><td>Train loss</td><td>1.76</td><td>1.75</td><td>1.72</td></tr></tbody></table>
+    <table><thead><tr><th>Run</th><th>Run id</th><th>Stage 1 median steps/s</th><th>Stage 2 median steps/s</th><th>Final img/text RMS ratio</th><th>Config note</th></tr></thead><tbody><tr><td>175 L13 scale1<br><span class="muted">glamorous-night-44</span></td><td><code>n88hp1fs</code></td><td>1.178</td><td>0.875</td><td>3.974</td><td>late fusion layer 13, fixed scale 1</td></tr><tr><td>176 L13 scale100<br><span class="muted">swift-durian-55</span></td><td><code>3z61nmo1</code></td><td>1.179</td><td>0.866</td><td>261</td><td>late fusion layer 13, fixed scale 100</td></tr><tr><td>177 L13 prompt-stat<br><span class="muted">dauntless-armadillo-56</span></td><td><code>5q9p85l8</code></td><td>1.177</td><td>0.871</td><td>286</td><td>late fusion layer 13, match_text_stats from prompt</td></tr></tbody></table>
+  </section>
+
+  <section>
+    <h2>4. Late Fusion vs Baseline: Rows 165, 177, 179</h2>
+    <p>The late-fusion rows still do not show a clear benefit over the standard fusion baseline. Row 179 is better than row 177 on VQAv2, SEED, ScienceQA, GQA, and train loss, but it is still much worse than row 165 on MME, MMBench, POPE, CountBench, and overall stability. The speed data also goes the wrong direction: late fusion is slower, not faster, in these measurements.</p>
+    <div class="plot-wrap"><svg class="comparison-chart" viewBox="0 0 1120 716" role="img" aria-label="Standard fusion baseline vs late fusion: rows 165, 177, 179">
+<text x="0" y="18" class="chart-title">Standard fusion baseline vs late fusion: rows 165, 177, 179</text>
+<text x="0" y="42" class="axis-note">Full width = 100% for accuracy/F1 benchmarks; MME uses a fixed 0-2000 score axis.</text>
+<rect x="178" y="54" width="12" height="12" rx="2" fill="#23685a"/>
+<text x="196" y="66" class="legend-text">165 laion base</text>
+<rect x="408" y="54" width="12" height="12" rx="2" fill="#a95f2c"/>
+<text x="426" y="66" class="legend-text">177 L13 prompt-stat</text>
+<rect x="638" y="54" width="12" height="12" rx="2" fill="#315f9f"/>
+<text x="656" y="66" class="legend-text">179 L22 scale470</text>
+<text x="0" y="94" class="metric-label">MME-P</text>
+<rect x="178" y="76" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="76" x2="938" y2="118" class="full-line"/>
+<text x="945" y="86" class="axis-label">2000</text>
+<rect x="178" y="78" width="349.2" height="10" rx="3" fill="#23685a"/>
+<text x="534.2" y="87" class="bar-value">919 (46%)</text>
+<rect x="178" y="91" width="204.8" height="10" rx="3" fill="#a95f2c"/>
+<text x="389.8" y="100" class="bar-value">539 (27%)</text>
+<rect x="178" y="104" width="198.7" height="10" rx="3" fill="#315f9f"/>
+<text x="383.7" y="113" class="bar-value">523 (26%)</text>
+<text x="0" y="140" class="metric-label">MME-S</text>
+<rect x="178" y="122" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="122" x2="938" y2="164" class="full-line"/>
+<text x="945" y="132" class="axis-label">2000</text>
+<rect x="178" y="124" width="407.7" height="10" rx="3" fill="#23685a"/>
+<text x="592.7" y="133" class="bar-value">1073 (54%)</text>
+<rect x="178" y="137" width="281.6" height="10" rx="3" fill="#a95f2c"/>
+<text x="466.6" y="146" class="bar-value">741 (37%)</text>
+<rect x="178" y="150" width="282.0" height="10" rx="3" fill="#315f9f"/>
+<text x="467.0" y="159" class="bar-value">742 (37%)</text>
+<text x="0" y="186" class="metric-label">VQAv2</text>
+<rect x="178" y="168" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="168" x2="938" y2="210" class="full-line"/>
+<text x="945" y="178" class="axis-label">100%</text>
+<rect x="178" y="170" width="410.9" height="10" rx="3" fill="#23685a"/>
+<text x="595.9" y="179" class="bar-value">54.06%</text>
+<rect x="178" y="183" width="324.3" height="10" rx="3" fill="#a95f2c"/>
+<text x="509.3" y="192" class="bar-value">42.67%</text>
+<rect x="178" y="196" width="343.0" height="10" rx="3" fill="#315f9f"/>
+<text x="528.0" y="205" class="bar-value">45.13%</text>
+<text x="0" y="232" class="metric-label">TextVQA</text>
+<rect x="178" y="214" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="214" x2="938" y2="256" class="full-line"/>
+<text x="945" y="224" class="axis-label">100%</text>
+<rect x="178" y="216" width="216.7" height="10" rx="3" fill="#23685a"/>
+<text x="401.7" y="225" class="bar-value">28.51%</text>
+<rect x="178" y="229" width="165.0" height="10" rx="3" fill="#a95f2c"/>
+<text x="350.0" y="238" class="bar-value">21.71%</text>
+<rect x="178" y="242" width="159.4" height="10" rx="3" fill="#315f9f"/>
+<text x="344.4" y="251" class="bar-value">20.97%</text>
+<text x="0" y="278" class="metric-label">MMBench</text>
+<rect x="178" y="260" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="260" x2="938" y2="302" class="full-line"/>
+<text x="945" y="270" class="axis-label">100%</text>
+<rect x="178" y="262" width="321.3" height="10" rx="3" fill="#23685a"/>
+<text x="506.3" y="271" class="bar-value">42.27%</text>
+<rect x="178" y="275" width="11.8" height="10" rx="3" fill="#a95f2c"/>
+<text x="196.8" y="284" class="bar-value">1.55%</text>
+<rect x="178" y="288" width="67.3" height="10" rx="3" fill="#315f9f"/>
+<text x="252.3" y="297" class="bar-value">8.85%</text>
+<text x="0" y="324" class="metric-label">POPE adv F1</text>
+<rect x="178" y="306" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="306" x2="938" y2="348" class="full-line"/>
+<text x="945" y="316" class="axis-label">100%</text>
+<rect x="178" y="308" width="610.2" height="10" rx="3" fill="#23685a"/>
+<text x="795.2" y="317" class="bar-value">80.29%</text>
+<rect x="178" y="321" width="504.2" height="10" rx="3" fill="#a95f2c"/>
+<text x="689.2" y="330" class="bar-value">66.34%</text>
+<rect x="178" y="334" width="380.5" height="10" rx="3" fill="#315f9f"/>
+<text x="565.5" y="343" class="bar-value">50.07%</text>
+<text x="0" y="370" class="metric-label">VStar</text>
+<rect x="178" y="352" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="352" x2="938" y2="394" class="full-line"/>
+<text x="945" y="362" class="axis-label">100%</text>
+<rect x="178" y="354" width="226.8" height="10" rx="3" fill="#23685a"/>
+<text x="411.8" y="363" class="bar-value">29.84%</text>
+<rect x="178" y="367" width="282.5" height="10" rx="3" fill="#a95f2c"/>
+<text x="467.5" y="376" class="bar-value">37.17%</text>
+<rect x="178" y="380" width="298.5" height="10" rx="3" fill="#315f9f"/>
+<text x="483.5" y="389" class="bar-value">39.27%</text>
+<text x="0" y="416" class="metric-label">OCRBench</text>
+<rect x="178" y="398" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="398" x2="938" y2="440" class="full-line"/>
+<text x="945" y="408" class="axis-label">100%</text>
+<rect x="178" y="400" width="184.7" height="10" rx="3" fill="#23685a"/>
+<text x="369.7" y="409" class="bar-value">24.3%</text>
+<rect x="178" y="413" width="156.6" height="10" rx="3" fill="#a95f2c"/>
+<text x="341.6" y="422" class="bar-value">20.6%</text>
+<rect x="178" y="426" width="142.1" height="10" rx="3" fill="#315f9f"/>
+<text x="327.1" y="435" class="bar-value">18.7%</text>
+<text x="0" y="462" class="metric-label">CountBench</text>
+<rect x="178" y="444" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="444" x2="938" y2="486" class="full-line"/>
+<text x="945" y="454" class="axis-label">100%</text>
+<rect x="178" y="446" width="294.1" height="10" rx="3" fill="#23685a"/>
+<text x="479.1" y="455" class="bar-value">38.7%</text>
+<rect x="178" y="459" width="137.8" height="10" rx="3" fill="#a95f2c"/>
+<text x="322.8" y="468" class="bar-value">18.13%</text>
+<rect x="178" y="472" width="131.6" height="10" rx="3" fill="#315f9f"/>
+<text x="316.6" y="481" class="bar-value">17.31%</text>
+<text x="0" y="508" class="metric-label">VisWiz</text>
+<rect x="178" y="490" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="490" x2="938" y2="532" class="full-line"/>
+<text x="945" y="500" class="axis-label">100%</text>
+<rect x="178" y="492" width="175.0" height="10" rx="3" fill="#23685a"/>
+<text x="360.0" y="501" class="bar-value">23.03%</text>
+<rect x="178" y="505" width="77.4" height="10" rx="3" fill="#a95f2c"/>
+<text x="262.4" y="514" class="bar-value">10.19%</text>
+<rect x="178" y="518" width="78.8" height="10" rx="3" fill="#315f9f"/>
+<text x="263.8" y="527" class="bar-value">10.37%</text>
+<text x="0" y="554" class="metric-label">SEED-Bench</text>
+<rect x="178" y="536" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="536" x2="938" y2="578" class="full-line"/>
+<text x="945" y="546" class="axis-label">100%</text>
+<rect x="178" y="538" width="389.1" height="10" rx="3" fill="#23685a"/>
+<text x="574.1" y="547" class="bar-value">51.2%</text>
+<rect x="178" y="551" width="184.5" height="10" rx="3" fill="#a95f2c"/>
+<text x="369.5" y="560" class="bar-value">24.28%</text>
+<rect x="178" y="564" width="262.4" height="10" rx="3" fill="#315f9f"/>
+<text x="447.4" y="573" class="bar-value">34.53%</text>
+<text x="0" y="600" class="metric-label">ScienceQA-IMG</text>
+<rect x="178" y="582" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="582" x2="938" y2="624" class="full-line"/>
+<text x="945" y="592" class="axis-label">100%</text>
+<rect x="178" y="584" width="445.0" height="10" rx="3" fill="#23685a"/>
+<text x="630.0" y="593" class="bar-value">58.55%</text>
+<rect x="178" y="597" width="274.3" height="10" rx="3" fill="#a95f2c"/>
+<text x="459.3" y="606" class="bar-value">36.09%</text>
+<rect x="178" y="610" width="368.9" height="10" rx="3" fill="#315f9f"/>
+<text x="553.9" y="619" class="bar-value">48.54%</text>
+<text x="0" y="646" class="metric-label">GQA</text>
+<rect x="178" y="628" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="628" x2="938" y2="670" class="full-line"/>
+<text x="945" y="638" class="axis-label">100%</text>
+<rect x="178" y="630" width="363.2" height="10" rx="3" fill="#23685a"/>
+<text x="548.2" y="639" class="bar-value">47.79%</text>
+<rect x="178" y="643" width="314.6" height="10" rx="3" fill="#a95f2c"/>
+<text x="499.6" y="652" class="bar-value">41.4%</text>
+<rect x="178" y="656" width="324.4" height="10" rx="3" fill="#315f9f"/>
+<text x="509.4" y="665" class="bar-value">42.69%</text>
+</svg></div>
+    <table><thead><tr><th>Metric</th><th>165 laion base</th><th>177 L13 prompt-stat</th><th>179 L22 scale470</th></tr></thead><tbody><tr><td>MME-P</td><td>919</td><td>539</td><td>523</td></tr><tr><td>MME-S</td><td>1073</td><td>741</td><td>742</td></tr><tr><td>VQAv2</td><td>54.06</td><td>42.67</td><td>45.13</td></tr><tr><td>TextVQA</td><td>28.51</td><td>21.71</td><td>20.97</td></tr><tr><td>MMBench</td><td>42.27</td><td>1.55</td><td>8.85</td></tr><tr><td>POPE adv F1</td><td>80.29</td><td>66.34</td><td>50.07</td></tr><tr><td>VStar</td><td>29.84</td><td>37.17</td><td>39.27</td></tr><tr><td>OCRBench</td><td>24.3</td><td>20.6</td><td>18.7</td></tr><tr><td>CountBench</td><td>38.7</td><td>18.13</td><td>17.31</td></tr><tr><td>VisWiz</td><td>23.03</td><td>10.19</td><td>10.37</td></tr><tr><td>SEED-Bench</td><td>51.2</td><td>24.28</td><td>34.53</td></tr><tr><td>ScienceQA-IMG</td><td>58.55</td><td>36.09</td><td>48.54</td></tr><tr><td>GQA</td><td>47.79</td><td>41.4</td><td>42.69</td></tr></tbody></table>
+    <table><thead><tr><th>Scalar</th><th>165 laion base</th><th>177 L13 prompt-stat</th><th>179 L22 scale470</th></tr></thead><tbody><tr><td>Train acc</td><td>0.679</td><td>0.624</td><td>0.671</td></tr><tr><td>Train loss</td><td>1.32</td><td>1.72</td><td>1.34</td></tr></tbody></table>
+    <table><thead><tr><th>Run</th><th>Run id</th><th>Stage 1 median steps/s</th><th>Stage 2 median steps/s</th><th>Final img/text RMS ratio</th><th>Config note</th></tr></thead><tbody><tr><td>165 laion base<br><span class="muted">amber-fire-13</span></td><td><code>oc5p312v</code></td><td>5.28</td><td>3.571</td><td>n/a</td><td>laion-aes pretrain, stage1 image encoder frozen, stage2 connector+LM</td></tr><tr><td>177 L13 prompt-stat<br><span class="muted">dauntless-armadillo-56</span></td><td><code>5q9p85l8</code></td><td>1.177</td><td>0.871</td><td>286</td><td>late fusion layer 13, match_text_stats from prompt</td></tr><tr><td>179 L22 scale470<br><span class="muted">cosmic-eon-26</span></td><td><code>6hidfm8i</code></td><td>2.16</td><td>1.135</td><td>n/a</td><td>late fusion layer 22, fixed scale 470</td></tr></tbody></table>
+  </section>
+
+  <section>
+    <h2>5. More SFT For LLaVA-Style Fusion: Rows 170-172</h2>
+    <p>The cc12m/160-token LLaVA-style path responds well to more SFT effective compute. Row 171 increases stage-2 batch from 128 to 512 and scales LR upward; it gives the best VQAv2, TextVQA, MMBench, POPE, OCRBench, VisWiz, ScienceQA, GQA, train acc, and train loss in this trio. Row 172 trains stage 2 for 15000 steps and gives the best MME, CountBench, SEED, ScienceQA, and a stronger overall long-training signal than row 170.</p>
+    <div class="plot-wrap"><svg class="comparison-chart" viewBox="0 0 1120 808" role="img" aria-label="LLaVA-style fusion with more SFT: rows 170-172">
+<text x="0" y="18" class="chart-title">LLaVA-style fusion with more SFT: rows 170-172</text>
+<text x="0" y="42" class="axis-note">Full width = 100% for accuracy/F1 benchmarks; MME uses a fixed 0-2000 score axis.</text>
+<rect x="178" y="54" width="12" height="12" rx="2" fill="#23685a"/>
+<text x="196" y="66" class="legend-text">170 cc12m base</text>
+<rect x="408" y="54" width="12" height="12" rx="2" fill="#a95f2c"/>
+<text x="426" y="66" class="legend-text">171 4x batch+LR</text>
+<rect x="638" y="54" width="12" height="12" rx="2" fill="#315f9f"/>
+<text x="656" y="66" class="legend-text">172 3x longer</text>
+<text x="0" y="94" class="metric-label">MME-P</text>
+<rect x="178" y="76" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="76" x2="938" y2="118" class="full-line"/>
+<text x="945" y="86" class="axis-label">2000</text>
+<rect x="178" y="78" width="410.0" height="10" rx="3" fill="#23685a"/>
+<text x="595.0" y="87" class="bar-value">1079 (54%)</text>
+<rect x="178" y="91" width="392.5" height="10" rx="3" fill="#a95f2c"/>
+<text x="577.5" y="100" class="bar-value">1033 (52%)</text>
+<rect x="178" y="104" width="453.7" height="10" rx="3" fill="#315f9f"/>
+<text x="638.7" y="113" class="bar-value">1194 (60%)</text>
+<text x="0" y="140" class="metric-label">MME-S</text>
+<rect x="178" y="122" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="122" x2="938" y2="164" class="full-line"/>
+<text x="945" y="132" class="axis-label">2000</text>
+<rect x="178" y="124" width="494.0" height="10" rx="3" fill="#23685a"/>
+<text x="679.0" y="133" class="bar-value">1300 (65%)</text>
+<rect x="178" y="137" width="474.2" height="10" rx="3" fill="#a95f2c"/>
+<text x="659.2" y="146" class="bar-value">1248 (62%)</text>
+<rect x="178" y="150" width="545.7" height="10" rx="3" fill="#315f9f"/>
+<text x="730.7" y="159" class="bar-value">1436 (72%)</text>
+<text x="0" y="186" class="metric-label">VQAv2</text>
+<rect x="178" y="168" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="168" x2="938" y2="210" class="full-line"/>
+<text x="945" y="178" class="axis-label">100%</text>
+<rect x="178" y="170" width="416.6" height="10" rx="3" fill="#23685a"/>
+<text x="601.6" y="179" class="bar-value">54.82%</text>
+<rect x="178" y="183" width="460.0" height="10" rx="3" fill="#a95f2c"/>
+<text x="645.0" y="192" class="bar-value">60.52%</text>
+<rect x="178" y="196" width="442.9" height="10" rx="3" fill="#315f9f"/>
+<text x="627.9" y="205" class="bar-value">58.27%</text>
+<text x="0" y="232" class="metric-label">TextVQA</text>
+<rect x="178" y="214" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="214" x2="938" y2="256" class="full-line"/>
+<text x="945" y="224" class="axis-label">100%</text>
+<rect x="178" y="216" width="266.8" height="10" rx="3" fill="#23685a"/>
+<text x="451.8" y="225" class="bar-value">35.11%</text>
+<rect x="178" y="229" width="320.0" height="10" rx="3" fill="#a95f2c"/>
+<text x="505.0" y="238" class="bar-value">42.1%</text>
+<rect x="178" y="242" width="284.4" height="10" rx="3" fill="#315f9f"/>
+<text x="469.4" y="251" class="bar-value">37.42%</text>
+<text x="0" y="278" class="metric-label">RefCOCOg</text>
+<rect x="178" y="260" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="260" x2="938" y2="302" class="full-line"/>
+<text x="945" y="270" class="axis-label">100%</text>
+<rect x="178" y="262" width="1.0" height="10" rx="3" fill="#23685a"/>
+<text x="186.0" y="271" class="bar-value">0%</text>
+<rect x="178" y="275" width="1.0" height="10" rx="3" fill="#a95f2c"/>
+<text x="186.0" y="284" class="bar-value">0%</text>
+<rect x="178" y="288" width="1.0" height="10" rx="3" fill="#315f9f"/>
+<text x="186.0" y="297" class="bar-value">0%</text>
+<text x="0" y="324" class="metric-label">MMBench</text>
+<rect x="178" y="306" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="306" x2="938" y2="348" class="full-line"/>
+<text x="945" y="316" class="axis-label">100%</text>
+<rect x="178" y="308" width="331.1" height="10" rx="3" fill="#23685a"/>
+<text x="516.1" y="317" class="bar-value">43.56%</text>
+<rect x="178" y="321" width="384.6" height="10" rx="3" fill="#a95f2c"/>
+<text x="569.6" y="330" class="bar-value">50.6%</text>
+<rect x="178" y="334" width="318.6" height="10" rx="3" fill="#315f9f"/>
+<text x="503.6" y="343" class="bar-value">41.92%</text>
+<text x="0" y="370" class="metric-label">POPE adv F1</text>
+<rect x="178" y="352" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="352" x2="938" y2="394" class="full-line"/>
+<text x="945" y="362" class="axis-label">100%</text>
+<rect x="178" y="354" width="615.3" height="10" rx="3" fill="#23685a"/>
+<text x="800.3" y="363" class="bar-value">80.96%</text>
+<rect x="178" y="367" width="636.6" height="10" rx="3" fill="#a95f2c"/>
+<text x="821.6" y="376" class="bar-value">83.76%</text>
+<rect x="178" y="380" width="624.8" height="10" rx="3" fill="#315f9f"/>
+<text x="809.8" y="389" class="bar-value">82.21%</text>
+<text x="0" y="416" class="metric-label">VStar</text>
+<rect x="178" y="398" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="398" x2="938" y2="440" class="full-line"/>
+<text x="945" y="408" class="axis-label">100%</text>
+<rect x="178" y="400" width="242.7" height="10" rx="3" fill="#23685a"/>
+<text x="427.7" y="409" class="bar-value">31.94%</text>
+<rect x="178" y="413" width="222.8" height="10" rx="3" fill="#a95f2c"/>
+<text x="407.8" y="422" class="bar-value">29.32%</text>
+<rect x="178" y="426" width="254.7" height="10" rx="3" fill="#315f9f"/>
+<text x="439.7" y="435" class="bar-value">33.51%</text>
+<text x="0" y="462" class="metric-label">OCRBench</text>
+<rect x="178" y="444" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="444" x2="938" y2="486" class="full-line"/>
+<text x="945" y="454" class="axis-label">100%</text>
+<rect x="178" y="446" width="231.0" height="10" rx="3" fill="#23685a"/>
+<text x="416.0" y="455" class="bar-value">30.4%</text>
+<rect x="178" y="459" width="307.8" height="10" rx="3" fill="#a95f2c"/>
+<text x="492.8" y="468" class="bar-value">40.5%</text>
+<rect x="178" y="472" width="281.2" height="10" rx="3" fill="#315f9f"/>
+<text x="466.2" y="481" class="bar-value">37%</text>
+<text x="0" y="508" class="metric-label">MMVP</text>
+<rect x="178" y="490" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="490" x2="938" y2="532" class="full-line"/>
+<text x="945" y="500" class="axis-label">100%</text>
+<rect x="178" y="492" width="390.1" height="10" rx="3" fill="#23685a"/>
+<text x="575.1" y="501" class="bar-value">51.33%</text>
+<rect x="178" y="505" width="418.0" height="10" rx="3" fill="#a95f2c"/>
+<text x="603.0" y="514" class="bar-value">55%</text>
+<rect x="178" y="518" width="395.2" height="10" rx="3" fill="#315f9f"/>
+<text x="580.2" y="527" class="bar-value">52%</text>
+<text x="0" y="554" class="metric-label">CountBench</text>
+<rect x="178" y="536" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="536" x2="938" y2="578" class="full-line"/>
+<text x="945" y="546" class="axis-label">100%</text>
+<rect x="178" y="538" width="337.4" height="10" rx="3" fill="#23685a"/>
+<text x="522.4" y="547" class="bar-value">44.4%</text>
+<rect x="178" y="551" width="340.6" height="10" rx="3" fill="#a95f2c"/>
+<text x="525.6" y="560" class="bar-value">44.81%</text>
+<rect x="178" y="564" width="356.0" height="10" rx="3" fill="#315f9f"/>
+<text x="541.0" y="573" class="bar-value">46.84%</text>
+<text x="0" y="600" class="metric-label">VisWiz</text>
+<rect x="178" y="582" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="582" x2="938" y2="624" class="full-line"/>
+<text x="945" y="592" class="axis-label">100%</text>
+<rect x="178" y="584" width="79.3" height="10" rx="3" fill="#23685a"/>
+<text x="264.3" y="593" class="bar-value">10.44%</text>
+<rect x="178" y="597" width="137.9" height="10" rx="3" fill="#a95f2c"/>
+<text x="322.9" y="606" class="bar-value">18.15%</text>
+<rect x="178" y="610" width="64.4" height="10" rx="3" fill="#315f9f"/>
+<text x="249.4" y="619" class="bar-value">8.47%</text>
+<text x="0" y="646" class="metric-label">SEED-Bench</text>
+<rect x="178" y="628" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="628" x2="938" y2="670" class="full-line"/>
+<text x="945" y="638" class="axis-label">100%</text>
+<rect x="178" y="630" width="411.2" height="10" rx="3" fill="#23685a"/>
+<text x="596.2" y="639" class="bar-value">54.1%</text>
+<rect x="178" y="643" width="426.0" height="10" rx="3" fill="#a95f2c"/>
+<text x="611.0" y="652" class="bar-value">56.05%</text>
+<rect x="178" y="656" width="428.6" height="10" rx="3" fill="#315f9f"/>
+<text x="613.6" y="665" class="bar-value">56.4%</text>
+<text x="0" y="692" class="metric-label">ScienceQA-IMG</text>
+<rect x="178" y="674" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="674" x2="938" y2="716" class="full-line"/>
+<text x="945" y="684" class="axis-label">100%</text>
+<rect x="178" y="676" width="426.5" height="10" rx="3" fill="#23685a"/>
+<text x="611.5" y="685" class="bar-value">56.12%</text>
+<rect x="178" y="689" width="458.6" height="10" rx="3" fill="#a95f2c"/>
+<text x="643.6" y="698" class="bar-value">60.34%</text>
+<rect x="178" y="702" width="460.5" height="10" rx="3" fill="#315f9f"/>
+<text x="645.5" y="711" class="bar-value">60.59%</text>
+<text x="0" y="738" class="metric-label">GQA</text>
+<rect x="178" y="720" width="760" height="42" rx="5" class="bar-bg"/>
+<line x1="938" y1="720" x2="938" y2="762" class="full-line"/>
+<text x="945" y="730" class="axis-label">100%</text>
+<rect x="178" y="722" width="374.5" height="10" rx="3" fill="#23685a"/>
+<text x="559.5" y="731" class="bar-value">49.28%</text>
+<rect x="178" y="735" width="407.7" height="10" rx="3" fill="#a95f2c"/>
+<text x="592.7" y="744" class="bar-value">53.65%</text>
+<rect x="178" y="748" width="394.6" height="10" rx="3" fill="#315f9f"/>
+<text x="579.6" y="757" class="bar-value">51.92%</text>
+</svg></div>
+    <table><thead><tr><th>Metric</th><th>170 cc12m base</th><th>171 4x batch+LR</th><th>172 3x longer</th></tr></thead><tbody><tr><td>MME-P</td><td>1079</td><td>1033</td><td>1194</td></tr><tr><td>MME-S</td><td>1300</td><td>1248</td><td>1436</td></tr><tr><td>VQAv2</td><td>54.82</td><td>60.52</td><td>58.27</td></tr><tr><td>TextVQA</td><td>35.11</td><td>42.1</td><td>37.42</td></tr><tr><td>RefCOCOg</td><td>0</td><td>0</td><td>0</td></tr><tr><td>MMBench</td><td>43.56</td><td>50.6</td><td>41.92</td></tr><tr><td>POPE adv F1</td><td>80.96</td><td>83.76</td><td>82.21</td></tr><tr><td>VStar</td><td>31.94</td><td>29.32</td><td>33.51</td></tr><tr><td>OCRBench</td><td>30.4</td><td>40.5</td><td>37</td></tr><tr><td>MMVP</td><td>51.33</td><td>55</td><td>52</td></tr><tr><td>CountBench</td><td>44.4</td><td>44.81</td><td>46.84</td></tr><tr><td>VisWiz</td><td>10.44</td><td>18.15</td><td>8.47</td></tr><tr><td>SEED-Bench</td><td>54.1</td><td>56.05</td><td>56.4</td></tr><tr><td>ScienceQA-IMG</td><td>56.12</td><td>60.34</td><td>60.59</td></tr><tr><td>GQA</td><td>49.28</td><td>53.65</td><td>51.92</td></tr></tbody></table>
+    <table><thead><tr><th>Scalar</th><th>170 cc12m base</th><th>171 4x batch+LR</th><th>172 3x longer</th></tr></thead><tbody><tr><td>Train acc</td><td>0.684</td><td>0.705</td><td>0.697</td></tr><tr><td>Train loss</td><td>1.27</td><td>1.13</td><td>1.2</td></tr></tbody></table>
+    <table><thead><tr><th>Run</th><th>Run id</th><th>Stage 1 median steps/s</th><th>Stage 2 median steps/s</th><th>Final img/text RMS ratio</th><th>Config note</th></tr></thead><tbody><tr><td>170 cc12m base<br><span class="muted">soft-snowball-57</span></td><td><code>4k5j3pg8</code></td><td>0.601</td><td>0.67</td><td>4.056</td><td>cc12m max_txt_len=160, stage2 batch 128, LM lr 2e-5, connector lr 5e-4</td></tr><tr><td>171 4x batch+LR<br><span class="muted">earthy-field-61</span></td><td><code>sahzaodl</code></td><td>4.15</td><td>1.423</td><td>3.386</td><td>cc12m max_txt_len=160, stage2 batch 512, LM lr 4e-5, connector lr 1e-3</td></tr><tr><td>172 3x longer<br><span class="muted">fresh-bee-58</span></td><td><code>vtwqn8cw</code></td><td>0.6</td><td>0.664</td><td>4.028</td><td>cc12m max_txt_len=160, stage2 trained 15000 steps, batch 128</td></tr></tbody></table>
+  </section>
+
+  <section>
+    <h2>Recommended Next Steps</h2>
+    <ul>
+      <li>Keep the standard LLaVA-style fusion path as the mainline and spend next runs on stronger SFT schedules/data rather than late-fusion complexity.</li>
+      <li>Use the row 171 recipe as the short-horizon performance baseline when budget allows larger batch and sqrt LR scaling; use row 172 when testing longer SFT convergence.</li>
+      <li>If late fusion is revisited, first solve the image/text scale initialization problem and measure early-stage image-token usage before launching full benchmark sweeps.</li>
+      <li>Do not make beam search the default table metric. Keep greedy as the main comparable protocol and log beam as an eval ablation for tasks such as VisWiz.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Source Notes</h2>
+    <table><tbody>
+      <tr><th>Spreadsheet</th><td><code>PaliGemma-baseline-cleaned-20260608</code>, rows 163-179.</td></tr>
+      <tr><th>Speed source</th><td>Median <code>steps_per_second</code> parsed from W&B history when available and local <code>output.log</code> text for older/resumed runs. Compile/resume-adjacent values below 0.05 steps/s were ignored.</td></tr>
+      <tr><th>Loss/KNN</th><td>Train loss is included in scalar tables. These rows are JAX LLaVA runs, so ImageNet KNN is not consistently logged; it is only displayed when present in the sheet.</td></tr>
+    </tbody></table>
+  </section>
+</main>
+</body>
+</html>
