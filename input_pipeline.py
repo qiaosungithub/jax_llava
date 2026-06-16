@@ -222,9 +222,10 @@ def _dataset_type_to_mask_category(dataset_type: str) -> str:
         "textvqa",
         "tallyqa",
         "dvqa",
+        "ai2d",
     }:
         return "vqa"
-    if dataset_type in {"rendered_text", "textcaps"}:
+    if dataset_type in {"rendered_text", "textcaps", "ureader"}:
         return "ocr"
     if dataset_type in {"genome_gcap", "genome_det", "refcoco"}:
         return "grounded_caption"
@@ -304,10 +305,19 @@ def _dataset_config_int(dataset_config, field: str, dataset_type: str, default: 
 _SHUFFLE_SIZE_REFERENCE_STREAMS = 32
 
 
+def _shuffle_total_streams(dataset_config) -> int:
+    num_workers = max(1, int(getattr(dataset_config, "num_workers", 1)))
+    total_streams_override = getattr(dataset_config, "shuffle_total_streams_override", None)
+    if total_streams_override is None:
+        total_streams_override = os.environ.get("LLAVA_SHUFFLE_TOTAL_STREAMS_OVERRIDE")
+    if total_streams_override not in (None, ""):
+        return max(1, int(total_streams_override))
+    return jax.process_count() * num_workers
+
+
 def _scaled_shuffle_size(raw: int, dataset_config) -> int:
     """Scale a shuffle buffer size relative to the reference stream count (32)."""
-    num_workers = max(1, int(getattr(dataset_config, "num_workers", 1)))
-    total_streams = jax.process_count() * num_workers
+    total_streams = _shuffle_total_streams(dataset_config)
     if total_streams <= _SHUFFLE_SIZE_REFERENCE_STREAMS:
         return raw
     return max(1, int(raw * _SHUFFLE_SIZE_REFERENCE_STREAMS / total_streams))
@@ -326,6 +336,53 @@ def _item_shuffle_size(dataset_config, dataset_type: str, default: int) -> int:
                 value = value.get(dataset_type, value.get("default", default))
             raw = max(1, int(value))
     return _scaled_shuffle_size(raw, dataset_config)
+
+
+def _as_config_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return list(value) if hasattr(value, "__iter__") else [value]
+
+
+def _weighted_item_shuffle_size_override(
+    dataset_config,
+    dataset_type: str,
+    dataset_weight: float,
+    eligible_weight_sum: float,
+):
+    """Allocate per-child raw-image shuffle slots from mix weights.
+
+    This is intended for split mixtures such as LLaVA-OV1.5 task-family groups:
+    large groups get larger buffers, while small groups still keep a floor so
+    multiple questions from one image are not emitted close together.
+    """
+    cfg = getattr(dataset_config, "weighted_item_shuffle_size", None)
+    if cfg is None:
+        return None
+    enabled = bool(cfg.get("enabled", True)) if hasattr(cfg, "get") else True
+    if not enabled:
+        return None
+
+    include_types = _as_config_list(
+        cfg.get("include_types", ["llava_ov15"]) if hasattr(cfg, "get") else ["llava_ov15"]
+    )
+    if include_types and dataset_type not in include_types:
+        return None
+    if eligible_weight_sum <= 0 or dataset_weight <= 0:
+        return None
+
+    total = int(cfg.get("total", 65536))
+    min_size = int(cfg.get("min", 512))
+    max_size = cfg.get("max", None)
+    raw = max(1, int(round(float(total) * float(dataset_weight) / float(eligible_weight_sum))))
+    effective = max(min_size, _scaled_shuffle_size(raw, dataset_config))
+    if max_size is not None:
+        effective = min(int(max_size), effective)
+    return max(1, int(effective))
 
 
 def _stream_start_skip(dataset_config, dataset_type: str) -> int:
@@ -504,6 +561,16 @@ def _serialize_shuffle_entry(entry):
     if kind == "pending_ref":
         raw_ref, items = payload
         return {"kind": "pending", "sample": raw_ref, "items": items}
+    if kind == "item":
+        raw_sample, item = payload
+        return {
+            "kind": "item",
+            "sample": _sample_ref(raw_sample),
+            "item": _strip_image_keys(item),
+        }
+    if kind == "item_ref":
+        raw_ref, item = payload
+        return {"kind": "item", "sample": raw_ref, "item": item}
     raise ValueError(f"Unknown shuffle entry kind: {kind}")
 
 
@@ -518,6 +585,11 @@ def _deserialize_shuffle_entry(entry):
         if "inline" in sample_ref:
             return ("pending", (sample_ref["inline"], entry["items"]))
         return ("pending_ref", (sample_ref, entry["items"]))
+    if entry["kind"] == "item":
+        sample_ref = entry["sample"]
+        if "inline" in sample_ref:
+            return ("item", (sample_ref["inline"], entry["item"]))
+        return ("item_ref", (sample_ref, entry["item"]))
     raise ValueError(f"Unknown serialized shuffle entry kind: {entry.get('kind')}")
 
 
@@ -743,8 +815,11 @@ def _box_to_loc_tokens(transform, x, y, w, h, img_w, img_h):
     return f"<loc{ymin:04d}><loc{xmin:04d}><loc{ymax:04d}><loc{xmax:04d}>"
 
 
+_CONVERSATION_DATASET_TYPES = {"llava15", "llava_ov15", "ai2d", "ureader"}
+
+
 def _get_text_from_sample(sample, dataset_type):
-    if dataset_type in {"llava15", "llava_ov15"}:
+    if dataset_type in _CONVERSATION_DATASET_TYPES:
         raw = sample.get("json")
         if raw is None:
             return ("", "")
@@ -850,7 +925,7 @@ def preprocess_fn(
         prompt_for_mask = prompt_for_mask + "\n"
         full_text = f"{prompt_for_mask}{answer_part}"
         prefix_tokens = tokenizer.encode(prompt_for_mask, add_bos=True, add_eos=False)
-    elif dataset_type == "llava_ov15":
+    elif dataset_type in {"llava_ov15", "ai2d", "ureader"}:
         question_part = (sample.get("question", "") or "").strip()
         answer_part = (sample.get("aux", {}) or {}).get("answer", "")
         answer_part = "" if answer_part is None else str(answer_part).strip()
@@ -1198,7 +1273,7 @@ def expand_genome_sample(sample):
 
 def _refcoco_phrases(ref):
     phrases = []
-    for key in ("sentences", "captions"):
+    for key in ("sentences", "captions", "phrase"):
         values = ref.get(key, [])
         if isinstance(values, str):
             values = [values]
@@ -1221,6 +1296,42 @@ def _refcoco_phrases(ref):
     return deduped
 
 
+def _refcoco_bbox_xywh(ref):
+    """Return xywh bbox for RefCOCO-family records.
+
+    New records write bbox_format explicitly. Legacy jxu124/refcoco shards stored
+    HF's xyxy `bbox` without a format tag, so missing format is treated as xyxy.
+    """
+    def _as_box(value):
+        if not isinstance(value, (list, tuple)) or len(value) < 4:
+            return None
+        try:
+            return [float(value[0]), float(value[1]), float(value[2]), float(value[3])]
+        except (TypeError, ValueError):
+            return None
+
+    box = _as_box(ref.get("bbox_xywh"))
+    if box is not None and box[2] > 0 and box[3] > 0:
+        return box
+
+    fmt = str(ref.get("bbox_format", "")).lower()
+    box = _as_box(ref.get("bbox"))
+    if fmt == "xywh" and box is not None and box[2] > 0 and box[3] > 0:
+        return box
+
+    xyxy = _as_box(ref.get("bbox_xyxy"))
+    if xyxy is None and box is not None and fmt in {"", "xyxy"}:
+        xyxy = box
+    if xyxy is None:
+        return None
+    x1, y1, x2, y2 = xyxy
+    w = x2 - x1
+    h = y2 - y1
+    if w <= 0 or h <= 0:
+        return None
+    return [x1, y1, w, h]
+
+
 def expand_refcoco_sample(sample):
     """Expand grouped RefCOCO records into one phrase-to-box item per ref."""
     j = sample.get("json")
@@ -1235,14 +1346,8 @@ def expand_refcoco_sample(sample):
 
     out = []
     for ref in refs:
-        bbox = ref.get("bbox", [])
-        if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
-            continue
-        try:
-            bbox = [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])]
-        except (TypeError, ValueError):
-            continue
-        if bbox[2] <= 0 or bbox[3] <= 0:
+        bbox = _refcoco_bbox_xywh(ref)
+        if bbox is None:
             continue
         phrases = _refcoco_phrases(ref)
         if not phrases:
@@ -1252,11 +1357,13 @@ def expand_refcoco_sample(sample):
             "phrase": random.choice(phrases),
             "bbox": bbox,
             "aux": {
-                "dataset": "refcoco",
+                "dataset": j.get("dataset", "refcoco"),
                 "image_id": j.get("image_id"),
                 "ref_id": ref.get("ref_id"),
                 "ann_id": ref.get("ann_id"),
                 "bbox": bbox,
+                "bbox_format": "xywh",
+                "bbox_xyxy": ref.get("bbox_xyxy"),
                 "phrases": phrases,
             },
         })
@@ -1370,6 +1477,8 @@ _EXPAND_FN = {
     "refcoco": expand_refcoco_sample,
     "llava15": expand_llava_sample,
     "llava_ov15": expand_llava_sample,
+    "ai2d": expand_llava_sample,
+    "ureader": expand_llava_sample,
     # genome_gcap needs region_lookup; handled separately in GenomeGCapIterableDataset
 }
 
@@ -1705,6 +1814,7 @@ class _StatefulVQAIterator(Stateful):
         self.rng = random.Random(_worker_seed(2027, dataset.shard_rank, dataset.data_seed_offset))
         self.choice_rng = random.Random(_worker_seed(2039, dataset.shard_rank, dataset.data_seed_offset))
         self.expand_fn = _EXPAND_FN.get(dataset.dataset_type, expand_vqa_sample)
+        self.expand_at_fill = bool(getattr(dataset, "expand_at_fill", False))
         self.shuffle_buf = []
         start_skip_max = _stream_start_skip(dataset.config, dataset.dataset_type)
         self.start_skip_remaining = self.rng.randrange(start_skip_max + 1) if start_skip_max > 0 else 0
@@ -1735,6 +1845,9 @@ class _StatefulVQAIterator(Stateful):
             elif kind == "pending_ref":
                 raw_ref, _items = payload
                 refs.append(raw_ref)
+            elif kind == "item_ref":
+                raw_ref, _item = payload
+                refs.append(raw_ref)
         if not refs:
             return
         self.raw_iter.batch_hydrate(refs)
@@ -1747,6 +1860,10 @@ class _StatefulVQAIterator(Stateful):
                 raw_ref, items = payload
                 sample = self.raw_iter.hydrate(raw_ref)
                 hydrated.append(("pending", (sample, items)))
+            elif kind == "item_ref":
+                raw_ref, item = payload
+                sample = self.raw_iter.hydrate(raw_ref)
+                hydrated.append(("item", (sample, item)))
             else:
                 hydrated.append((kind, payload))
         self.shuffle_buf = hydrated
@@ -1791,7 +1908,50 @@ class _StatefulVQAIterator(Stateful):
             mask_token_category_probs=self.dataset.mask_token_category_probs,
         )
 
+    def _emit_one_item(self):
+        # expand_at_fill mode: each buffer entry is a single expanded QA item that
+        # already carries its raw sample (or a ref to it for image hydration).
+        kind, payload = self._pop_random_entry()
+        if kind == "item":
+            raw_sample, chosen = payload
+        elif kind == "item_ref":
+            raw_ref, chosen = payload
+            raw_sample = self.raw_iter.hydrate(raw_ref)
+        else:
+            raise ValueError(f"Expected item entry in expand_at_fill mode, got {kind}")
+        chosen = _sample_with_image(raw_sample, chosen)
+        return _with_module_random(
+            self.choice_rng,
+            preprocess_fn,
+            chosen,
+            self.dataset.transform,
+            self.dataset.tokenizer,
+            self.dataset.max_len,
+            dataset_type=self.dataset.dataset_type,
+            mask_token_category_probs=self.dataset.mask_token_category_probs,
+        )
+
+    def _fill_items(self):
+        while len(self.shuffle_buf) < self.dataset.shuffle_size:
+            sample = next(self.raw_iter)
+            if sample is None:
+                continue
+            if self.start_skip_remaining > 0:
+                self.start_skip_remaining -= 1
+                continue
+            items = _with_module_random(self.choice_rng, self.expand_fn, sample)
+            if not items:
+                continue
+            for item in items:
+                self.shuffle_buf.append(("item", (sample, item)))
+
     def __next__(self):
+        if self.expand_at_fill:
+            while True:
+                self._fill_items()
+                out = self._emit_one_item()
+                if out is not None:
+                    return out
         while True:
             while len(self.shuffle_buf) < self.dataset.shuffle_size:
                 sample = next(self.raw_iter)
@@ -1932,7 +2092,16 @@ class VQAv2IterableDataset(IterableDataset):
     copies of the same image.
     """
 
-    def __init__(self, root_url, config, tokenizer, num_shards=None, dataset_type="vqav2", data_seed_offset=0):
+    def __init__(
+        self,
+        root_url,
+        config,
+        tokenizer,
+        num_shards=None,
+        dataset_type="vqav2",
+        data_seed_offset=0,
+        shuffle_size_override=None,
+    ):
         # Expand expensive GCS globs once in the parent process. Otherwise each
         # DataLoader worker repeats the same bucket listing on first iteration.
         expanded_root = _expand_gcs_glob_if_needed(root_url)
@@ -1956,11 +2125,15 @@ class VQAv2IterableDataset(IterableDataset):
             "dvqa": 20000,
             "tallyqa": 50000,
         }
-        self.shuffle_size = _item_shuffle_size(
-            self.config,
-            self.dataset_type,
-            shuffle_sizes.get(self.dataset_type, 10000),
-        )
+        if shuffle_size_override is None:
+            self.shuffle_size = _item_shuffle_size(
+                self.config,
+                self.dataset_type,
+                shuffle_sizes.get(self.dataset_type, 10000),
+            )
+        else:
+            self.shuffle_size = max(1, int(shuffle_size_override))
+        self.expand_at_fill = bool(getattr(config, "expand_conversations_at_fill", False))
 
     def __iter__(self):
         if _stateful_enabled(self.config):
@@ -2206,21 +2379,41 @@ class GenomeDetIterableDataset(IterableDataset):
                         yield out
 
 
-def make_dataset(root, dataset_config, tokenizer, is_train=True, dataset_type="default", data_seed_offset=0):
-    log_for_0(f"Making dataset for {dataset_type} with root {root}")
+def make_dataset(
+    root,
+    dataset_config,
+    tokenizer,
+    is_train=True,
+    dataset_type="default",
+    data_seed_offset=0,
+    shuffle_size_override=None,
+    dataset_name=None,
+):
+    log_prefix = f"{dataset_type}" if dataset_name is None else f"{dataset_type}:{dataset_name}"
+    if isinstance(root, (list, tuple)):
+        root_preview = f"{len(root)} patterns; first={root[0] if root else '<empty>'}"
+    else:
+        root_preview = root
+    log_for_0(f"Making dataset for {log_prefix} with root {root_preview}")
     assert dataset_type in [
-        "default", "laion_aes", "cc12m", "blip3o", "textcaps", "llava15", "llava_ov15", "vqav2", "okvqa", "aokvqa", "ocrvqa", "gqa", "textvqa", "tallyqa", "dvqa", "genome", "genome_gcap", "genome_det", "refcoco", "rendered_text"
+        "default", "laion_aes", "cc12m", "blip3o", "textcaps", "llava15", "llava_ov15", "ai2d", "ureader", "vqav2", "okvqa", "aokvqa", "ocrvqa", "gqa", "textvqa", "tallyqa", "dvqa", "genome", "genome_gcap", "genome_det", "refcoco", "rendered_text"
     ], f"Invalid dataset type: {dataset_type}"
 
-    if dataset_type in ["vqav2", "okvqa", "aokvqa", "ocrvqa", "gqa", "textvqa", "tallyqa", "dvqa", "genome", "refcoco", "llava15", "llava_ov15"]:
+    if dataset_type in ["vqav2", "okvqa", "aokvqa", "ocrvqa", "gqa", "textvqa", "tallyqa", "dvqa", "genome", "refcoco", "llava15", "llava_ov15", "ai2d", "ureader"]:
         ds = VQAv2IterableDataset(
             root,
             dataset_config,
             tokenizer,
             dataset_type=dataset_type,
             data_seed_offset=data_seed_offset,
+            shuffle_size_override=shuffle_size_override,
         )
-        log_for_0(f'VQAv2IterableDataset created.')
+        if shuffle_size_override is None:
+            log_for_0(f'VQAv2IterableDataset created.')
+        else:
+            log_for_0(
+                f'VQAv2IterableDataset created with weighted shuffle_size={int(shuffle_size_override)}.'
+            )
         return ds
 
     if dataset_type == "genome_gcap":
@@ -2406,7 +2599,7 @@ def create_split(config, batch_size, data_seed_offset=0):
 
     log_for_0(f"Creating dataset with data_seed_offset={data_seed_offset}...")
     num_workers = max(1, int(getattr(config.dataset, "num_workers", 1)))
-    total_streams = jax.process_count() * num_workers
+    total_streams = _shuffle_total_streams(config.dataset)
     log_for_0(
         f"Shuffle buffer scaling: total_streams={total_streams} "
         f"(processes={jax.process_count()} x workers={num_workers}), "
@@ -2422,10 +2615,46 @@ def create_split(config, batch_size, data_seed_offset=0):
         f"dataset.types length ({len(types)}) != dataset.root length ({len(roots)}). "
         "Ensure resolve_dataset_roots() was called before create_split()."
     )
-    for root, dataset_type in zip(roots, types):
-        assert "💣" not in root, f"💣 found in dataset path {root}"
+    weights = list(getattr(config.dataset, "mix_weights", []) or [])
+    if not weights:
+        weights = [1.0] * len(roots)
+    assert len(weights) == len(roots) or len(roots) == 1
+    if len(roots) == 1 and len(weights) != 1:
+        weights = [1.0]
+
+    weighted_cfg = getattr(config.dataset, "weighted_item_shuffle_size", None)
+    include_types = []
+    if weighted_cfg is not None and bool(weighted_cfg.get("enabled", True)):
+        include_types = _as_config_list(weighted_cfg.get("include_types", ["llava_ov15"]))
+    eligible_weight_sum = sum(
+        float(weight)
+        for weight, dtype in zip(weights, types)
+        if (not include_types or dtype in include_types) and float(weight) > 0
+    )
+    resolved_names = list(getattr(config.dataset, "resolved_names", []) or [])
+    if len(resolved_names) != len(roots):
+        resolved_names = [None] * len(roots)
+
+    for root, dataset_type, dataset_weight, dataset_name in zip(roots, types, weights, resolved_names):
+        for root_part in _iter_roots(root):
+            assert "💣" not in root_part, f"💣 found in dataset path {root_part}"
         if not dataset_type:
             dataset_type = "default"
+        shuffle_size_override = _weighted_item_shuffle_size_override(
+            config.dataset,
+            dataset_type,
+            float(dataset_weight),
+            eligible_weight_sum,
+        )
+        if shuffle_size_override is not None:
+            log_for_0(
+                "Weighted item shuffle: name=%s type=%s weight=%.6g eligible_weight_sum=%.6g size=%d",
+                dataset_name or "<unnamed>",
+                dataset_type,
+                float(dataset_weight),
+                float(eligible_weight_sum),
+                int(shuffle_size_override),
+            )
         datasets.append(
             make_dataset(
                 root,
@@ -2434,23 +2663,32 @@ def create_split(config, batch_size, data_seed_offset=0):
                 is_train=True,
                 dataset_type=dataset_type,
                 data_seed_offset=data_seed_offset,
+                shuffle_size_override=shuffle_size_override,
+                dataset_name=dataset_name,
             )
         )
     log_for_0("Datasets created.")
-
-    weights = getattr(config.dataset, "mix_weights", [])
-    assert len(weights) == len(roots) or len(roots) == 1
     if len(roots) == 1:
         dataset = datasets[0]
     else:
         if _stateful_enabled(config.dataset):
             dataset = StatefulRandomMix(datasets, weights, data_seed_offset=data_seed_offset)
-            log_for_0(f"StatefulRandomMix dataset created with roots {roots} and weights {weights}.")
+            log_for_0(
+                "StatefulRandomMix dataset created with %d sources, names=%s, weights=%s.",
+                len(roots),
+                resolved_names,
+                weights,
+            )
         elif RandomMix is None:
             raise ImportError("webdataset RandomMix is unavailable in current environment")
         else:
             dataset = RandomMix(datasets, weights)
-            log_for_0(f"RandomMix dataset created with roots {roots} and weights {weights}.")
+            log_for_0(
+                "RandomMix dataset created with %d sources, names=%s, weights=%s.",
+                len(roots),
+                resolved_names,
+                weights,
+            )
 
     dl_kwargs = dict(
         dataset=dataset,

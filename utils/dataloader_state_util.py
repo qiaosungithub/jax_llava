@@ -177,6 +177,13 @@ def _checkpoint_path_for_workdir(workdir: str, step: int) -> str:
     return f"{convert_to_gs(workdir).rstrip('/')}/checkpoint_{int(step)}"
 
 
+def _pending_state_path_for_workdir(workdir: str, step: int) -> str:
+    return (
+        f"{convert_to_gs(workdir).rstrip('/')}/_pending_dataloader_state/"
+        f"checkpoint_{int(step)}/process_{jax.process_index():05d}.pkl"
+    )
+
+
 def _probe_state_path_for_workdir(workdir: str) -> str:
     return (
         f"{convert_to_gs(workdir).rstrip('/')}/_dataloader_state_probe/"
@@ -226,15 +233,34 @@ def validate_dataloader_state_save(train_loader, config, workdir, batch_size):
             tf.io.gfile.remove(state_path)
 
 
-def save_dataloader_state(train_loader, config, workdir, step, batch_size):
+def save_dataloader_state(train_loader, config, workdir, step, batch_size, *, pending=False):
     if not stateful_dataloader_enabled(config):
-        return
+        return None
 
-    checkpoint_path = _checkpoint_path_for_workdir(workdir, step)
-    state_path = _state_path_from_checkpoint(checkpoint_path)
+    state_path = (
+        _pending_state_path_for_workdir(workdir, step)
+        if pending
+        else _state_path_from_checkpoint(_checkpoint_path_for_workdir(workdir, step))
+    )
     payload = _dataloader_state_payload(train_loader, config, step, batch_size)
     _write_dataloader_state_file(state_path, payload)
-    log_for_0("Dataloader state saved to %s.", state_path)
+    log_for_0("Dataloader state written at %s.", state_path)
+    return state_path
+
+
+def finalize_pending_dataloader_state(config, workdir, step):
+    if not stateful_dataloader_enabled(config):
+        return None
+
+    pending_path = _pending_state_path_for_workdir(workdir, step)
+    final_path = _state_path_from_checkpoint(_checkpoint_path_for_workdir(workdir, step))
+    if not tf.io.gfile.exists(pending_path):
+        raise FileNotFoundError(f"Pending dataloader state missing: {pending_path}")
+
+    tf.io.gfile.makedirs(final_path.rsplit("/", 1)[0])
+    tf.io.gfile.rename(pending_path, final_path, overwrite=True)
+    log_for_0("Dataloader state finalized to %s.", final_path)
+    return final_path
 
 
 def restore_dataloader_state(train_loader, config, load_from, zone, expected_step, batch_size):

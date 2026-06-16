@@ -1,4 +1,5 @@
 import jax
+import jax.experimental.multihost_utils as mu
 from flax.training import checkpoints
 from utils.logging_util import log_for_0, print0, Emoji
 import os
@@ -191,20 +192,32 @@ def save_checkpoint(state, workdir, *, log_completion=True):
     Saves the model state to a checkpoint in the specified working directory.
     """
     assert not workdir.startswith('gs://'), f'workdir {workdir} must not start with gs://'
-    # Save a host tree, matching the text-jit HSDP path. This avoids baking a
-    # TPU topology-specific sharding into checkpoints that may later be resumed
-    # on a different v5p/v6e layout. save_checkpoint_multiprocess must still be
-    # called by every JAX host; otherwise its internal barriers get out of sync
-    # with the training loop's explicit checkpoint barrier.
-    state = jax.tree.map(lambda x: jax.device_get(x), state)
-    step = int(state.step)
-    print0(f'{Emoji.ROCKET} Saving checkpoint at step {step} ...')
+    step = int(jax.device_get(state.step))
     gs_path = convert_to_gs(workdir)
+    print0(f'{Emoji.ROCKET} Saving checkpoint at step {step} ...')
     with _orbax_set_mesh_context_compat():
-        checkpoints.save_checkpoint_multiprocess(gs_path, state, step, keep=3)
+        _save_sharded_checkpoint_all_processes(gs_path, state, step, keep=3)
     if log_completion:
         print0(f'{Emoji.GOOD} Checkpoint at step {step} saved to {gs_path}.')
     return step, gs_path
+
+
+def _save_sharded_checkpoint_all_processes(gs_path, state, step, keep):
+    """Writes a sharded Orbax checkpoint without all-gathering the TrainState."""
+    gs_path = gs_path.rstrip('/')
+    ckpt_path = f'{gs_path}/checkpoint_{step}'
+    if jax.process_index() == 0:
+        checkpoints._remove_invalid_ckpts(  # pylint: disable=protected-access
+            ckpt_path,
+            f'{gs_path}/checkpoint_',
+            keep,
+            False,
+            None,
+            True,
+        )
+    mu.sync_global_devices(f'checkpoint_prune_{step}')
+    checkpointer = ocp.Checkpointer(ocp.PyTreeCheckpointHandler())
+    checkpointer.save(ckpt_path, state)
 
 
 @contextlib.contextmanager

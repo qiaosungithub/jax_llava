@@ -1,4 +1,10 @@
 import os
+import sys
+
+
+SHARED_CODE_ROOT = "/kmh-nfs-ssd-us-mount/code/hanhong/shared"
+if os.path.isdir(SHARED_CODE_ROOT) and SHARED_CODE_ROOT not in sys.path:
+    sys.path.insert(0, SHARED_CODE_ROOT)
 
 
 def get_available_bytes():
@@ -57,10 +63,68 @@ config_flags.DEFINE_config_file(
     lock_config=True,
 )
 
+
+_ENV_CONFIG_OVERRIDES = {
+    "load_from": ("LOAD_FROM", "load_from", "CONFIG_LOAD_FROM"),
+    "wandb_resume_id": (
+        "WANDB_RESUME_ID",
+        "wandb_resume_id",
+        "CONFIG_WANDB_RESUME_ID",
+    ),
+}
+
+
+def _normalize_env_config_value(value):
+    value = str(value).strip()
+    if value.lower() in ("none", "null"):
+        return ""
+    return value
+
+
+def _read_env_config_value(names):
+    found = []
+    for name in names:
+        if name in os.environ:
+            found.append((name, _normalize_env_config_value(os.environ[name])))
+    if not found:
+        return None
+    first_name, first_value = found[0]
+    for name, value in found[1:]:
+        if value != first_value:
+            raise ValueError(
+                f"Conflicting environment overrides: {first_name}={first_value!r} "
+                f"but {name}={value!r}"
+            )
+    return first_name, first_value
+
+
+def _apply_env_config_overrides(config):
+    updates = []
+    with config.unlocked():
+        for key, names in _ENV_CONFIG_OVERRIDES.items():
+            env_value = _read_env_config_value(names)
+            if env_value is None:
+                continue
+            env_name, value = env_value
+            current = _normalize_env_config_value(getattr(config, key, ""))
+            if current and current != value:
+                raise ValueError(
+                    f"Conflicting {key}: config has {current!r}, "
+                    f"but environment {env_name}={value!r}"
+                )
+            if current != value:
+                config[key] = value
+                updates.append((key, env_name, value))
+    for key, env_name, value in updates:
+        shown_value = value if key != "wandb_resume_id" else (value or "<empty>")
+        log_for_0("Applied config.%s from environment %s=%r", key, env_name, shown_value)
+
+
 def main(argv):
   if len(argv) > 1:
     raise app.UsageError('Too many command-line arguments.')
 
+  _apply_env_config_overrides(FLAGS.config)
   log_for_0('JAX process: %d / %d', jax.process_index(), jax.process_count())
   log_for_0('JAX local devices: %r', jax.local_devices())
   log_for_0('FLAGS.config: \n{}'.format(FLAGS.config))

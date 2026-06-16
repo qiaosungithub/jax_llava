@@ -68,7 +68,9 @@ sudo rsync -a . "${STAGEDIR}" \
     --exclude=datasets \
     --exclude=datasets_sqa \
     --exclude=dataset_wzh \
-    --exclude=dataset_new
+    --exclude=dataset_new \
+    --exclude=big_vision \
+    --exclude=gemma
 sudo chmod 777 -R "${STAGEDIR}"
 
 sudo mkdir -p "${LOCAL_LOGDIR}" "${WORKDIR}"
@@ -99,6 +101,7 @@ echo 'Current dir:'
 pwd
 export GOOGLE_APPLICATION_CREDENTIALS=/kmh-nfs-ssd-us-mount/code/qiao/${CRED_ZONE}.json
 export PYTHONUNBUFFERED=1
+export PYTHONPATH=/kmh-nfs-ssd-us-mount/code/hanhong/shared:\${PYTHONPATH:-}
 export WANDB_MODE=disabled
 export HF_HOME=/dev/shm/huggingface
 export TRANSFORMERS_CACHE=/dev/shm/huggingface

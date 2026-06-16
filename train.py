@@ -33,6 +33,7 @@ from utils.ckpt_util import (
 )
 from utils.data_util import resolve_dataset_roots
 from utils.dataloader_state_util import (
+    finalize_pending_dataloader_state,
     restore_dataloader_state,
     save_dataloader_state,
     stateful_dataloader_enabled,
@@ -326,13 +327,14 @@ def _create_train_iterator(
         local_batch_size,
         data_seed_offset=data_seed_offset,
     )
+    restored_dataloader_state = False
     if stateful_dataloader_enabled(config) and load_from and int(step_offset) > 0:
         expected_state_step = (
             int(checkpoint_step_for_state)
             if checkpoint_step_for_state is not None
             else int(step_offset)
         )
-        restore_dataloader_state(
+        restored_dataloader_state = restore_dataloader_state(
             train_loader,
             config,
             load_from,
@@ -340,17 +342,22 @@ def _create_train_iterator(
             expected_state_step,
             local_batch_size,
         )
-    validate_dataloader_state_save(train_loader, config, workdir, local_batch_size)
+    # The startup probe is only a capability check. After exact resume it
+    # serializes the already-restored large loader state again and can stall
+    # before model checkpoint restore, so skip it on successful restore.
+    if not restored_dataloader_state:
+        validate_dataloader_state_save(train_loader, config, workdir, local_batch_size)
     return train_loader, iter(train_loader), tokenizer
 
 
 def _save_training_checkpoint(state, train_loader, config, workdir, step, local_batch_size):
-    # Orbax owns checkpoint_N creation, so write model files before placing
-    # dataloader sidecars under checkpoint_N/dataloader_state. Keep the final
-    # "saved to" log after sidecars are durable; the monitor treats that line as
-    # the completed-resume-point marker.
+    # Serialize the dataloader first, then publish it under checkpoint_N only
+    # after Orbax finishes. Writing the pending copy outside checkpoint_N avoids
+    # pre-creating Orbax's target directory.
+    save_dataloader_state(train_loader, config, workdir, step, local_batch_size, pending=True)
+    mu.sync_global_devices(f'pending_dataloader_state_{int(step)}')
     ckpt_step, ckpt_path = save_checkpoint(state, workdir, log_completion=False)
-    save_dataloader_state(train_loader, config, workdir, step, local_batch_size)
+    finalize_pending_dataloader_state(config, workdir, step)
     mu.sync_global_devices(f'dataloader_state_{int(step)}')
     log_for_0('Checkpoint at step %d saved to %s.', ckpt_step, ckpt_path)
 
@@ -944,16 +951,14 @@ def _run_train_phase(
         ):
             with timer.skip():
                 log_for_0(f'[{stage_name}] Saving checkpoint at global step {step + 1}...')
-                host_state = mu.process_allgather(state, tiled=True)
                 _save_training_checkpoint(
-                    host_state,
+                    state,
                     train_loader,
                     config,
                     workdir,
                     step + 1,
                     local_batch_size,
                 )
-                del host_state
                 mu.sync_global_devices('ckpt')
 
         online_eval_per_step = int(config.training.get('online_eval_per_step', -1))

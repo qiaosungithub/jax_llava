@@ -20,6 +20,9 @@ def get_config():
     dataset.root  = ['/kmh-nfs-ssd-us-mount/data/imagenet']
     # Populated automatically by resolve_dataset_roots(); do not set manually.
     dataset.types = []
+    # Auto-populated by resolve_dataset_roots() (the OV1.5 grouped expansion
+    # needs per-source names). Predeclared so it can be set on a LOCKED config.
+    dataset.resolved_names = []
     dataset.mix_weights = []
 
     dataset.num_workers = 8
@@ -39,6 +42,44 @@ def get_config():
     dataset.item_shuffle_size = ml_collections.ConfigDict()
     dataset.item_shuffle_size.default = 512
     dataset.item_shuffle_size.llava_ov15 = 50000
+    # Optional per-child shuffle allocation for expanded mixtures. Disabled by
+    # default; configs can enable it for LLaVA-OV1.5 grouped SFT.
+    dataset.weighted_item_shuffle_size = ml_collections.ConfigDict()
+    dataset.weighted_item_shuffle_size.enabled = False
+    dataset.weighted_item_shuffle_size.total = 65536
+    dataset.weighted_item_shuffle_size.min = 512
+    dataset.weighted_item_shuffle_size.max = None
+    dataset.weighted_item_shuffle_size.include_types = ["llava_ov15"]
+    # LLaVA-OV1.5 grouped mixture granularity. None/0 keeps the coarse 13
+    # task-family groups. A positive value splits each group into per-config
+    # StatefulRandomMix sources (each config with >= this many shards becomes its
+    # own fixed-weight source; smaller configs merge into a per-group tail),
+    # which makes the config mixture stationary and removes the valid-token
+    # window-mean drift. Weights split each group's weight proportional to
+    # per-config shard count, preserving the group-level mixture.
+    dataset.llava_ov15_min_shards_standalone = None
+    # When True, expand multi-turn conversations at shuffle-buffer fill time so
+    # each QA turn is an independent buffer element (stationary turn distribution,
+    # no slow-draining pending slot). Pairs with the finer-grained mixture above.
+    dataset.expand_conversations_at_fill = False
+    # Base for the per-config OV1.5 mixture weight:
+    #   'samples'   -> per-config image count (reproduces the image-proportional
+    #                  13-group mixture; default).
+    #   'questions' -> per-config emitted QA-pair count (images x avg turns); this
+    #                  matches the natural distribution of a uniform image read +
+    #                  conversation expansion.
+    #   'shards'    -> tar-shard count (image proxy, no count tables needed).
+    dataset.llava_ov15_weight_basis = "samples"
+    # Optional per-group / per-config weight MULTIPLIERS (default 1.0 each). Keys
+    # are group names (e.g. 'ocr_text_reading') / config names (e.g. 'coco').
+    # Final per-source weight = base-count-in-millions x group_mult x config_mult
+    # x the OV1.5 item weight (an overall multiplier, default 1.0). NOT normalised:
+    # OV1.5's total share emerges from the data. Dynamic keys; filled from yaml.
+    dataset.llava_ov15_group_weights = ml_collections.ConfigDict()
+    dataset.llava_ov15_config_weights = ml_collections.ConfigDict()
+    # Debug-only override for loader audits that run in a single Python process
+    # but want to simulate multi-host stream-count shuffle scaling.
+    dataset.shuffle_total_streams_override = None
     # 0 means use all Visual Genome region annotations for genome_det.
     # LLaVA-1.5-style SFT configs override this to 10.
     dataset.genome_det_regions_per_image = 0
@@ -161,6 +202,11 @@ def get_config():
     model.attn_logits_soft_cap = 0.0   # 0.0 = disabled; e.g. 50.0 for Gemma2-style
     model.final_logit_softcap = 0.0    # 0.0 = disabled; e.g. 30.0 for Gemma2-style
     model.txt_feature_layer = 0 # 0: disabled
+    # CFG training. Defaults keep the standard image-conditioned NTP objective.
+    model.vlm_loss_weight = 1.0
+    model.text_only_loss_weight = 0.0
+    model.cfg_loss_weight = 0.0
+    model.alpha = 0.0
     # None means auto: when txt_feature_layer > 0 and the prefix text LM blocks
     # are frozen, treat their outputs as fixed features to avoid useless HSDP
     # backward compute. Set False if you intentionally train through that path.

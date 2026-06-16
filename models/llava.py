@@ -136,6 +136,11 @@ class LlavaGemma(nn.Module):
     image_size: int = 336
     recon_loss_weight: float = 0.0
     txt_feature_layer: int = 0
+    # CFG-style training losses. Defaults keep existing LLaVA behavior unchanged.
+    vlm_loss_weight: float = 1.0
+    text_only_loss_weight: float = 0.0
+    cfg_loss_weight: float = 0.0
+    alpha: float = 0.0
     # If the first txt_feature_layer LM blocks are frozen, their text-only
     # output should usually be treated as a fixed feature. Otherwise JAX still
     # builds a backward pass through those frozen blocks for no trainable
@@ -475,17 +480,78 @@ class LlavaGemma(nn.Module):
             return {"logits": logits, "cache": new_cache}
 
         assert cache is None
+        embedding_table = self.lm_backbone.embedder.input_embedding_table
+
+        # CFG-style text-only branch.  This mirrors PaliGemmaEncDec, but computes
+        # losses from hidden states in vocab chunks so HSDP does not materialize
+        # full (B, T, vocab) logits for the extra branch.
+        if (
+            images is not None
+            and K > 0
+            and self.alpha > 0.0
+            and (self.text_only_loss_weight > 0.0 or self.cfg_loss_weight > 0.0)
+        ):
+            text_embeds = token_embeds[:, K:, :]
+            T_text = text_embeds.shape[1]
+            text_positions = jnp.broadcast_to(
+                jnp.arange(T_text, dtype=jnp.int32)[None, :],
+                (B, T_text),
+            )
+            text_attn_mask = self.make_causal_with_prefix_block(
+                T_text,
+                jnp.asarray(prefix_len, dtype=jnp.int32),
+                image_prefix=0,
+            )
+            text_out, _ = self._apply_lm_from_layer(
+                text_embeds,
+                text_positions,
+                text_attn_mask,
+                None,
+                self.txt_feature_layer,
+            )
+            text_out = constrain_batch_model(text_out)
+
+            if self.text_only_loss_weight > 0.0:
+                loss_text_only, _ = token_xent_loss_from_hidden(
+                    text_out,
+                    embedding_table,
+                    labels,
+                    final_logit_softcap=self.final_logit_softcap,
+                    chunk_size=int(self.token_loss_chunk_size),
+                )
+            else:
+                loss_text_only = jnp.zeros(())
+
+            if self.cfg_loss_weight > 0.0:
+                loss_cfg, _ = token_xent_loss_from_hidden(
+                    out[:, K:, :],
+                    embedding_table,
+                    labels,
+                    final_logit_softcap=self.final_logit_softcap,
+                    chunk_size=int(self.token_loss_chunk_size),
+                    subtract_hidden=text_out,
+                    subtract_alpha=self.alpha,
+                )
+            else:
+                loss_cfg = jnp.zeros(())
+
+            log_dict["loss_text_only"] = loss_text_only
+            log_dict["loss_cfg"] = loss_cfg
+        else:
+            loss_text_only = jnp.zeros(())
+            loss_cfg = jnp.zeros(())
+
         lm_hidden = out[:, K:, :] if K > 0 else out
         if self._token_loss_mode() == "full_decode":
             logits = self.lm_backbone.embedder.decode(lm_hidden)
             if self.final_logit_softcap != 0.0:
                 logits = jnp.tanh(logits / self.final_logit_softcap) * self.final_logit_softcap
-            loss = token_xent_loss(logits, labels)
+            loss_vlm = token_xent_loss(logits, labels)
             pred_ids = jnp.argmax(logits, axis=-1)
         else:
-            loss, pred_ids = token_xent_loss_from_hidden(
+            loss_vlm, pred_ids = token_xent_loss_from_hidden(
                 lm_hidden,
-                self.lm_backbone.embedder.input_embedding_table,
+                embedding_table,
                 labels,
                 final_logit_softcap=self.final_logit_softcap,
                 chunk_size=int(self.token_loss_chunk_size),
@@ -497,11 +563,16 @@ class LlavaGemma(nn.Module):
             jnp.sum((pred_ids == labels) * valid)
             / jnp.maximum(valid_count, 1)
         )
-        log_dict["loss_vlm"] = loss
+        log_dict["loss_vlm"] = loss_vlm
         log_dict["acc"] = acc
         log_dict["valid_tokens"] = valid_count.astype(jnp.float32)
         log_dict["valid_tokens_per_sample"] = (
             valid_count.astype(jnp.float32) / jnp.maximum(B, 1)
+        )
+        loss_total = (
+            self.vlm_loss_weight * loss_vlm
+            + self.text_only_loss_weight * loss_text_only
+            + self.cfg_loss_weight * loss_cfg
         )
 
         debug = {
@@ -510,7 +581,7 @@ class LlavaGemma(nn.Module):
             "preds": pred_ids,
             "input_ids": input_ids,
         }
-        return loss, log_dict, debug
+        return loss_total, log_dict, debug
 
     def generate(
         self,

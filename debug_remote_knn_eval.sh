@@ -98,7 +98,9 @@ sudo rsync -a . "${STAGEDIR}" \
     --exclude=datasets \
     --exclude=datasets_sqa \
     --exclude=dataset_wzh \
-    --exclude=dataset_new
+    --exclude=dataset_new \
+    --exclude=big_vision \
+    --exclude=gemma
 sudo chmod 777 -R "${STAGEDIR}"
 
 sudo mkdir -p "${LOGDIR}"
@@ -109,6 +111,7 @@ sudo chmod 777 "${REMOTE_LOG_ROOT}" "${REMOTE_WORKDIR}"
 ZONE_SHORT="${ZONE::-2}"
 REMOTE_ENV="export GOOGLE_APPLICATION_CREDENTIALS=/kmh-nfs-ssd-us-mount/code/qiao/${ZONE_SHORT}.json
 export PYTHONUNBUFFERED=1
+export PYTHONPATH=/kmh-nfs-ssd-us-mount/code/hanhong/shared:\${PYTHONPATH:-}
 export WANDB_MODE=${WANDB_MODE:-disabled}
 export KNN_IMAGES_PER_CLASS=${KNN_IMAGES_PER_CLASS:-32}
 export KNN_VAL_EXAMPLES=${KNN_VAL_EXAMPLES:-2048}

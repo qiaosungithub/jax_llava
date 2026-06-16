@@ -148,48 +148,76 @@ class Writer:
         self.use_wandb = use_wandb
         self.use_tb = use_tb
         self.workdir = workdir
+        self.wandb = None
+        self._wandb_error_count = 0
         if use_wandb:
             import wandb
+            self.wandb = wandb
             kwargs = {}
             wandb_resume_id = getattr(config, 'wandb_resume_id', '')
             if wandb_resume_id:
                 kwargs['id'] = wandb_resume_id
                 kwargs['resume'] = 'must'
-            wandb.init(
-                project=config.logging.wandb_project + '_eval' * config.eval_only,
-                entity=config.logging.wandb_entity if config.logging.wandb_entity else None,
-                notes=config.logging.wandb_notes if config.logging.wandb_notes else None,
-                tags=config.logging.wandb_tags if config.logging.wandb_tags else None,
-                dir='/tmp', # avoid writing to workdir
-                settings=wandb.Settings(_service_wait=60),
-                **kwargs
-            )
-            wandb.config.update(config.to_dict(), allow_val_change=True)
             try:
-                ka = re.search(
-                    r"kmh-tpuvm-v[23456e]+-(\d+)(-preemptible)?(-spot)?-.*yang-(\d+)", workdir
-                ).group()
-            except AttributeError:
-                ka = ' ' * 10 + 'Failed to parse VM'
-            ka = ka[10:] # remove "kmh-tpuvm-"
-            wandb.config.update({'ka': ka})
-            
-            self.wandb = wandb
-
-            # Save wandb run id so resume scripts can continue the same run.
-            try:
-                os.makedirs(workdir, exist_ok=True)
-                wandb_id_path = os.path.join(workdir, 'wandb_run_id.txt')
-                with open(wandb_id_path, 'w') as f:
-                    f.write(self.wandb.run.id)
-                log_for_0(f'Saved wandb run id {self.wandb.run.id} to {wandb_id_path}')
+                wandb.init(
+                    project=config.logging.wandb_project + '_eval' * config.eval_only,
+                    entity=config.logging.wandb_entity if config.logging.wandb_entity else None,
+                    notes=config.logging.wandb_notes if config.logging.wandb_notes else None,
+                    tags=config.logging.wandb_tags if config.logging.wandb_tags else None,
+                    dir='/tmp', # avoid writing to workdir
+                    settings=wandb.Settings(_service_wait=60),
+                    **kwargs
+                )
             except Exception as e:
-                log_for_0(f'[WARNING] Failed to save wandb run id: {e}')
-            
+                self.use_wandb = False
+                self._log_wandb_failure('init', e)
+            if self.use_wandb:
+                self._safe_wandb_call(
+                    'config.update(full_config)',
+                    lambda: wandb.config.update(config.to_dict(), allow_val_change=True),
+                )
+                try:
+                    ka = re.search(
+                        r"kmh-tpuvm-v[23456e]+-(\d+)(-preemptible)?(-spot)?-.*yang-(\d+)", workdir
+                    ).group()
+                except AttributeError:
+                    ka = ' ' * 10 + 'Failed to parse VM'
+                ka = ka[10:] # remove "kmh-tpuvm-"
+                self._safe_wandb_call(
+                    'config.update(ka)',
+                    lambda: wandb.config.update({'ka': ka}),
+                )
+
+                # Save wandb run id so resume scripts can continue the same run.
+                try:
+                    os.makedirs(workdir, exist_ok=True)
+                    wandb_id_path = os.path.join(workdir, 'wandb_run_id.txt')
+                    with open(wandb_id_path, 'w') as f:
+                        f.write(self.wandb.run.id)
+                    log_for_0(f'Saved wandb run id {self.wandb.run.id} to {wandb_id_path}')
+                except Exception as e:
+                    log_for_0(f'[WARNING] Failed to save wandb run id: {e}')
+
         if use_tb:
             raise ValueError("use_tb is not supported")
             from clu import metric_writers
             self.writer = metric_writers.create_default_writer(logdir=workdir, just_logging=False)
+
+    def _log_wandb_failure(self, action, error):
+        self._wandb_error_count += 1
+        if self._wandb_error_count <= 20 or self._wandb_error_count % 100 == 0:
+            log_for_0(
+                f"[WARNING] wandb {action} failed; training will continue. "
+                f"{type(error).__name__}: {error}"
+            )
+
+    def _safe_wandb_call(self, action, fn):
+        try:
+            fn()
+            return True
+        except Exception as e:
+            self._log_wandb_failure(action, e)
+            return False
             
     def write_scalars(self, step, scalar_dict):
         # [200] ep=0.159073, steps_per_second=6.76798, train_accuracy=0.00585938, train_loss=6.71379, train_lr=0.0127258, train_step=199
@@ -201,7 +229,10 @@ class Writer:
         log_str = log_str.strip(",")
         logging.info(log_str)
         if self.use_wandb:
-            self.wandb.log(scalar_dict, step=step)
+            self._safe_wandb_call(
+                f'log scalars at step {step}',
+                lambda: self.wandb.log(scalar_dict, step=step),
+            )
         if self.use_tb:
             self.writer.write_scalars(step, scalar_dict)
             
@@ -222,15 +253,19 @@ class Writer:
                 v = v.transpose((1, 2, 0))
             return Image.fromarray(v)
 
+        wandb_ok = False
         if self.use_wandb:
-            self.wandb.log({
-                k: self.wandb.Image(reduce_arr_func(v)) for k, v in image_dict.items()
-            }, step=step)
+            wandb_ok = self._safe_wandb_call(
+                f'log images at step {step}',
+                lambda: self.wandb.log({
+                    k: self.wandb.Image(reduce_arr_func(v)) for k, v in image_dict.items()
+                }, step=step),
+            )
         if self.use_tb:
             self.writer.write_images(step, {
                 k: np.asarray(reduce_arr_func(v)) for k, v in image_dict.items()
             })
-        if not self.use_wandb and not self.use_tb:
+        if (not self.use_wandb or not wandb_ok) and not self.use_tb:
             log_for_0(f"[NOTE] Saving images locally, at step {step}")
             for k, v in image_dict.items():
                 v = reduce_arr_func(v)
@@ -241,14 +276,16 @@ class Writer:
         if jax.process_index() != 0:
             return
         if self.use_wandb:
-            text_table = self.wandb.Table(columns=[text_key])
-            for text in text_list:
-                text_table.add_data(text)
-            self.wandb.log({text_key: text_table}, step=step)
-        else:
-            log_for_0(f"[NOTE] {text_key} at step {step}:")
-            for text in text_list:
-                log_for_0(text)
+            def log_text_table():
+                text_table = self.wandb.Table(columns=[text_key])
+                for text in text_list:
+                    text_table.add_data(text)
+                self.wandb.log({text_key: text_table}, step=step)
+            if self._safe_wandb_call(f'log text table {text_key} at step {step}', log_text_table):
+                return
+        log_for_0(f"[NOTE] {text_key} at step {step}:")
+        for text in text_list:
+            log_for_0(text)
 
     def flush(self):
         if jax.process_index() != 0:
@@ -260,7 +297,7 @@ class Writer:
         if jax.process_index() != 0:
             return
         if self.use_wandb:
-            self.wandb.finish()
+            self._safe_wandb_call('finish', lambda: self.wandb.finish())
             shutil.rmtree('/tmp/wandb', ignore_errors=True)
         if self.use_tb:
             self.writer.flush()

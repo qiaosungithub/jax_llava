@@ -1,6 +1,41 @@
 
+from utils.llava_ov15_groups import (
+    LLAVA_OV15_GROUP_ALIAS,
+    LLAVA_OV15_GROUP_ALIASES,
+    LLAVA_OV15_GROUP_ALIAS_SHORT,
+    LLAVA_OV15_GROUP_TOTAL_WEIGHT,
+    llava_ov15_group_roots,
+    llava_ov15_finegrained_roots,
+)
+
+_LLAVA_OV15_CONFIG_ROOT = 'gs://kmh-gcp-💣/data/llava-ov-1.5-instruct/configs'
+_UREADER_CONFIGS = (
+    'ureader_tr',
+    'ureader_ocr',
+    'ureader_qa',
+    'ureader_chart',
+    'ureader_cap',
+    'ureader_ie',
+    'ureader_kg',
+)
+
+_ZONE_LOCKED_DATASETS = {
+    'laion-400m': 'asia-northeast1-b',
+}
+
+
+def _assert_zone_allowed(name, zone: str):
+    locked_zone = _ZONE_LOCKED_DATASETS.get(name)
+    if locked_zone is None and isinstance(name, str) and '/data/laion-400m/' in name:
+        locked_zone = _ZONE_LOCKED_DATASETS['laion-400m']
+    assert locked_zone is None or zone == locked_zone, (
+        f'{name} is only available in {locked_zone}; got zone={zone}'
+    )
+
+
 dataset_name_to_path_dict = {
     'laion-aes':         'gs://kmh-gcp-💣/data/laion-aesthetic/part-{00000..00127}-cad4a140-cebd-46fa-b874-e8968f93e32e-c000.snappy/{00000..00040}.tar',
+    'laion-400m':        'gs://kmh-gcp-asia-northeast1-b/data/laion-400m/part-{00000..00127}/{00000..00282}.tar',
     'cc12m':             'gs://kmh-gcp-💣/data/cc12m/{00000..01096}.tar',
     # NOTE: shards 00842.tar and 01812.tar are missing from the upstream
     # HuggingFace dataset (and therefore from our mirrors). Use webdataset's
@@ -29,6 +64,8 @@ dataset_name_to_path_dict = {
     'ocrvqa-train':      'gs://kmh-gcp-💣/data/ocrvqa/train/shard-{000000..000083}.tar',
     'refcoco':           'gs://kmh-gcp-💣/data/refcoco/train/shard-{000000..000008}.tar',
     'refcoco-train':     'gs://kmh-gcp-💣/data/refcoco/train/shard-{000000..000008}.tar',
+    'refcocog':          'gs://kmh-gcp-💣/data/refcocog/image_records_wds/train/shard-*.tar',
+    'refcocog-train':    'gs://kmh-gcp-💣/data/refcocog/image_records_wds/train/shard-*.tar',
     'gqa':               'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/gqa-balanced/train/shard-{000000..000036}.tar',
     'gqa-train':         'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/gqa-balanced/train/shard-{000000..000036}.tar',
     'gqa-val':           'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/gqa-balanced/val/shard-{000000..000005}.tar',
@@ -50,16 +87,35 @@ dataset_name_to_path_dict = {
     'dvqa-val-easy':     'gs://kmh-gcp-💣/data/dvqa/wds/val_easy/shard-{000000..000024}.tar',
     'dvqa-val-hard':     'gs://kmh-gcp-💣/data/dvqa/wds/val_hard/shard-{000000..000024}.tar',
     'llava-1.5':         'gs://kmh-gcp-💣/data/llava-v1-5-mix665k/shards/llava_v1_5_mix665k-{000000..000003}.tar',
-    'llava-ov-1.5-instruct': 'gs://kmh-gcp-💣/data/llava-ov-1.5-instruct/configs/*/shard-*.tar',
-    'llava-ov1.5':       'gs://kmh-gcp-💣/data/llava-ov-1.5-instruct/configs/*/shard-*.tar',
+    'llava-ov-1.5-instruct': f'{_LLAVA_OV15_CONFIG_ROOT}/*/shard-*.tar',
+    'llava-ov1.5':       f'{_LLAVA_OV15_CONFIG_ROOT}/*/shard-*.tar',
     'llava-ov-1.5-instruct-image-shuffled-v1': 'gs://kmh-gcp-💣/data/llava-ov-1.5-instruct-image-shuffled-v1/part-*/shard-*.tar',
     'llava-ov-1.5-instruct-image-shuffled-v1-pilot': 'gs://kmh-gcp-💣/data/llava-ov-1.5-instruct-image-shuffled-v1-pilot/shard-*.tar',
+    'ai2d':              f'{_LLAVA_OV15_CONFIG_ROOT}/ai2d/shard-*.tar',
+    'ai2d-train':        f'{_LLAVA_OV15_CONFIG_ROOT}/ai2d/shard-*.tar',
+    'ureader':           [f'{_LLAVA_OV15_CONFIG_ROOT}/{name}/shard-*.tar' for name in _UREADER_CONFIGS],
+    'ureader-tr':        f'{_LLAVA_OV15_CONFIG_ROOT}/ureader_tr/shard-*.tar',
+    'ureader-train':     f'{_LLAVA_OV15_CONFIG_ROOT}/ureader_tr/shard-*.tar',
+    'ureader-ocr':       f'{_LLAVA_OV15_CONFIG_ROOT}/ureader_ocr/shard-*.tar',
+    'ureader-qa':        f'{_LLAVA_OV15_CONFIG_ROOT}/ureader_qa/shard-*.tar',
+    'ureader-chart':     f'{_LLAVA_OV15_CONFIG_ROOT}/ureader_chart/shard-*.tar',
+    'ureader-cap':       f'{_LLAVA_OV15_CONFIG_ROOT}/ureader_cap/shard-*.tar',
+    'ureader-ie':        f'{_LLAVA_OV15_CONFIG_ROOT}/ureader_ie/shard-*.tar',
+    'ureader-kg':        f'{_LLAVA_OV15_CONFIG_ROOT}/ureader_kg/shard-*.tar',
+    'ureader_tr':        f'{_LLAVA_OV15_CONFIG_ROOT}/ureader_tr/shard-*.tar',
+    'ureader_ocr':       f'{_LLAVA_OV15_CONFIG_ROOT}/ureader_ocr/shard-*.tar',
+    'ureader_qa':        f'{_LLAVA_OV15_CONFIG_ROOT}/ureader_qa/shard-*.tar',
+    'ureader_chart':     f'{_LLAVA_OV15_CONFIG_ROOT}/ureader_chart/shard-*.tar',
+    'ureader_cap':       f'{_LLAVA_OV15_CONFIG_ROOT}/ureader_cap/shard-*.tar',
+    'ureader_ie':        f'{_LLAVA_OV15_CONFIG_ROOT}/ureader_ie/shard-*.tar',
+    'ureader_kg':        f'{_LLAVA_OV15_CONFIG_ROOT}/ureader_kg/shard-*.tar',
 }
 
 # Default dataset_type for each named dataset.
 # Used by resolve_dataset_roots when no explicit 'type' is given in an item.
 dataset_name_to_type_dict = {
     'laion-aes':         'laion_aes',
+    'laion-400m':        'laion_aes',
     'cc12m':             'cc12m',
     'blip3o-short':      'blip3o',
     'textcaps-train':    'textcaps',
@@ -77,6 +133,8 @@ dataset_name_to_type_dict = {
     'ocrvqa-train':      'ocrvqa',
     'refcoco':           'refcoco',
     'refcoco-train':     'refcoco',
+    'refcocog':          'refcoco',
+    'refcocog-train':    'refcoco',
     'gqa':               'gqa',
     'gqa-train':         'gqa',
     'gqa-val':           'gqa',
@@ -98,6 +156,26 @@ dataset_name_to_type_dict = {
     'llava-ov1.5':       'llava_ov15',
     'llava-ov-1.5-instruct-image-shuffled-v1': 'llava_ov15',
     'llava-ov-1.5-instruct-image-shuffled-v1-pilot': 'llava_ov15',
+    LLAVA_OV15_GROUP_ALIAS: 'llava_ov15',
+    LLAVA_OV15_GROUP_ALIAS_SHORT: 'llava_ov15',
+    'ai2d':              'ai2d',
+    'ai2d-train':        'ai2d',
+    'ureader':           'ureader',
+    'ureader-tr':        'ureader',
+    'ureader-train':     'ureader',
+    'ureader-ocr':       'ureader',
+    'ureader-qa':        'ureader',
+    'ureader-chart':     'ureader',
+    'ureader-cap':       'ureader',
+    'ureader-ie':        'ureader',
+    'ureader-kg':        'ureader',
+    'ureader_tr':        'ureader',
+    'ureader_ocr':       'ureader',
+    'ureader_qa':        'ureader',
+    'ureader_chart':     'ureader',
+    'ureader_cap':       'ureader',
+    'ureader_ie':        'ureader',
+    'ureader_kg':        'ureader',
 }
 
 
@@ -105,11 +183,75 @@ def _resolve_one(name, zone: str):
     """Resolve a single dataset name or raw GCS path to a full path."""
     if isinstance(name, (list, tuple)):
         return [_resolve_one(item, zone) for item in name]
+    _assert_zone_allowed(name, zone)
     if name in dataset_name_to_path_dict:
         return _resolve_one(dataset_name_to_path_dict[name], zone)
     if '💣' in name:
         return name.replace('💣', zone)
     return name
+
+
+def _item_name_and_type(item):
+    if hasattr(item, 'get') and not isinstance(item, str):
+        name = item.get('name', '')
+        dtype = item.get('type', dataset_name_to_type_dict.get(name, ''))
+    else:
+        name = str(item)
+        dtype = dataset_name_to_type_dict.get(name, '')
+    return name, dtype
+
+
+def _item_weight(item, raw_weights, item_index):
+    if (
+        hasattr(item, 'get')
+        and not isinstance(item, str)
+        and item.get('weight', None) is not None
+    ):
+        return float(item['weight'])
+    if raw_weights and len(raw_weights) > item_index:
+        return float(raw_weights[item_index])
+    return None
+
+
+def _append_llava_ov15_grouped(
+    *,
+    zone,
+    alias_name,
+    base_weight,
+    resolved_roots,
+    resolved_types,
+    resolved_weights,
+    resolved_names,
+    min_shards_standalone=None,
+    weight_basis="samples",
+    group_weights=None,
+    config_weights=None,
+):
+    """Expand the OV1.5 grouped alias into per-(group/config) sources.
+
+    Absolute-M weighting: each source's weight is its base count (images for
+    'samples', emitted QA pairs for 'questions') in MILLIONS, times the per-group
+    and per-config multipliers, times `base_weight` (an overall OV1.5 multiplier;
+    the alias item's `weight`, default 1.0). Each OV1.5 sub-source therefore sits
+    in the same "millions of examples" unit as the other datasets in the mix, and
+    OV1.5's total share emerges from the data (~54 for 'questions' / ~14.7 for
+    'samples') instead of being a number you must set.
+    """
+    overall_mult = float(base_weight)
+    if min_shards_standalone is not None and int(min_shards_standalone) > 0:
+        names, roots_list, counts = llava_ov15_finegrained_roots(
+            int(min_shards_standalone),
+            basis=weight_basis,
+            group_weights=group_weights,
+            config_weights=config_weights,
+        )
+    else:
+        names, roots_list, counts = llava_ov15_group_roots()
+    for group_name, roots, count in zip(names, roots_list, counts):
+        resolved_roots.append(_resolve_one(roots, zone))
+        resolved_types.append('llava_ov15')
+        resolved_weights.append(float(count) / 1e6 * overall_mult)
+        resolved_names.append(f"{alias_name}:{group_name}")
 
 
 def resolve_dataset_roots(config, zone):
@@ -133,29 +275,107 @@ def resolve_dataset_roots(config, zone):
 
     Eval roots (vqav2_root, mme_root, …) are always resolved.
     """
+    ov15_min_shards = config.dataset.get('llava_ov15_min_shards_standalone', None)
+    ov15_basis = config.dataset.get('llava_ov15_weight_basis', 'samples') or 'samples'
+    ov15_group_weights = dict(config.dataset.get('llava_ov15_group_weights', {}) or {})
+    ov15_config_weights = dict(config.dataset.get('llava_ov15_config_weights', {}) or {})
     items = list(config.dataset.get('items', []) or [])
     if items:
         resolved_roots = []
         resolved_types = []
-        for item in items:
-            if isinstance(item, dict):
-                name = item.get('name', '')
-                dtype = item.get('type', dataset_name_to_type_dict.get(name, ''))
-            else:
-                name = str(item)
-                dtype = dataset_name_to_type_dict.get(name, '')
+        resolved_weights = []
+        resolved_names = []
+        raw_weights = list(config.dataset.get('mix_weights', []) or [])
+        raw_weights_match_items = len(raw_weights) == len(items)
+        for item_index, item in enumerate(items):
+            name, dtype = _item_name_and_type(item)
+            item_weight = _item_weight(
+                item,
+                raw_weights if raw_weights_match_items else [],
+                item_index,
+            )
+            if name in LLAVA_OV15_GROUP_ALIASES:
+                _append_llava_ov15_grouped(
+                    zone=zone,
+                    alias_name=name,
+                    base_weight=(
+                        item_weight
+                        if item_weight is not None
+                        else 1.0
+                    ),
+                    resolved_roots=resolved_roots,
+                    resolved_types=resolved_types,
+                    resolved_weights=resolved_weights,
+                    resolved_names=resolved_names,
+                    min_shards_standalone=ov15_min_shards,
+                    weight_basis=ov15_basis,
+                    group_weights=ov15_group_weights,
+                    config_weights=ov15_config_weights,
+                )
+                continue
+
             resolved_roots.append(_resolve_one(name, zone))
             resolved_types.append(dtype)
+            resolved_names.append(name)
+            if item_weight is not None:
+                resolved_weights.append(float(item_weight))
         config.dataset.root  = resolved_roots
         config.dataset.types = resolved_types
+        config.dataset.resolved_names = resolved_names
+        if resolved_weights:
+            if len(resolved_weights) != len(resolved_roots):
+                raise ValueError(
+                    "Partial dataset weights after resolving dataset.items: "
+                    f"{len(resolved_weights)} weights for {len(resolved_roots)} roots. "
+                    "Use either item.weight on every item or a mix_weights list matching items."
+                )
+            config.dataset.mix_weights = resolved_weights
     else:
         # Legacy: plain list of name strings / raw paths
         roots = list(config.dataset.root or [])
         if roots:
-            config.dataset.root  = [_resolve_one(n, zone) for n in roots]
-            config.dataset.types = [
-                dataset_name_to_type_dict.get(n, '') for n in roots
-            ]
+            resolved_roots = []
+            resolved_types = []
+            resolved_weights = []
+            resolved_names = []
+            raw_weights = list(config.dataset.get('mix_weights', []) or [])
+            raw_weights_match_roots = len(raw_weights) == len(roots)
+            for root_index, root in enumerate(roots):
+                if root in LLAVA_OV15_GROUP_ALIASES:
+                    _append_llava_ov15_grouped(
+                        zone=zone,
+                        alias_name=root,
+                        base_weight=(
+                            raw_weights[root_index]
+                            if raw_weights_match_roots
+                            else 1.0
+                        ),
+                        resolved_roots=resolved_roots,
+                        resolved_types=resolved_types,
+                        resolved_weights=resolved_weights,
+                        resolved_names=resolved_names,
+                        min_shards_standalone=ov15_min_shards,
+                        weight_basis=ov15_basis,
+                        group_weights=ov15_group_weights,
+                        config_weights=ov15_config_weights,
+                    )
+                    continue
+                resolved_roots.append(_resolve_one(root, zone))
+                resolved_types.append(dataset_name_to_type_dict.get(root, ''))
+                resolved_names.append(str(root))
+                if raw_weights_match_roots:
+                    resolved_weights.append(float(raw_weights[root_index]))
+            config.dataset.root  = resolved_roots
+            config.dataset.types = resolved_types
+            config.dataset.resolved_names = resolved_names
+            if resolved_weights:
+                if len(resolved_weights) != len(resolved_roots):
+                    raise ValueError(
+                        "Partial dataset weights after resolving dataset.root: "
+                        f"{len(resolved_weights)} weights for {len(resolved_roots)} roots. "
+                        "Use either no mix_weights or a mix_weights list matching root."
+                    )
+                config.dataset.mix_weights = resolved_weights
 
     for _eval_root_key in [
         'vqav2_root',

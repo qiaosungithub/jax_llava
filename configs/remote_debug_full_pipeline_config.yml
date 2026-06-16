@@ -75,7 +75,7 @@ training:
         dataset_items:
             - blip3o-short
         mix_weights: [1]
-        batch_size: 16
+        batch_size: 32
         freeze_lm: True
         freeze_image_encoder: True
         optimizer: adam
@@ -105,7 +105,7 @@ training:
             - visual-genome-det
             - refcoco-train
         mix_weights: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
-        batch_size: 16
+        batch_size: 32
         freeze_lm: False
         freeze_image_encoder: True
         optimizer: adam
