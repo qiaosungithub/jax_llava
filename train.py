@@ -1189,6 +1189,10 @@ def _train_llava_curriculum(config: ml_collections.ConfigDict, workdir: str):
         )
         current_step = stage1_steps
         if current_step < total_steps:
+            if bool(config.training.get('copy_stage1_checkpoint_to_pretrained', True)):
+                log_for_0('Copying stage1 boundary checkpoint to durable pretrained path...')
+                copy_latest_checkpoint_to_pretrained(workdir, zone=zone)
+                mu.sync_global_devices('stage1_boundary_pretrained_ckpt')
             params_for_next = state.params
             del state
             mu.sync_global_devices('curriculum_stage1_to_stage2')

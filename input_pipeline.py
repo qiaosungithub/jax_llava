@@ -127,6 +127,9 @@ _GCAP_REGION_PROMPTS = [
 _DETECTION_PROMPT_SUFFIX = (
     "Output exactly four location tokens, indicating up, left, down, right."
 )
+_POINTING_PROMPT_SUFFIX = (
+    "Output each point as two location tokens, y then x."
+)
 _MC_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 
@@ -179,6 +182,7 @@ def _sample_qa_prompt(question: str) -> str:
 
 
 _SHORT_ANSWER_FORMAT_PROMPT = "Answer the question using a single word or phrase."
+_COUNT_ANSWER_FORMAT_PROMPT = "Answer with a single number."
 
 
 def _format_short_answer_qa_prompt(question: str) -> str:
@@ -186,6 +190,18 @@ def _format_short_answer_qa_prompt(question: str) -> str:
     if not qline:
         return ""
     return f"{qline}\n{_SHORT_ANSWER_FORMAT_PROMPT}"
+
+
+def _format_countbench_question(label: str) -> str:
+    label = (label or "object").strip()
+    return f"How many {label} are there in the image?"
+
+
+def _format_count_qa_prompt(question: str) -> str:
+    qline = _ensure_question_line(question)
+    if not qline:
+        return ""
+    return f"{qline}\n{_COUNT_ANSWER_FORMAT_PROMPT}"
 
 
 def _format_multiple_choice_prompt(question: str, choices) -> str:
@@ -223,11 +239,13 @@ def _dataset_type_to_mask_category(dataset_type: str) -> str:
         "tallyqa",
         "dvqa",
         "ai2d",
+        "pixmo_count",
+        "pixmo_cap_qa",
     }:
         return "vqa"
     if dataset_type in {"rendered_text", "textcaps", "ureader"}:
         return "ocr"
-    if dataset_type in {"genome_gcap", "genome_det", "refcoco"}:
+    if dataset_type in {"genome_gcap", "genome_det", "refcoco", "pixmo_points"}:
         return "grounded_caption"
     return "caption"
 
@@ -815,6 +833,49 @@ def _box_to_loc_tokens(transform, x, y, w, h, img_w, img_h):
     return f"<loc{ymin:04d}><loc{xmin:04d}><loc{ymax:04d}><loc{xmax:04d}>"
 
 
+def _point_to_loc_tokens(transform, x, y, img_w, img_h):
+    img_w = max(float(img_w), 1.0)
+    img_h = max(float(img_h), 1.0)
+    x = float(x)
+    y = float(y)
+    # PixMo stores normalized coordinates in [0, 1]. Keep support for absolute
+    # pixel coordinates as a fallback in case future mirrors change format.
+    if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
+        x = x * img_w
+        y = y * img_h
+    x = max(0.0, min(x, img_w))
+    y = max(0.0, min(y, img_h))
+
+    if isinstance(transform, LetterboxPadTransform):
+        scale, _, _, pad_left, pad_top, _, _ = transform.get_params(img_w, img_h)
+        x = x * scale + pad_left
+        y = y * scale + pad_top
+        norm_w, norm_h = _transform_target_size(transform)
+    elif isinstance(transform, DirectResizeTransform):
+        norm_w, norm_h = _transform_target_size(transform)
+        x = x / img_w * norm_w
+        y = y / img_h * norm_h
+    else:
+        norm_w, norm_h = img_w, img_h
+
+    if norm_w is None or norm_h is None:
+        norm_w, norm_h = img_w, img_h
+    xbin = int((x / float(norm_w)) * 1023)
+    ybin = int((y / float(norm_h)) * 1023)
+    xbin = max(0, min(xbin, 1023))
+    ybin = max(0, min(ybin, 1023))
+    return f"<loc{ybin:04d}><loc{xbin:04d}>"
+
+
+def _count_to_text(count):
+    if count is None:
+        return ""
+    try:
+        return str(int(float(count)))
+    except (TypeError, ValueError):
+        return str(count).strip()
+
+
 _CONVERSATION_DATASET_TYPES = {"llava15", "llava_ov15", "ai2d", "ureader"}
 
 
@@ -1022,6 +1083,56 @@ def preprocess_fn(
             return None
         prefix = f"{prompt}\n"
         full_text = f"{prefix}{answer}"
+        prefix_tokens = tokenizer.encode(prefix, add_bos=True, add_eos=False)
+    elif dataset_type == "pixmo_count":
+        label = (sample.get("label") or "object").strip()
+        question = (
+            sample.get("question")
+            or _format_countbench_question(label)
+        ).strip()
+        aux = sample.get("aux", None) or {}
+        answer = _count_to_text(aux.get("count", sample.get("count")))
+        if not question or not answer:
+            return None
+        prompt = _format_count_qa_prompt(question)
+        if not prompt:
+            return None
+        prefix = f"{prompt}\n"
+        full_text = f"{prefix}{answer}"
+        prefix_tokens = tokenizer.encode(prefix, add_bos=True, add_eos=False)
+    elif dataset_type == "pixmo_cap_qa":
+        question = (sample.get("question", "") or "").strip()
+        aux = sample.get("aux", None) or {}
+        answer = (aux.get("answer", sample.get("answer", "")) or "").strip()
+        if not question or not answer:
+            return None
+        prefix = f"{question}\n"
+        full_text = f"{prefix}{answer}"
+        prefix_tokens = tokenizer.encode(prefix, add_bos=True, add_eos=False)
+    elif dataset_type == "pixmo_points":
+        label = (sample.get("label") or "object").strip()
+        points = sample.get("points") or []
+        locs = []
+        for point in points:
+            if not isinstance(point, dict):
+                continue
+            try:
+                locs.append(_point_to_loc_tokens(
+                    transform,
+                    point["x"],
+                    point["y"],
+                    orig_w,
+                    orig_h,
+                ))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not locs:
+            return None
+        if len(locs) == 1:
+            prefix = f"Point to the {label} in the image.\n{_POINTING_PROMPT_SUFFIX}\n"
+        else:
+            prefix = f"Point to all instances of {label} in the image.\n{_POINTING_PROMPT_SUFFIX}\n"
+        full_text = f"{prefix}{''.join(locs)}"
         prefix_tokens = tokenizer.encode(prefix, add_bos=True, add_eos=False)
     elif dataset_type == "genome_gcap":
         # Grounded captioning: prompt = "caption <loc_ymin><loc_xmin><loc_ymax><loc_xmax>\n"
@@ -1271,6 +1382,124 @@ def expand_genome_sample(sample):
     return out
 
 
+def _pixmo_json(sample):
+    j = sample.get("json")
+    if j is None:
+        return None
+    if isinstance(j, bytes):
+        j = json.loads(j.decode("utf-8"))
+    return j if isinstance(j, dict) else None
+
+
+def _pixmo_image(sample):
+    return sample.get("jpg") or sample.get("jpeg") or sample.get("png") or sample.get("webp")
+
+
+def expand_pixmo_count_sample(sample):
+    """Expand one PixMo-count image record into one QA item per label."""
+    j = _pixmo_json(sample)
+    img = _pixmo_image(sample)
+    if j is None or img is None:
+        return []
+    out = []
+    for ann in j.get("annotations", []):
+        if not isinstance(ann, dict):
+            continue
+        raw_label = ann.get("label")
+        label = "" if raw_label is None else str(raw_label).strip()
+        count = ann.get("count")
+        answer = _count_to_text(count)
+        if not label or not answer:
+            continue
+        question = _format_countbench_question(label)
+        out.append({
+            "jpg": img,
+            "label": label,
+            "question": question,
+            "count": count,
+            "aux": {
+                "dataset": j.get("dataset", "pixmo-count"),
+                "image_key": j.get("image_key"),
+                "row_index": ann.get("row_index"),
+                "label": label,
+                "count": count,
+                "answers": [answer],
+            },
+        })
+    return out
+
+
+def expand_pixmo_points_sample(sample):
+    """Expand one PixMo-points image record into one pointing item per label."""
+    j = _pixmo_json(sample)
+    img = _pixmo_image(sample)
+    if j is None or img is None:
+        return []
+    out = []
+    for ann in j.get("annotations", []):
+        if not isinstance(ann, dict):
+            continue
+        raw_label = ann.get("label")
+        label = "" if raw_label is None else str(raw_label).strip()
+        points = []
+        for point in ann.get("points", []) or []:
+            if not isinstance(point, dict):
+                continue
+            try:
+                points.append({"x": float(point["x"]), "y": float(point["y"])})
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not label or not points:
+            continue
+        out.append({
+            "jpg": img,
+            "label": label,
+            "points": points,
+            "aux": {
+                "dataset": j.get("dataset", "pixmo-points"),
+                "image_key": j.get("image_key"),
+                "row_index": ann.get("row_index"),
+                "label": label,
+                "count": ann.get("count"),
+                "points": points,
+                "collection_method": ann.get("collection_method"),
+            },
+        })
+    return out
+
+
+def expand_pixmo_capqa_sample(sample):
+    """Expand one PixMo CapQA image record into one QA item per question."""
+    j = _pixmo_json(sample)
+    img = _pixmo_image(sample)
+    if j is None or img is None:
+        return []
+    out = []
+    for qa in j.get("qas", []):
+        if not isinstance(qa, dict):
+            continue
+        raw_question = qa.get("question")
+        raw_answer = qa.get("answer")
+        question = "" if raw_question is None else str(raw_question).strip()
+        answer = "" if raw_answer is None else str(raw_answer).strip()
+        if not question or not answer:
+            continue
+        out.append({
+            "jpg": img,
+            "question": question,
+            "answer": answer,
+            "aux": {
+                "dataset": j.get("dataset", "pixmo-cap-qa"),
+                "image_key": j.get("image_key"),
+                "row_index": qa.get("row_index"),
+                "question": question,
+                "answer": answer,
+                "messages": qa.get("messages"),
+            },
+        })
+    return out
+
+
 def _refcoco_phrases(ref):
     phrases = []
     for key in ("sentences", "captions", "phrase"):
@@ -1474,6 +1703,9 @@ _EXPAND_FN = {
     "dvqa":    expand_vqa_sample,
     "aokvqa":  expand_aokvqa_sample,
     "genome":  expand_genome_sample,
+    "pixmo_count": expand_pixmo_count_sample,
+    "pixmo_points": expand_pixmo_points_sample,
+    "pixmo_cap_qa": expand_pixmo_capqa_sample,
     "refcoco": expand_refcoco_sample,
     "llava15": expand_llava_sample,
     "llava_ov15": expand_llava_sample,
@@ -2396,10 +2628,10 @@ def make_dataset(
         root_preview = root
     log_for_0(f"Making dataset for {log_prefix} with root {root_preview}")
     assert dataset_type in [
-        "default", "laion_aes", "cc12m", "blip3o", "textcaps", "llava15", "llava_ov15", "ai2d", "ureader", "vqav2", "okvqa", "aokvqa", "ocrvqa", "gqa", "textvqa", "tallyqa", "dvqa", "genome", "genome_gcap", "genome_det", "refcoco", "rendered_text"
+        "default", "laion_aes", "cc12m", "blip3o", "textcaps", "llava15", "llava_ov15", "ai2d", "ureader", "vqav2", "okvqa", "aokvqa", "ocrvqa", "gqa", "textvqa", "tallyqa", "dvqa", "genome", "genome_gcap", "genome_det", "refcoco", "pixmo_count", "pixmo_points", "pixmo_cap_qa", "rendered_text"
     ], f"Invalid dataset type: {dataset_type}"
 
-    if dataset_type in ["vqav2", "okvqa", "aokvqa", "ocrvqa", "gqa", "textvqa", "tallyqa", "dvqa", "genome", "refcoco", "llava15", "llava_ov15", "ai2d", "ureader"]:
+    if dataset_type in ["vqav2", "okvqa", "aokvqa", "ocrvqa", "gqa", "textvqa", "tallyqa", "dvqa", "genome", "refcoco", "pixmo_count", "pixmo_points", "pixmo_cap_qa", "llava15", "llava_ov15", "ai2d", "ureader"]:
         ds = VQAv2IterableDataset(
             root,
             dataset_config,

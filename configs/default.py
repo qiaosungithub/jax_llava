@@ -40,8 +40,24 @@ def get_config():
     dataset.webdataset_shuffle_size = 10000
     # Keep custom QA/region loaders from reading huge buffers before first yield.
     dataset.item_shuffle_size = ml_collections.ConfigDict()
-    dataset.item_shuffle_size.default = 512
+    dataset.item_shuffle_size.default = 2048
     dataset.item_shuffle_size.llava_ov15 = 50000
+    dataset.item_shuffle_size.vqav2 = 2048
+    dataset.item_shuffle_size.okvqa = 2048
+    dataset.item_shuffle_size.aokvqa = 2048
+    dataset.item_shuffle_size.ocrvqa = 2048
+    dataset.item_shuffle_size.gqa = 2048
+    dataset.item_shuffle_size.textvqa = 2048
+    dataset.item_shuffle_size.textcaps = 2048
+    dataset.item_shuffle_size.genome = 2048
+    dataset.item_shuffle_size.genome_gcap = 2048
+    dataset.item_shuffle_size.genome_det = 2048
+    dataset.item_shuffle_size.refcoco = 2048
+    dataset.item_shuffle_size.tallyqa = 2048
+    dataset.item_shuffle_size.dvqa = 2048
+    dataset.item_shuffle_size.pixmo_count = 2048
+    dataset.item_shuffle_size.pixmo_points = 2048
+    dataset.item_shuffle_size.pixmo_cap_qa = 2048
     # Optional per-child shuffle allocation for expanded mixtures. Disabled by
     # default; configs can enable it for LLaVA-OV1.5 grouped SFT.
     dataset.weighted_item_shuffle_size = ml_collections.ConfigDict()
@@ -80,14 +96,17 @@ def get_config():
     # Debug-only override for loader audits that run in a single Python process
     # but want to simulate multi-host stream-count shuffle scaling.
     dataset.shuffle_total_streams_override = None
-    # 0 means use all Visual Genome region annotations for genome_det.
-    # LLaVA-1.5-style SFT configs override this to 10.
-    dataset.genome_det_regions_per_image = 0
+    # Match the LLaVA-1.5/PaliGemma SFT recipe: sample 10 Visual Genome region
+    # annotations per image for genome_det.
+    dataset.genome_det_regions_per_image = 10
     # Optional per-dataset startup skip for iterable WebDataset streams.
     dataset.stream_start_skip = ml_collections.ConfigDict()
     dataset.stream_start_skip.default = 0
-    # 0 keeps PyTorch's default; remote configs can set this to fail fast.
-    dataset.dataloader_timeout = 0
+    dataset.stream_start_skip.pixmo_count = 0
+    dataset.stream_start_skip.pixmo_points = 0
+    dataset.stream_start_skip.pixmo_cap_qa = 0
+    # Remote production default. Debug configs can lower this to fail faster.
+    dataset.dataloader_timeout = 900
 
     dataset.image_size = 224
     # Image geometry before normalization:
@@ -161,6 +180,8 @@ def get_config():
     training.curriculum_stage_start_step = 0
     training.curriculum_stage_end_step = 0
     training.curriculum_global_num_steps = 0
+    training.copy_stage1_checkpoint_to_pretrained = True
+    training.copy_final_checkpoint_to_pretrained = True
 
     training.seed = 42
 
@@ -184,7 +205,7 @@ def get_config():
     training.freeze_image_encoder = False
     training.vision_tower_from_scratch = False
     training.clip_from_pt = True
-    training.hf_cache_dir = None
+    training.hf_cache_dir = "/dev/shm/huggingface"
     # If enabled, only load pretrained Gemma embedder + first N transformer
     # layers into lm_backbone; later multimodal layers stay randomly initialized.
     # When lm_init_pretrained_num_layers is None, model.txt_feature_layer is used.

@@ -35,27 +35,11 @@ dataset:
     # ~34 per-config sources; streams = sources x num_workers).
     num_workers: 16
     prefetch_factor: 4
-    dataloader_timeout: 900
     stateful_dataloader: True
     stateful_dataloader_strict: True
     # The OV1.5 grouped/stationary-mixture knobs (llava_ov15_min_shards_standalone,
     # expand_conversations_at_fill, llava_ov15_weight_basis, weighted_item_shuffle_size)
     # live in stage2's dataset block so they only affect the SFT stage.
-    item_shuffle_size:
-        # llava_ov15 omitted: stage2 enables weighted_item_shuffle_size for it,
-        # which overrides this per-type buffer.
-        default: 2048
-        vqav2: 2048
-        okvqa: 2048
-        aokvqa: 2048
-        ocrvqa: 2048
-        gqa: 2048
-        textvqa: 2048
-        genome: 2048
-        genome_det: 2048
-        refcoco: 2048
-    # LLaVA-1.5 samples 10 Visual Genome region annotations per image.
-    genome_det_regions_per_image: 10
 
 training:
     curriculum: llava15_two_stage # train 2 stages together.
@@ -70,7 +54,6 @@ training:
 
     vision_tower_from_scratch: False
     clip_from_pt: True
-    hf_cache_dir: /dev/shm/huggingface
 
     optimizer: adam
     grad_clip_norm: 1.0
