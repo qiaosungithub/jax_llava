@@ -607,10 +607,17 @@ class LlavaGemma(nn.Module):
             valid_count.astype(jnp.float32) / jnp.maximum(B, 1)
         )
         if xent_aux is not None:
-            log_dict["log_z_mean"] = xent_aux["log_z_mean"]
-            log_dict["log_z_rms"] = xent_aux["log_z_rms"]
-        # Common-mode logit h @ mean(table): watches the raw direction that the
-        # pre-fix chunked CE let XLA exploit (loss ~= CE - this) on big meshes.
+            # CE guardrails (see README.md "Sharding invariant & CE guardrails").
+            log_dict["log_z_mean"] = jax.lax.stop_gradient(xent_aux["log_z_mean"])
+            log_dict["centered_logit_mean"] = xent_aux["centered_logit_mean"]
+            log_dict["nll_min"] = xent_aux["nll_min"]
+            log_dict["hidden_absmax"] = xent_aux["hidden_absmax"]
+            for _k, _v in xent_aux.items():
+                if _k.startswith("dbg_"):
+                    log_dict[_k] = _v
+        # Common-mode logit h @ mean(table): drifts by design (~-1.5 per 10k
+        # steps); the loss decodes through a centered table, so this only
+        # watches the raw direction. Pathological iff |.| reaches the softcap.
         _emb_mean = jax.lax.stop_gradient(
             embedding_table.astype(jnp.float32).mean(axis=0)
         )

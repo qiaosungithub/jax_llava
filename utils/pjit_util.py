@@ -226,6 +226,12 @@ def _process_major_model_axis_mesh(mesh_shape, devices):
     shards and then `make_array_from_process_local_data` expects a larger host
     batch.  This process-major layout keeps the last axis local whenever the
     model-axis size divides the local device count.
+
+    Beyond the host-batch shape, this is a correctness requirement: a model
+    group spanning hosts turns P((data...), None) inputs into "replicated"
+    copies filled from different hosts' dataloaders -- replicas with different
+    data (the whole negative-CE family in PaliGemma-baseline). See README.md
+    "Sharding invariant & CE guardrails".
     """
     if len(mesh_shape) < 2 or not devices:
         return None
@@ -256,6 +262,16 @@ def _process_major_model_axis_mesh(mesh_shape, devices):
             data_ordinal = process_ordinal * data_slots_per_process + local_ordinal // model_axis_size
             model_ordinal = local_ordinal % model_axis_size
             out[np.unravel_index(data_ordinal, data_shape) + (model_ordinal,)] = device
+    # Hard guarantee: one host per model group, or refuse to run.
+    pi = np.vectorize(lambda d: d.process_index)(out)
+    lead = pi.reshape(-1, model_axis_size)
+    assert (lead == lead[:, :1]).all(), (
+        f"model axis crosses hosts even after process-major layout: {pi}"
+    )
+    log_for_0(
+        "get_mesh: process-major host-aligned layout %s; model groups are "
+        "intra-host (fixes fake batch replication)", mesh_shape,
+    )
     return out
 
 

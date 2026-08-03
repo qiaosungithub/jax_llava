@@ -823,10 +823,34 @@ class PaliGemmaEncDec(nn.Module):
             )
             log_dict['loss_vlm'] = loss_vlm
             log_dict['acc']      = acc
+            # Common-mode logit h @ mean(table): drifts by design (~-1.5 per 10k
+            # steps); the loss decodes through a centered table, so this only
+            # watches the raw direction. Pathological iff |.| reaches the softcap.
+            _emb_mean = jax.lax.stop_gradient(
+                embedding_table.astype(jnp.float32).mean(axis=0)
+            )
+            _cm_logit = jnp.einsum(
+                '...d,d->...', lm_hidden.astype(jnp.float32), _emb_mean
+            )
+            log_dict['vocab_mean_logit'] = (
+                (_cm_logit * valid).sum() / jnp.maximum(valid_count, 1)
+            )
+            log_dict['vocab_mean_logit_rms'] = jnp.sqrt(
+                (jnp.square(_cm_logit) * valid).sum()
+                / jnp.maximum(valid_count, 1)
+            )
             log_dict['valid_tokens'] = valid_count.astype(jnp.float32)
             log_dict['valid_tokens_per_sample'] = (
                 valid_count.astype(jnp.float32) / jnp.maximum(B, 1)
             )
+            # CE guardrails (see README.md "Sharding invariant & CE guardrails").
+            log_dict['log_z_mean'] = jax.lax.stop_gradient(xent_aux['log_z_mean'])
+            log_dict['centered_logit_mean'] = xent_aux['centered_logit_mean']
+            log_dict['nll_min'] = xent_aux['nll_min']
+            log_dict['hidden_absmax'] = xent_aux['hidden_absmax']
+            for _k, _v in xent_aux.items():
+                if _k.startswith('dbg_'):
+                    log_dict[_k] = _v
 
             loss_total = (
                 self.vlm_loss_weight       * loss_vlm

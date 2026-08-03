@@ -221,6 +221,70 @@ class Writer:
             
     def write_scalars(self, step, scalar_dict):
         # [200] ep=0.159073, steps_per_second=6.76798, train_accuracy=0.00585938, train_loss=6.71379, train_lr=0.0127258, train_step=199
+        # Fail fast on a non-finite training loss: once loss is NaN/Inf the params
+        # are poisoned and every further step is wasted compute. Raise (on ALL
+        # hosts, before the process-0 early return) so the job dies immediately and
+        # infra marks it failed instead of burning hours logging NaN.
+        _loss = scalar_dict.get("loss")
+        if _loss is not None:
+            try:
+                _loss_f = float(np.asarray(_loss))
+            except (TypeError, ValueError):
+                _loss_f = None
+            if _loss_f is not None and not np.isfinite(_loss_f):
+                # Dump every scalar of the failing step, non-finite ones first.
+                # "loss is inf" alone says nothing about which term blew up, and
+                # the run is dead either way -- there is no second chance to look.
+                bad, ok = [], []
+                for k in sorted(scalar_dict):
+                    try:
+                        v = float(np.asarray(scalar_dict[k]))
+                    except (TypeError, ValueError):
+                        continue
+                    (bad if not np.isfinite(v) else ok).append(f"{k}={v:.6g}")
+                raise FloatingPointError(
+                    f"[step {step}] training loss is {_loss_f} (NaN/Inf) -- aborting run. "
+                    "This usually means a numerical blow-up (e.g. NaN gradient); "
+                    "resume will NOT help (checkpoint params are NaN), fix the cause "
+                    "and start a fresh run."
+                    f"\n  HOST: process_index={jax.process_index()}"
+                    f"\n  NON-FINITE: {', '.join(bad) or '(none besides loss)'}"
+                    f"\n  FINITE:     {', '.join(ok)}"
+                )
+        # Cross-host consistency probe. Jit outputs here are global scalars and
+        # must be bitwise-identical on every host, yet the PaliGemma-baseline
+        # fake-replication dumps showed acc/valid_tokens/nll_min splitting into
+        # two host groups (12-29% apart) -- replicated-output divergence, i.e.
+        # some reduction was compiled without covering the whole mesh. Every
+        # host reaches this point (the train loop syncs right after), so a tiny
+        # allgather makes the divergence a first-class logged metric instead of
+        # a forensic find. ~1KB per log interval.
+        try:
+            from jax.experimental import multihost_utils as _mu
+            if jax.process_count() > 1:
+                _probe_keys = [
+                    k for k in ("loss", "loss_vlm", "acc", "nll_min", "valid_tokens")
+                    if k in scalar_dict
+                ]
+                if _probe_keys:
+                    _local = np.asarray(
+                        [float(np.asarray(scalar_dict[k])) for k in _probe_keys],
+                        dtype=np.float64,
+                    )
+                    _all = np.asarray(_mu.process_allgather(_local))
+                    _spread = np.abs(_all - _all[0:1]).max(axis=0)
+                    scalar_dict = dict(scalar_dict)
+                    scalar_dict["host_metric_spread"] = float(_spread.max())
+                    if _spread.max() > 0:
+                        _detail = ", ".join(
+                            f"{k}:{s:.3g}" for k, s in zip(_probe_keys, _spread) if s > 0
+                        )
+                        log_for_0(
+                            "[host-spread step %s] replicated metrics differ across "
+                            "hosts: %s", step, _detail,
+                        )
+        except Exception:  # never let the probe kill training
+            logging.exception("host_metric_spread probe failed (non-fatal)")
         if jax.process_index() != 0:
             return
         log_str = f"[{step}]"
