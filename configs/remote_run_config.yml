@@ -45,12 +45,14 @@ training:
     curriculum: llava15_two_stage # train 2 stages together.
 
     # Global checkpoint stream in one workdir:
-    # stage-1 [0, 2180), stage-2 [2180, 7375).
+    # stage-1 [0, 2180), stage-2 [2180, 77180).
     stage1_steps: 2180
     # stage2_steps: 5195 # baseline
     # num_steps: 7375 # baseline
-    stage2_steps: 50000
-    num_steps: 52180
+    # Half of beifen-Paligemma stage3's 150000 (wall-clock budget); warmup halved
+    # with it to keep the same 10% warmup fraction.
+    stage2_steps: 75000
+    num_steps: 77180
 
     vision_tower_from_scratch: False
     clip_from_pt: True
@@ -126,51 +128,68 @@ training:
                 min: 1024
                 max: 262144
         dataset_items:
+            # Aligned to beifen-Paligemma stage3 SFT mix (2026-07-24): dropped
+            # tallyqa (Pali flags it "bad") and full visual-genome QA (Pali keeps
+            # only vg-det); added pixmo-cap-qa + pixmo-count + the ported
+            # openimages-relationship loader. Same 12 sources as beifen stage3.
             - llava-ov-1.5-instruct-grouped
             - vqav2
             - okvqa-train
             - aokvqa-train
             - ocrvqa-train
-            - tallyqa
             - gqa-train
-            # - textcaps-train
-            - visual-genome
             - visual-genome-det
             - refcoco-train
             - refcocog-train
-        # Weights = MILLIONS OF QA EXAMPLES (true question/example counts). The
-        # OV1.5 grouped item weight is an overall MULTIPLIER (1.0); weight_basis
-        # =questions expands it to per-config sources summing to ~54 (M QA).
-        # Order / counts (M): OV1.5(~54), vqav2 0.444, okvqa 0.009, aokvqa 0.068,
-        # ocrvqa 0.802 (full train), gqa 0.943, textcaps 0.022, visual-genome 1.7,
-        # vg-det 0.86 (10 regions/image), refcoco 0.042 (42404 refs).
-        mix_weights: [1.0, 0.444, 0.009, 0.068, 0.802, 0.25, 0.943, 1.7, 0.86, 0.042, 0.042]
+            - pixmo-cap-qa
+            - pixmo-count
+            - openimages-relationship-train
+        # Weights = MILLIONS OF QA EXAMPLES, matched to beifen stage3. Order/counts
+        # (M): OV1.5(~54), vqav2 0.444, okvqa 0.009, aokvqa 0.068, ocrvqa 0.802,
+        # gqa 0.943, vg-det 0.86, refcoco 0.084 (doubled stream), refcocog 0.084,
+        # pixmo-cap-qa 0.27, pixmo-count 0.036, OI-relationship 0.235245 (its
+        # emitted structured-SPO count after ambiguity filtering + the 10% `at` cap).
+        mix_weights: [1.0, 0.444, 0.009, 0.068, 0.802, 0.943, 0.86, 0.084, 0.084, 0.27, 0.036, 0.235245]
+        # w -> w**0.5 per RESOLVED source (OV1.5 sub-sources powered individually),
+        # flattening the mixture toward uniform. NOTE: beifen stage3 ran with this
+        # OFF (commented out); 0.5 here is a deliberate jax deviation.
+        dataset_mix_weight_power: 0.5
         # batch_size: 128 # baseline
-        batch_size: 512
+        # batch_size: 512  # was: 4x, samples-matched at 50000 steps
+        batch_size: 256  # beifen-Paligemma stage3 batch (bs 256 x 75000 steps = 19.2M samples)
         freeze_lm: False
         freeze_lm_embed: False
         freeze_lm_late: False
         freeze_image_encoder: True
         optimizer: adam
+        # sqrt-scaled to bs 256 from this family's own ladder: bs 128 -> (2e-5,
+        # 5e-4) and bs 512 -> (4e-5, 1e-3), i.e. batch x4 -> lr x2. bs 256 is the
+        # geometric midpoint, so lr x sqrt(2). No bs-256 run existed before this.
         adam:
-            # learning_rate: 0.00002 # baseline
-            learning_rate: 0.00004
+            # learning_rate: 0.00002 # baseline (bs 128)
+            # learning_rate: 0.00004 # bs 512
+            learning_rate: 0.000028
             adam_b2: 0.95
             weight_decay: 0.0
-        # vision_encoder_learning_rate: 0.00002 # baseline
-        # connector_learning_rate: 0.0005 # baseline
-        vision_encoder_learning_rate: 0.00004
-        connector_learning_rate: 0.001
+        # vision_encoder_learning_rate: 0.00002 # baseline (bs 128)
+        # connector_learning_rate: 0.0005 # baseline (bs 128)
+        # Moot while freeze_image_encoder=True; kept tracking the LM lr.
+        vision_encoder_learning_rate: 0.000028
+        connector_learning_rate: 0.0007
 
         # warmup_steps: 156 # baseline
-        warmup_steps: 1500
+        # beifen stage3 warmup 15000 / 150000 = 10%; halved with stage2_steps.
+        warmup_steps: 7500
         lr_schedule: cos
         # sample_per_step: 200 # baseline
         # online_eval_per_step: 1200 # baseline
         sample_per_step: 2000
         online_eval_per_step: 5000
-        online_eval_tasks: [vqav2, mme, textvqa, refcocog, pixelbench, gqa, vizwiz, scienceqa_img, seed_bench]
-        final_eval_tasks: [vqav2, mme, textvqa, pope, refcocog, pixelbench, mmbench, gqa, vizwiz, scienceqa_img, seed_bench]
+        # Same task lists as beifen-Paligemma stage3 / PaliGemma-baseline: the
+        # `pixelbench` bundle is spelled out per benchmark (mmvp/vstar/ocrbench/
+        # countbenchqa) so each gets its own sampler token budget.
+        online_eval_tasks: [vqav2, mme, textvqa, pope, refcocog, mmvp, vstar, ocrbench, countbenchqa]
+        final_eval_tasks: [vqav2, mme, textvqa, pope, mmbench, knn_full, refcocog, mmvp, vstar, ocrbench, countbenchqa, gqa, seed_bench, cambrian_cvbench, vlms_are_blind, docvqa, realworldqa]
 
 sampling:
     max_new_tokens: 64
@@ -183,10 +202,15 @@ eval:
     eval_tokens_shortqa: 8
     eval_tokens_mid: 16
     eval_tokens_ocr: 32
-    eval_tokens_refcoco: 16
+    eval_tokens_refcoco: 32
     eval_tokens_pixelbench: 32
+    eval_tokens_cambrian_cvbench: 8
+    eval_tokens_vlms_are_blind: 32
+    eval_tokens_docvqa: 32
+    eval_tokens_realworldqa: 16
     eval_tokens_mmbench: 8
     online_vqav2_sample_fraction: 0.1
+    vqav2_num_samples: 214354
 
 finetune: False
 sharding: hsdp_legacy_data
@@ -201,4 +225,4 @@ logging:
     wandb_project: "jax-llava"
     wandb_entity: "sqa24-massachusetts-institute-of-technology"
     wandb_tags: ["llava1.5", "curriculum", "hsdp"]
-    wandb_notes: "[new dataset + dataloader] [stage 2 4x batch size 50000 steps, llava-fusion] llava-1.5 reproduction. Stage-1 trains connector only with CFG disabled; stage-2 trains connector + LM with VLM/text-only/CFG losses 1:1:1 and alpha=1. Adam original LR: stage1 connector 1e-3, stage2 LM 4e-5, connector 1e-3. Stage-2 data: LLaVA-OV1.5-Instruct plus VQAv2/OKVQA/A-OKVQA/OCRVQA/GQA/TextCaps/Visual Genome QA, VG detection, and RefCOCO grounding."
+    wandb_notes: "[new dataset + dataloader] [stage 2 bs256 75000 steps, llava-fusion] llava-1.5 reproduction. Stage-1 trains connector only with CFG disabled; stage-2 trains connector + LM with VLM CE loss only (text-only/CFG off, alpha=0), image encoder frozen (original LLaVA-1.5 recipe). Adam LR: stage1 connector 1e-3, stage2 LM 2.8e-5, connector 7e-4 (sqrt-scaled to bs 256 from the bs128 2e-5/5e-4 and bs512 4e-5/1e-3 anchors), warmup 7500 (10%), cos. Stage-2 data aligned to beifen-Paligemma stage3 SFT mix: LLaVA-OV1.5-Instruct(grouped) + VQAv2/OKVQA/A-OKVQA/OCRVQA/GQA/VG-det/RefCOCO/RefCOCOg/PixMo-cap-qa/PixMo-count/OpenImages-relationship (12 sources, same as beifen stage3), dataset_mix_weight_power 0.5."

@@ -141,6 +141,12 @@ class LlavaGemma(nn.Module):
     text_only_loss_weight: float = 0.0
     cfg_loss_weight: float = 0.0
     alpha: float = 0.0
+    # Diffusion-style CFG training: per-sample probability of dropping the image
+    # condition inside the SAME joint forward (zeroed image embeds, text rows see
+    # no image columns, text tokens use the 0-based text-only position table), so
+    # the plain VLM CE trains the uncond branch that generate_cfg's uncond stream
+    # (images=None) runs at eval. Train-only; labels=None paths never drop.
+    image_drop_prob: float = 0.0
     # If the first txt_feature_layer LM blocks are frozen, their text-only
     # output should usually be treated as a fixed feature. Otherwise JAX still
     # builds a backward pass through those frozen blocks for no trainable
@@ -375,6 +381,7 @@ class LlavaGemma(nn.Module):
                 1.0 - valid_text_tokens / jnp.maximum(total_text_tokens, 1.0)
             )
 
+        image_drop = None
         if images is not None:
             images = constrain_batch(images)
             clip_tokens = self.encode_image(images, train=labels is not None)
@@ -428,6 +435,21 @@ class LlavaGemma(nn.Module):
                     img_embeds_rms / jnp.maximum(txt_feature_embeds_valid_rms, 1e-12)
                 )
 
+            if self.image_drop_prob > 0.0 and labels is not None:
+                image_drop = jax.random.bernoulli(
+                    self.make_rng("gen"),
+                    float(self.image_drop_prob),
+                    (img_embeds.shape[0],),
+                )
+                img_embeds = jnp.where(
+                    image_drop[:, None, None],
+                    jnp.zeros_like(img_embeds),
+                    img_embeds,
+                )
+                log_dict["image_drop_fraction"] = jnp.mean(
+                    image_drop.astype(jnp.float32)
+                )
+
             token_embeds = jnp.concatenate([img_embeds, token_embeds], axis=1)
             token_embeds = constrain_batch_model(token_embeds)
             K = img_embeds.shape[1]
@@ -448,6 +470,20 @@ class LlavaGemma(nn.Module):
             )
 
         positions = jnp.broadcast_to(jnp.arange(L, dtype=jnp.int32)[None, :], (B, L))
+        if image_drop is not None:
+            # Dropped samples compute the text-only forward inside the joint
+            # pass: text rows attend no image columns (image rows keep their
+            # bidirectional image block so no attention row is fully masked —
+            # a fully masked row would NaN the softmax and poison gradients),
+            # and text tokens switch to the 0-based text-only position table.
+            j_idx = jnp.arange(attn_mask.shape[-1], dtype=jnp.int32)[None, None, :]
+            i_idx = jnp.arange(L, dtype=jnp.int32)[None, :, None]
+            dropped_mask = attn_mask & ((j_idx >= K) | (i_idx < K))
+            attn_mask = jnp.where(image_drop[:, None, None], dropped_mask, attn_mask)
+            dropped_positions = jnp.maximum(jnp.arange(L, dtype=jnp.int32) - K, 0)
+            positions = jnp.where(
+                image_drop[:, None], dropped_positions[None, :], positions
+            )
         inputs = _Inputs(
             embeddings=token_embeds,
             positions=positions,
@@ -512,7 +548,7 @@ class LlavaGemma(nn.Module):
             text_out = constrain_batch_model(text_out)
 
             if self.text_only_loss_weight > 0.0:
-                loss_text_only, _ = token_xent_loss_from_hidden(
+                loss_text_only, _, _ = token_xent_loss_from_hidden(
                     text_out,
                     embedding_table,
                     labels,
@@ -523,7 +559,7 @@ class LlavaGemma(nn.Module):
                 loss_text_only = jnp.zeros(())
 
             if self.cfg_loss_weight > 0.0:
-                loss_cfg, _ = token_xent_loss_from_hidden(
+                loss_cfg, _, _ = token_xent_loss_from_hidden(
                     out[:, K:, :],
                     embedding_table,
                     labels,
@@ -548,8 +584,9 @@ class LlavaGemma(nn.Module):
                 logits = jnp.tanh(logits / self.final_logit_softcap) * self.final_logit_softcap
             loss_vlm = token_xent_loss(logits, labels)
             pred_ids = jnp.argmax(logits, axis=-1)
+            xent_aux = None
         else:
-            loss_vlm, pred_ids = token_xent_loss_from_hidden(
+            loss_vlm, pred_ids, xent_aux = token_xent_loss_from_hidden(
                 lm_hidden,
                 embedding_table,
                 labels,
@@ -568,6 +605,23 @@ class LlavaGemma(nn.Module):
         log_dict["valid_tokens"] = valid_count.astype(jnp.float32)
         log_dict["valid_tokens_per_sample"] = (
             valid_count.astype(jnp.float32) / jnp.maximum(B, 1)
+        )
+        if xent_aux is not None:
+            log_dict["log_z_mean"] = xent_aux["log_z_mean"]
+            log_dict["log_z_rms"] = xent_aux["log_z_rms"]
+        # Common-mode logit h @ mean(table): watches the raw direction that the
+        # pre-fix chunked CE let XLA exploit (loss ~= CE - this) on big meshes.
+        _emb_mean = jax.lax.stop_gradient(
+            embedding_table.astype(jnp.float32).mean(axis=0)
+        )
+        _cm_logit = jnp.einsum(
+            "...d,d->...", lm_hidden.astype(jnp.float32), _emb_mean
+        )
+        log_dict["vocab_mean_logit"] = (
+            (_cm_logit * valid).sum() / jnp.maximum(valid_count, 1)
+        )
+        log_dict["vocab_mean_logit_rms"] = jnp.sqrt(
+            (jnp.square(_cm_logit) * valid).sum() / jnp.maximum(valid_count, 1)
         )
         loss_total = (
             self.vlm_loss_weight * loss_vlm
@@ -764,6 +818,212 @@ class LlavaGemma(nn.Module):
             cond_fn,
             (lambda carry: body_fn_split(self, carry)) if use_split else body_fn,
             (first_token, prefill_cache, 1, tokens_out),
+        )
+        return all_tokens
+
+    def generate_cfg(
+        self,
+        prompt_ids: Array,
+        prefix_len: Array,
+        images: Array,
+        max_new_tokens: int = 64,
+        guidance_scale: float = 1.0,
+    ) -> Array:
+        """Greedy generation with eval-time CFG guidance.
+
+        Two decode streams over the same prompt — conditional (image prefix,
+        identical to `generate`) and unconditional (text-only, the branch the
+        text-only/CFG training losses supervise) — pick each token from
+
+            logits = (1 + w) * cond_logits - w * uncond_logits
+
+        and both streams consume the SAME sampled token. w=0 reduces to
+        `generate` output token-for-token (at twice the cost).
+        """
+        assert images is not None, "generate_cfg requires images (cond stream)"
+        B = prompt_ids.shape[0]
+        T_prompt = prompt_ids.shape[1]
+        prefix_len = jnp.asarray(prefix_len, dtype=jnp.int32)
+        w = float(guidance_scale)
+
+        token_embeds = self.lm_backbone.embedder.encode(prompt_ids)
+        clip_tokens = self.encode_image(images, train=False)
+        img_embeds = self.projector(clip_tokens)
+        K = img_embeds.shape[1]
+
+        prefix_total = prefix_len + K
+        step_pos_init = prefix_total[:, None]
+        step_pos_init_txt = prefix_len[:, None]
+        max_total_len = T_prompt + max_new_tokens + K   # cond cache
+        max_total_len_u = T_prompt + max_new_tokens     # uncond cache
+
+        cache_c = self.lm_backbone.init_cache(
+            batch_size=B, dtype=jnp.bfloat16, cache_length=max_total_len
+        )
+        cache_dtype = cache_c[list(cache_c.keys())[0]]["v"].dtype
+        cache_u = self.lm_backbone.init_cache(
+            batch_size=B, dtype=jnp.bfloat16, cache_length=max_total_len_u
+        )
+
+        # ── Uncond prefill: full stack over the raw text embeddings ────────
+        positions_u = jnp.broadcast_to(
+            jnp.arange(T_prompt, dtype=jnp.int32)[None, :], (B, T_prompt)
+        )
+        prefill_mask_u = self.make_causal_with_prefix_block(
+            T_prompt, prefix_len, cache_size=max_total_len_u, image_prefix=0
+        )
+        prefill_inputs_u = _Inputs(
+            embeddings=token_embeds.astype(cache_dtype),
+            positions=positions_u,
+            attention_mask=prefill_mask_u,
+            inputs_mask=jnp.ones((B, T_prompt), dtype=jnp.int32),
+        )
+        prefill_out_u, prefill_cache_u = self.lm_backbone._apply_attention(
+            prefill_inputs_u, cache_u
+        )
+        hidden_u = jnp.take_along_axis(
+            prefill_out_u, (prefix_len - 1)[:, None, None], axis=1
+        ).squeeze(1)
+        logits_u0 = self.lm_backbone.embedder.decode(hidden_u)
+
+        # ── Cond prefill: identical to `generate` ──────────────────────────
+        split_txt_cache = {}
+        use_split = self.txt_feature_layer > 0
+        if use_split:
+            token_embeds, split_txt_cache = self._apply_text_feature_layers(
+                token_embeds,
+                prefix_len,
+                cache_c,
+            )
+        img_embeds, _ = self._transform_image_embeds(
+            img_embeds,
+            token_embeds,
+            prefix_len,
+            attention_mask=None,
+        )
+        img_embeds = constrain_batch_model(img_embeds)
+        token_embeds = jnp.concatenate([img_embeds, token_embeds], axis=1)
+
+        L = token_embeds.shape[1]
+        positions = jnp.broadcast_to(jnp.arange(L, dtype=jnp.int32)[None, :], (B, L))
+        prefill_attn_mask = self.make_causal_with_prefix_block(
+            L, prefix_total, cache_size=max_total_len, image_prefix=K
+        )
+        if use_split:
+            prefill_out, rest_cache = self._apply_lm_from_layer(
+                token_embeds,
+                positions,
+                prefill_attn_mask,
+                cache_c,
+                self.txt_feature_layer,
+            )
+            prefill_cache = {**split_txt_cache, **rest_cache}
+        else:
+            prefill_inputs = _Inputs(
+                embeddings=token_embeds.astype(cache_dtype),
+                positions=positions,
+                attention_mask=prefill_attn_mask,
+                inputs_mask=jnp.ones((B, L), dtype=jnp.int32),
+            )
+            prefill_out, prefill_cache = self.lm_backbone._apply_attention(
+                prefill_inputs, cache_c
+            )
+        hidden_c = jnp.take_along_axis(
+            prefill_out, (prefix_total - 1)[:, None, None], axis=1
+        ).squeeze(1)
+        logits_c0 = self.lm_backbone.embedder.decode(hidden_c)
+
+        first_token = jnp.argmax(
+            (1.0 + w) * logits_c0 - w * logits_u0, axis=-1, keepdims=True
+        )
+        tokens_out = jnp.zeros((B, max_new_tokens), dtype=jnp.int32)
+        tokens_out = tokens_out.at[:, 0].set(first_token.squeeze(-1))
+
+        def _cond_step_logits(m, curr_tok, curr_cache, step):
+            """One cond-stream decode step -> ((B, V) logits, new cache).
+            Mirrors generate's body_fn / body_fn_split exactly."""
+            emb = m.lm_backbone.embedder.encode(curr_tok).astype(
+                curr_cache[list(curr_cache.keys())[0]]["v"].dtype
+            )
+            j = jnp.arange(max_total_len)[None, None, :]
+            full_mask = (
+                (j < prefix_total[:, None, None])
+                | ((j >= T_prompt + K) & (j < T_prompt + K + step))
+            )
+            if use_split:
+                txt_mask = (
+                    (j < prefix_len[:, None, None])
+                    | ((j >= T_prompt) & (j < T_prompt + step))
+                )
+                x = emb
+                new_cache = {}
+                txt_pos = step_pos_init_txt + step
+                for i in range(m.txt_feature_layer):
+                    layer_name = f"layer_{i}"
+                    layer_cache, x = m.lm_backbone.blocks[i](
+                        x, txt_pos, curr_cache.get(layer_name), txt_mask
+                    )
+                    new_cache[layer_name] = layer_cache
+                full_pos = step_pos_init + step
+                for i in range(m.txt_feature_layer, len(m.lm_backbone.blocks)):
+                    layer_name = f"layer_{i}"
+                    layer_cache, x = m.lm_backbone.blocks[i](
+                        x, full_pos, curr_cache.get(layer_name), full_mask
+                    )
+                    new_cache[layer_name] = layer_cache
+                lm_out = m.lm_backbone.final_norm(x)
+                return m.lm_backbone.embedder.decode(lm_out[:, -1, :]), new_cache
+            step_inputs = _Inputs(
+                embeddings=emb,
+                positions=step_pos_init + step,
+                attention_mask=full_mask,
+                inputs_mask=jnp.ones((B, 1), dtype=jnp.int32),
+            )
+            lm_out, new_cache = m.lm_backbone._apply_attention(step_inputs, curr_cache)
+            return m.lm_backbone.embedder.decode(lm_out[:, -1, :]), new_cache
+
+        def _uncond_step_logits(m, curr_tok, curr_cache, step):
+            """One uncond-stream decode step: full stack over text only (K=0)."""
+            emb = m.lm_backbone.embedder.encode(curr_tok).astype(
+                curr_cache[list(curr_cache.keys())[0]]["v"].dtype
+            )
+            j = jnp.arange(max_total_len_u)[None, None, :]
+            mask = (
+                (j < prefix_len[:, None, None])
+                | ((j >= T_prompt) & (j < T_prompt + step))
+            )
+            step_inputs = _Inputs(
+                embeddings=emb,
+                positions=step_pos_init_txt + step,
+                attention_mask=mask,
+                inputs_mask=jnp.ones((B, 1), dtype=jnp.int32),
+            )
+            lm_out, new_cache = m.lm_backbone._apply_attention(step_inputs, curr_cache)
+            return m.lm_backbone.embedder.decode(lm_out[:, -1, :]), new_cache
+
+        def cond_fn(carry):
+            _, _, _, step, _ = carry
+            return step < max_new_tokens
+
+        def body_fn(carry):
+            curr_tok, cc, cu, step, out_tokens = carry
+            lc, cc2 = _cond_step_logits(self, curr_tok, cc, step)
+            lu, cu2 = _uncond_step_logits(self, curr_tok, cu, step)
+            next_tok = jnp.argmax(
+                (1.0 + w) * lc - w * lu, axis=-1, keepdims=True
+            )
+            return (
+                next_tok,
+                cc2,
+                cu2,
+                step + 1,
+                out_tokens.at[:, step].set(next_tok.squeeze(-1)),
+            )
+
+        _, _, _, _, all_tokens = jax.lax.while_loop(
+            cond_fn,
+            body_fn,
+            (first_token, prefill_cache, prefill_cache_u, 1, tokens_out),
         )
         return all_tokens
 

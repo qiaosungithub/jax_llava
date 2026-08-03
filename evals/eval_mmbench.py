@@ -23,12 +23,20 @@ import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
+from absl import logging
 from jax.experimental import multihost_utils as mu
-from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data import DataLoader, Dataset
 
 from input_pipeline import get_transforms, prepare_batch_data
 from utils.logging_util import log_for_0, log_for_all
 from utils.eval_io_util import ensure_eval_result_base_dir, eval_result_prefix
+from evals.eval_dist_util import (
+    DistributedEvalSampler,
+    broadcast_merge_ok,
+    collate_fn,
+    gather_rank_json_results,
+    write_rank_json_results,
+)
 
 
 DEFAULT_DEV_URL = "https://opencompass.openxlab.space/utils/VLMEval/MMBench_DEV_EN.tsv"
@@ -138,14 +146,7 @@ def _row_with_limits(row, *, keep_hint, question_chars=None, option_chars=None):
 
 
 def _fit_mmbench_prompt(row, tokenizer, max_len, prefix, suffix):
-    """Build a prompt that fits max_len while preserving answer options.
-
-    Long MMBench rows often overflow because of hints or verbose choices. The
-    important part for multiple choice scoring is the question, option labels,
-    option text, and final "letter only" instruction. So we drop hints first,
-    then progressively shorten question/options instead of blindly chopping off
-    the tail where the options and instruction live.
-    """
+    """Fit long MMBench rows while preserving options and the final instruction."""
     attempts = []
     full_prompt = build_mmbench_prompt(row, prefix=prefix, suffix=suffix)
     attempts.append((full_prompt, False, _token_len(tokenizer, full_prompt)))
@@ -154,7 +155,8 @@ def _fit_mmbench_prompt(row, tokenizer, max_len, prefix, suffix):
     prompt = build_mmbench_prompt(no_hint, prefix=prefix, suffix=suffix)
     attempts.append((prompt, True, _token_len(tokenizer, prompt)))
 
-    # Progressively tighten text fields. Question gets twice the option budget.
+    # MMBench rows can have verbose choices. Shorten fields structurally instead
+    # of raw token truncation that would drop answer choices or instructions.
     for option_chars in (512, 384, 256, 192, 128, 96, 64, 48, 32, 24, 16):
         fitted = _row_with_limits(
             row,
@@ -169,9 +171,6 @@ def _fit_mmbench_prompt(row, tokenizer, max_len, prefix, suffix):
         if n_tokens <= max_len:
             return prompt, tokenizer.encode(prompt, add_bos=True, add_eos=False), truncated, n_tokens
 
-    # Last resort for pathological rows or very small max_len: keep the shortest
-    # structured prompt and let token truncation apply only after options were
-    # aggressively shortened.
     prompt, _, n_tokens = attempts[-1]
     return prompt, tokenizer.encode(prompt, add_bos=True, add_eos=False), True, n_tokens
 
@@ -255,25 +254,13 @@ def _group_index(row, index):
     return int(index % 1_000_000)
 
 
-class DistributedEvalSampler(Sampler):
-    def __init__(self, dataset, num_replicas=None, rank=None):
-        self.dataset = dataset
-        self.num_replicas = int(num_replicas if num_replicas is not None else jax.process_count())
-        self.rank = int(rank if rank is not None else jax.process_index())
-        self.dataset_len = len(dataset)
-        self.num_samples = (self.dataset_len - self.rank + self.num_replicas - 1) // self.num_replicas
-
-    def __iter__(self):
-        return iter(range(self.rank, self.dataset_len, self.num_replicas))
-
-    def __len__(self):
-        return self.num_samples
-
-
 class MMBenchDataset(Dataset):
     def __init__(self, tsv_path, config, tokenizer):
         self.tsv_path = tsv_path
         self.data = _read_tsv(tsv_path)
+        limit = int(getattr(config.eval, "mmbench_num_samples", 0) or 0)
+        if limit > 0:
+            self.data = self.data.iloc[:limit].reset_index(drop=True)
         self.config = config
         self.tokenizer = tokenizer
         self.transform = get_transforms(
@@ -363,18 +350,6 @@ class MMBenchDataset(Dataset):
             "prefix_len": prefix_len,
             "aux": aux,
         }
-
-
-def collate_fn(batch):
-    batch = [b for b in batch if b is not None]
-    if not batch:
-        return {}
-    return {
-        "pixel_values": torch.stack([b["pixel_values"] for b in batch]),
-        "input_ids": torch.stack([b["input_ids"] for b in batch]),
-        "prefix_len": torch.stack([b["prefix_len"] for b in batch]).to(torch.int32),
-        "aux": [b["aux"] for b in batch],
-    }
 
 
 def _make_dummy_mmbench_batch(batch_size, image_size, max_len):
@@ -504,31 +479,33 @@ def _run_mmbench_predictions(p_sample_step, run_p_sample_step, model, tokenizer,
             f"MMBench result cache dir is not writable on process {jax.process_index()}: {base_dir}."
         )
 
-    rank_file = f"{result_prefix}.results_{jax.process_index()}.json"
-    with open(rank_file, "w", encoding="utf-8") as f:
-        json.dump(all_outs, f, ensure_ascii=False, indent=2)
+    write_rank_json_results(result_prefix, all_outs)
 
     mu.sync_global_devices(f"mmbench {split_name} write done")
 
     merged = None
+    merge_exception = None
     if jax.process_index() == 0:
-        merged = []
-        for rank in range(jax.process_count()):
-            path = f"{result_prefix}.results_{rank}.json"
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"During MMBench eval, process {rank} results file missing: {path}")
-            with open(path, "r", encoding="utf-8") as f:
-                merged.extend(json.load(f))
+        try:
+            merged = gather_rank_json_results(
+                result_prefix,
+                missing_file_msg="During MMBench eval, process {rank} results file missing: {path}",
+            )
 
-        dedup = {}
-        for item in merged:
-            dedup[int(item["index"])] = item
-        merged = [dedup[idx] for idx in sorted(dedup)]
-        with open(f"{result_prefix}.results_final.json", "w", encoding="utf-8") as f:
-            json.dump(merged, f, ensure_ascii=False, indent=2)
-        log_for_0(f"MMBench {split_name} merged results saved with prefix: {result_prefix}")
+            dedup = {}
+            for item in merged:
+                dedup[int(item["index"])] = item
+            merged = [dedup[idx] for idx in sorted(dedup)]
+            with open(f"{result_prefix}.results_final.json", "w", encoding="utf-8") as f:
+                json.dump(merged, f, ensure_ascii=False, indent=2)
+            log_for_0(f"MMBench {split_name} merged results saved with prefix: {result_prefix}")
+        except Exception as exc:  # Keep every rank out of the final barrier on failure.
+            logging.exception(f"MMBench {split_name} rank-0 merge failed")
+            merge_exception = exc
     else:
         log_for_all(f"Process {jax.process_index()} waiting for MMBench {split_name} merge...")
+
+    broadcast_merge_ok(merge_exception, f"MMBench {split_name}")
 
     mu.sync_global_devices(f"mmbench {split_name} merge done")
     return merged if jax.process_index() == 0 else all_outs

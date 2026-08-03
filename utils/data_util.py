@@ -66,6 +66,7 @@ dataset_name_to_path_dict = {
     'refcoco-train':     'gs://kmh-gcp-💣/data/refcoco/train/shard-{000000..000008}.tar',
     'refcocog':          'gs://kmh-gcp-💣/data/refcocog/image_records_wds/train/shard-*.tar',
     'refcocog-train':    'gs://kmh-gcp-💣/data/refcocog/image_records_wds/train/shard-*.tar',
+    'openimages-relationship-train': 'gs://kmh-gcp-💣/data/openimages-relationships/image_records_wds/train/shard-*.tar',
     'gqa':               'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/gqa-balanced/train/shard-{000000..000036}.tar',
     'gqa-train':         'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/gqa-balanced/train/shard-{000000..000036}.tar',
     'gqa-val':           'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/gqa-balanced/val/shard-{000000..000005}.tar',
@@ -144,6 +145,7 @@ dataset_name_to_type_dict = {
     'ocrvqa-train':      'ocrvqa',
     'refcoco':           'refcoco',
     'refcoco-train':     'refcoco',
+    'openimages-relationship-train': 'openimages_relationship',
     'refcocog':          'refcoco',
     'refcocog-train':    'refcoco',
     'gqa':               'gqa',
@@ -276,6 +278,26 @@ def _append_llava_ov15_grouped(
         resolved_names.append(f"{alias_name}:{group_name}")
 
 
+def _mix_weight_power(config):
+    """Optional exponent p on every RESOLVED source weight (w -> w**p): p<1
+    flattens the mixture toward uniform (0.5 = sqrt), p=1/unset is a no-op."""
+    power = config.dataset.get('dataset_mix_weight_power', None)
+    if power is None or float(power) == 1.0:
+        return None
+    power = float(power)
+    assert power > 0.0, f'dataset_mix_weight_power must be > 0, got {power}'
+    return power
+
+
+def _power_resolved_mix_weights(resolved_weights, power):
+    """Apply w -> w**p per RESOLVED source, after grouped aliases (e.g.
+    llava-ov-1.5-instruct-grouped) are expanded into per-config sub-sources.
+    OV1.5 sub-sources are powered individually like every other entry, so the
+    intra-group split is flattened together with the rest of the mixture and
+    the group's aggregate becomes sum(w_i**p), not S**p."""
+    return [float(w) ** power for w in resolved_weights]
+
+
 def resolve_dataset_roots(config, zone):
     """Resolve dataset names/paths to full GCS paths for the given zone.
 
@@ -301,6 +323,7 @@ def resolve_dataset_roots(config, zone):
     ov15_basis = config.dataset.get('llava_ov15_weight_basis', 'samples') or 'samples'
     ov15_group_weights = dict(config.dataset.get('llava_ov15_group_weights', {}) or {})
     ov15_config_weights = dict(config.dataset.get('llava_ov15_config_weights', {}) or {})
+    mix_weight_power = _mix_weight_power(config)
     items = list(config.dataset.get('items', []) or [])
     if items:
         resolved_roots = []
@@ -351,6 +374,9 @@ def resolve_dataset_roots(config, zone):
                     f"{len(resolved_weights)} weights for {len(resolved_roots)} roots. "
                     "Use either item.weight on every item or a mix_weights list matching items."
                 )
+            if mix_weight_power is not None:
+                resolved_weights = _power_resolved_mix_weights(
+                    resolved_weights, mix_weight_power)
             config.dataset.mix_weights = resolved_weights
     else:
         # Legacy: plain list of name strings / raw paths
@@ -397,6 +423,9 @@ def resolve_dataset_roots(config, zone):
                         f"{len(resolved_weights)} weights for {len(resolved_roots)} roots. "
                         "Use either no mix_weights or a mix_weights list matching root."
                     )
+                if mix_weight_power is not None:
+                    resolved_weights = _power_resolved_mix_weights(
+                        resolved_weights, mix_weight_power)
                 config.dataset.mix_weights = resolved_weights
 
     for _eval_root_key in [

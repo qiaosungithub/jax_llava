@@ -766,7 +766,7 @@ class PaliGemmaEncDec(nn.Module):
 
             # Loss 1 – standard NTP on the text-only (unconditional) branch.
             if self.text_only_loss_weight > 0.0:
-                loss_text_only, _ = token_xent_loss_from_hidden(
+                loss_text_only, _, _ = token_xent_loss_from_hidden(
                     text_out,
                     embedding_table,
                     labels,
@@ -780,7 +780,7 @@ class PaliGemmaEncDec(nn.Module):
             # Subtracting the stop-grad text prior sharpens image-specific predictions.
             if self.cfg_loss_weight > 0.0:
                 cond_text_hidden = out[:, K:, :]                     # (B, T_text, D_lm)
-                loss_cfg, _ = token_xent_loss_from_hidden(
+                loss_cfg, _, _ = token_xent_loss_from_hidden(
                     cond_text_hidden,
                     embedding_table,
                     labels,
@@ -808,7 +808,7 @@ class PaliGemmaEncDec(nn.Module):
                 lm_hidden = out
                 labels_for_loss = labels
 
-            loss_vlm, pred_ids = token_xent_loss_from_hidden(
+            loss_vlm, pred_ids, xent_aux = token_xent_loss_from_hidden(
                 lm_hidden,
                 embedding_table,
                 labels_for_loss,

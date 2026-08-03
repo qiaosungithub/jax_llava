@@ -24,6 +24,11 @@ def get_config():
     # needs per-source names). Predeclared so it can be set on a LOCKED config.
     dataset.resolved_names = []
     dataset.mix_weights = []
+    # Optional exponent p on every RESOLVED source weight (w -> w**p), applied in
+    # resolve_dataset_roots after grouped aliases expand into sub-sources. p<1
+    # flattens the mixture toward uniform (0.5 = sqrt); 1.0 is a no-op. Stage
+    # configs override via a stage-level `dataset_mix_weight_power` key.
+    dataset.dataset_mix_weight_power = 1.0
 
     dataset.num_workers = 8
     dataset.prefetch_factor = 4
@@ -53,6 +58,7 @@ def get_config():
     dataset.item_shuffle_size.genome_gcap = 2048
     dataset.item_shuffle_size.genome_det = 2048
     dataset.item_shuffle_size.refcoco = 2048
+    dataset.item_shuffle_size.openimages_relationship = 2048
     dataset.item_shuffle_size.tallyqa = 2048
     dataset.item_shuffle_size.dvqa = 2048
     dataset.item_shuffle_size.pixmo_count = 2048
@@ -270,7 +276,30 @@ def get_config():
     eval.seed_bench_root = 'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/seed-bench-image'
     eval.seed_bench_num_samples = 14233
     eval.seed_bench_cache_dir = "/kmh-nfs-ssd-us-mount/data/cached/zhh/seed_bench_eval"
-    eval.cider_cache_dir = "/kmh-nfs-ssd-us-mount/data/cached/zhh/coco_caption_eval"
+    eval.cambrian_cvbench_root = 'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/cambrian-cvbench'
+    eval.cambrian_cvbench_num_samples = 2638
+    eval.cambrian_cvbench_cache_dir = "/kmh-nfs-ssd-us-mount/data/cached/zhh/cambrian_cvbench_eval"
+    eval.cambrian_cvbench_device_batch_size = 4
+    eval.cambrian_cvbench_num_workers = 0
+    eval.cambrian_cvbench_max_txt_len = 512
+    eval.vlms_are_blind_root = 'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/vlms-are-blind'
+    eval.vlms_are_blind_num_samples = 8016
+    eval.vlms_are_blind_cache_dir = "/kmh-nfs-ssd-us-mount/data/cached/zhh/vlms_are_blind_eval"
+    eval.vlms_are_blind_device_batch_size = 4
+    eval.vlms_are_blind_num_workers = 0
+    eval.vlms_are_blind_max_txt_len = 256
+    eval.docvqa_root = 'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/docvqa'
+    eval.docvqa_num_samples = 5349
+    eval.docvqa_cache_dir = "/kmh-nfs-ssd-us-mount/data/cached/zhh/docvqa_eval"
+    eval.docvqa_device_batch_size = 4
+    eval.docvqa_num_workers = 0
+    eval.docvqa_max_txt_len = 512
+    eval.realworldqa_root = 'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/realworldqa'
+    eval.realworldqa_num_samples = 765
+    eval.realworldqa_cache_dir = "/kmh-nfs-ssd-us-mount/data/cached/zhh/realworldqa_eval"
+    eval.realworldqa_device_batch_size = 4
+    eval.realworldqa_num_workers = 0
+    eval.realworldqa_max_txt_len = 512
     eval.pope_root = "gs://kmh-gcp-💣/data/pope/coco_image_records_wds/val2014"
     eval.pope_dataset = "coco"
     eval.pope_image_root = "unused_for_image_records_wds"
@@ -305,8 +334,12 @@ def get_config():
     eval.eval_tokens_shortqa = 8
     eval.eval_tokens_mid = 16
     eval.eval_tokens_ocr = 32
-    eval.eval_tokens_refcoco = 16
+    eval.eval_tokens_refcoco = 32
     eval.eval_tokens_pixelbench = 32
+    eval.eval_tokens_cambrian_cvbench = 8
+    eval.eval_tokens_vlms_are_blind = 32
+    eval.eval_tokens_docvqa = 32
+    eval.eval_tokens_realworldqa = 16
     eval.eval_tokens_mmbench = 8
     # Backward-compatible aliases.
     eval.short_answer_max_new_tokens = eval.eval_tokens_shortqa
@@ -319,10 +352,10 @@ def get_config():
     eval.mme_num_workers = 0
     # Optional smoke-test caps. 0/None keeps the full benchmark.
     eval.debug_max_samples = 0
-    eval.mme_max_samples = 0
-    eval.pope_max_samples_per_split = 0
-    eval.refcocog_max_samples = 0
-    eval.pixelbench_max_samples = 0
+    eval.mme_num_samples = 0
+    eval.pope_num_samples_per_split = 0
+    eval.refcocog_num_samples = 0
+    eval.pixelbench_num_samples_per_benchmark = 0
     eval.mmbench_max_samples = 0
     eval.current_eval_step = -1
     eval.current_eval_run_id = "manual"
@@ -339,6 +372,7 @@ def get_config():
     eval.knn_temperature = 0.07
     eval.knn_seed = 42
     eval.knn_images_per_class = 128   # for partial eval
+    eval.knn_full_images_per_class = None   # None = whole train set (full eval)
     # Optional remote debug cap.  None/0 keeps the full 50 k ImageNet val set.
     eval.knn_val_examples = None
     eval.knn_batch_size = 256

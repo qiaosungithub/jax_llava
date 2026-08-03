@@ -159,7 +159,18 @@ def train_step(state, batch, rng_init, config):
     return new_state, metrics, debug
 
 
-def sample_step(params, images, prompt_ids, prefix_len, model, max_new_tokens=64, beam_size=1):
+def sample_step(params, images, prompt_ids, prefix_len, model, max_new_tokens=64, beam_size=1, cfg_guidance_scale=0.0):
+    if cfg_guidance_scale and float(cfg_guidance_scale) != 0.0:
+        assert beam_size == 1, 'eval-time CFG guidance only supports greedy (beam_size=1)'
+        return model.apply(
+            {'params': params},
+            prompt_ids,
+            prefix_len,
+            images,
+            method=model.generate_cfg,
+            max_new_tokens=max_new_tokens,
+            guidance_scale=float(cfg_guidance_scale),
+        )
     if beam_size > 1:
         return model.apply(
             {'params': params},
@@ -466,6 +477,26 @@ def _build_pjit_fns(config, model, state, mesh_bundle):
     ocr_tokens = _eval_token_budget(config, 'eval_tokens_ocr', 32)
     refcoco_tokens = _eval_token_budget(config, 'eval_tokens_refcoco', mid_tokens)
     pixelbench_tokens = _eval_token_budget(config, 'eval_tokens_pixelbench', ocr_tokens)
+    cvbench_tokens = _eval_token_budget(
+        config,
+        'eval_tokens_cambrian_cvbench',
+        short_tokens,
+    )
+    blindtest_tokens = _eval_token_budget(
+        config,
+        'eval_tokens_vlms_are_blind',
+        32,
+    )
+    docvqa_tokens = _eval_token_budget(
+        config,
+        'eval_tokens_docvqa',
+        32,
+    )
+    realworldqa_tokens = _eval_token_budget(
+        config,
+        'eval_tokens_realworldqa',
+        16,
+    )
     mmbench_tokens = _eval_token_budget(
         config,
         'eval_tokens_mmbench',
@@ -475,9 +506,12 @@ def _build_pjit_fns(config, model, state, mesh_bundle):
 
     sample_cache = {}
 
+    cfg_guidance = float(config.sampling.get('cfg_guidance_scale', 0.0) or 0.0)
+
     def compile_sample_step(max_new_tokens, beam_size=default_beam, sampler_batch_spec=batch_spec, spec_name='default'):
         max_new_tokens = int(max_new_tokens)
         beam_size = int(beam_size)
+        step_cfg_guidance = 0.0 if beam_size > 1 else cfg_guidance
         cache_key = (max_new_tokens, beam_size, spec_name)
         if cache_key in sample_cache:
             return sample_cache[cache_key]
@@ -491,6 +525,7 @@ def _build_pjit_fns(config, model, state, mesh_bundle):
                 model=model,
                 max_new_tokens=max_new_tokens,
                 beam_size=beam_size,
+                cfg_guidance_scale=step_cfg_guidance,
             ),
             in_shardings=(
                 state_spec.params,
@@ -512,6 +547,10 @@ def _build_pjit_fns(config, model, state, mesh_bundle):
         'ocr': compile_sample_step(ocr_tokens, default_beam),
         'refcoco': compile_sample_step(refcoco_tokens, default_beam),
         'pixelbench': compile_sample_step(pixelbench_tokens, default_beam),
+        'cvbench': compile_sample_step(cvbench_tokens, default_beam),
+        'blindtest': compile_sample_step(blindtest_tokens, default_beam),
+        'docvqa': compile_sample_step(docvqa_tokens, default_beam),
+        'realworldqa': compile_sample_step(realworldqa_tokens, default_beam),
         # MMBench can need a longer prompt length than training/VQA prompts, so
         # it gets its own input spec instead of reusing batch_spec['input_ids'].
         'mmbench': compile_sample_step(
@@ -730,6 +769,11 @@ def _build_curriculum_stage_config(config, stage_key, *, stage_start_step, stage
         phase_config.dataset['items'] = copy.deepcopy(dataset_items)
     if stage.get('mix_weights', None) is not None:
         phase_config.dataset['mix_weights'] = copy.deepcopy(stage.mix_weights)
+    # Lives at the same stage level as mix_weights (the knob it modifies);
+    # forwarded onto phase_config.dataset where resolve_dataset_roots reads it.
+    if stage.get('dataset_mix_weight_power', None) is not None:
+        phase_config.dataset['dataset_mix_weight_power'] = copy.deepcopy(
+            stage.dataset_mix_weight_power)
     if stage.get('dataset', None) is not None:
         for key, value in stage.dataset.items():
             target_key = 'max_txt_len' if key == 'max_txt_length' else key

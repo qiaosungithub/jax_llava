@@ -134,10 +134,10 @@ eval:
     vizwiz_num_samples: 4
     scienceqa_img_num_samples: 4
     seed_bench_num_samples: 4
-    mme_max_samples: 16
-    pope_max_samples_per_split: 4
-    refcocog_max_samples: 16
-    pixelbench_max_samples: 16
+    mme_num_samples: 16
+    pope_num_samples_per_split: 4
+    refcocog_num_samples: 16
+    pixelbench_num_samples_per_benchmark: 16
     mmbench_max_samples: 16
     pixelbench_samples_per_benchmark: 3
     refcocog_num_vis: 3

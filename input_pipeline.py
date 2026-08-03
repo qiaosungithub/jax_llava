@@ -4,6 +4,7 @@ import json
 import math
 import os
 import pickle
+import re
 import subprocess
 import warnings
 
@@ -15,10 +16,19 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from torchvision import transforms
 from torchvision.transforms import functional as TF
 from functools import partial
-from PIL import Image, ImageFile
+from PIL import Image, ImageDraw, ImageFile
 
 from utils.logging_util import log_for_0
 from utils.llm_util import create_tokenizer
+from utils.bbox_util import (
+    CANONICAL_BBOX_FORMAT,
+    canonical_bbox_record,
+    canonicalize_bbox_xyxy,
+    explicit_bbox_format,
+    legacy_refcoco_untagged_format,
+    record_coord_size,
+    resolve_canonical_bbox,
+)
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -124,6 +134,91 @@ _GCAP_REGION_PROMPTS = [
     "Give a short caption for region {loc}.",
 ]
 
+_GCAP_DRAWN_BOX_PROMPTS = [
+    "Describe the region highlighted by the {color} box.",
+    "What is in the region highlighted by the {color} box?",
+    "Give a short caption for the region highlighted by the {color} box.",
+]
+
+_GCAP_DRAWN_BOX_COLORS = (
+    ("red", (255, 0, 0)),
+    ("green", (0, 255, 0)),
+    ("blue", (0, 0, 255)),
+)
+
+_OPENIMAGES_RELATIONSHIP_SHORT_PROMPTS = (
+    "How is {subject} related to {object}? Name both objects in one sentence.",
+    "Describe how {subject} relates to {object}, identifying both objects in one sentence.",
+    "What is the direct visual relationship from {subject} to {object}? "
+    "Answer in one short sentence and name both objects.",
+    "Name the two objects and state the relation from {subject} to {object} in one sentence.",
+    "Considering the two marked regions, how does {subject} relate to {object}? "
+    "Answer with one sentence.",
+    "Identify both objects. In one short sentence, state {subject}'s relation to {object}.",
+)
+
+_OPENIMAGES_RELATIONSHIP_ANCHOR_PROMPTS = (
+    "Use {subject} as the sentence subject and describe its visible relation to {object}. "
+    "Name both objects in one sentence.",
+    "Write one factual sentence that identifies {subject} and states its relation to {object}. "
+    "Do not add other scene details.",
+)
+
+# A finite surface realizer is deliberately used instead of attempting to parse
+# or inflect free-form answers in the input pipeline. Open Images V6 has exactly
+# these non-attribute predicates. ``interacts_with`` is filtered by the uploader
+# because it is not a concrete, visually checkable relation.
+_OPENIMAGES_RELATIONSHIP_SURFACES = {
+    "at": "is at",
+    "holds": "holds",
+    "wears": "wears",
+    "surf": "surfs on",
+    "hang": "hangs from",
+    "drink": "drinks",
+    "holding_hands": "holds hands with",
+    "on": "is on",
+    "ride": "rides",
+    "dance": "dances with",
+    "skateboard": "rides",
+    "catch": "catches",
+    "highfive": "high-fives",
+    "inside_of": "is inside",
+    "eat": "eats",
+    "cut": "cuts",
+    "contain": "contains",
+    "handshake": "shakes hands with",
+    "kiss": "kisses",
+    "talk_on_phone": "talks on",
+    "under": "is under",
+    "hug": "hugs",
+    "throw": "throws",
+    "hits": "hits",
+    "snowboard": "rides",
+    "kick": "kicks",
+    "ski": "uses",
+    "plays": "plays",
+    "read": "reads",
+}
+
+_GROUNDED_CAPTION_DATASET_TYPES = {
+    "genome_gcap",
+    "refcoco_gcap",
+    "openimages_detection",
+}
+_STRUCTURED_GROUNDING_DATASET_TYPES = {
+    "genome_gcap",
+    "genome_det",
+    "refcoco_gcap",
+    "refcoco",
+    "openimages_detection",
+}
+_STRUCTURED_RELATIONSHIP_DATASET_TYPES = {"openimages_relationship"}
+# Both roles of one example share this coin flip: drawn boxes or loc tokens.
+_GROUNDED_CAPTION_DRAW_BOX_PROB = 0.5
+# The refcoco stream carries a DOUBLED mix weight and each sample is routed by
+# this coin flip into detection (phrase -> box) or grounded captioning.
+_REFCOCO_GCAP_TASK_PROB = 0.5
+
 _DETECTION_PROMPT_SUFFIX = (
     "Output exactly four location tokens, indicating up, left, down, right."
 )
@@ -132,8 +227,15 @@ _POINTING_PROMPT_SUFFIX = (
 )
 _MC_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
+# PixMo-Points stores x/y in a 0-to-100 source canvas. This is explicit in the
+# upstream Molmo adapter (``point_scale=100``); it is not a [0,1] fraction and
+# it is not measured in decoded-image pixels.
+_PIXMO_POINT_SCALE = 100.0
 
-def format_detection_prompt(phrase: str) -> str:
+
+def format_detection_prompt(phrase: str, coord_format: str = "loc_tokens") -> str:
+    # coord_format accepted for eval-harness parity with PaliGemma-baseline;
+    # jax_llava emits loc_tokens only (follows beifen), so it is a no-op here.
     phrase = (phrase or "").strip()
     return f"Locate the region described by this phrase: {phrase}\n{_DETECTION_PROMPT_SUFFIX}\n"
 
@@ -245,7 +347,15 @@ def _dataset_type_to_mask_category(dataset_type: str) -> str:
         return "vqa"
     if dataset_type in {"rendered_text", "textcaps", "ureader"}:
         return "ocr"
-    if dataset_type in {"genome_gcap", "genome_det", "refcoco", "pixmo_points"}:
+    if dataset_type in {
+        "genome_gcap",
+        "genome_det",
+        "refcoco",
+        "refcoco_gcap",
+        "openimages_detection",
+        "openimages_relationship",
+        "pixmo_points",
+    }:
         return "grounded_caption"
     return "caption"
 
@@ -801,6 +911,46 @@ def get_transforms(image_size, is_train=True, resize_mode="letterbox"):
     raise ValueError(f"Unknown resize_mode: {resize_mode}")
 
 
+def _box_xyxy_to_model_tokens(transform, bbox_xyxy, image_size):
+    """Convert one canonical source-image xyxy box at the model-text boundary.
+
+    Same quantization as ``_box_to_loc_tokens``; the entry point differs because
+    structured sources carry canonical xyxy + an explicit coord_size rather than
+    xywh. jax_llava emits loc_tokens only (beifen's coord_format knob is a no-op
+    here), matching beifen stage3's coord_format=loc_tokens.
+    """
+    img_w, img_h = image_size
+    canonical = canonicalize_bbox_xyxy(
+        bbox_xyxy,
+        CANONICAL_BBOX_FORMAT,
+        coord_size=(img_w, img_h),
+    )
+    if canonical is None:
+        return None
+    x1, y1, x2, y2 = canonical
+
+    if hasattr(transform, "transform_box"):
+        x1, y1, x2, y2 = transform.transform_box(x1, y1, x2, y2, img_w, img_h)
+        norm_w, norm_h = _transform_target_size(transform)
+        if norm_w is None or norm_h is None:
+            norm_w, norm_h = img_w, img_h
+    else:
+        norm_w, norm_h = img_w, img_h
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    ymin = int((y1 / norm_h) * 1023)
+    xmin = int((x1 / norm_w) * 1023)
+    ymax = int((y2 / norm_h) * 1023)
+    xmax = int((x2 / norm_w) * 1023)
+    ymin = max(0, min(ymin, 1023))
+    xmin = max(0, min(xmin, 1023))
+    ymax = max(0, min(ymax, 1023))
+    xmax = max(0, min(xmax, 1023))
+    return f"<loc{ymin:04d}><loc{xmin:04d}><loc{ymax:04d}><loc{xmax:04d}>"
+
+
 def _box_to_loc_tokens(transform, x, y, w, h, img_w, img_h):
     img_w = max(float(img_w), 1.0)
     img_h = max(float(img_h), 1.0)
@@ -833,14 +983,303 @@ def _box_to_loc_tokens(transform, x, y, w, h, img_w, img_h):
     return f"<loc{ymin:04d}><loc{xmin:04d}><loc{ymax:04d}><loc{xmax:04d}>"
 
 
-def _point_to_loc_tokens(transform, x, y, img_w, img_h):
+def _structured_grounding_fields(sample, dataset_type, decoded_size):
+    """Return phrase plus canonical absolute xyxy on the decoded image canvas.
+
+    Dataset-specific conventions are interpreted only at the adapter boundary.
+    Every downstream drawing/tokenization path receives the same explicit
+    representation, regardless of whether storage used VG xywh, legacy
+    RefCOCO xyxy, or explicit RefCOCOg xywh.
+    """
+    decoded_w, decoded_h = decoded_size
+    if dataset_type in {"genome_gcap", "genome_det"}:
+        region = sample.get("region")
+        if not isinstance(region, dict):
+            return None
+        phrase = str(region.get("phrase") or "").strip()
+        if len(phrase.split()) < 2:
+            return None
+    elif dataset_type in {"refcoco_gcap", "refcoco", "openimages_detection"}:
+        phrase = str(sample.get("phrase") or "").strip()
+        if not phrase:
+            return None
+    else:
+        return None
+
+    if sample.get("bbox_xyxy") is not None:
+        raw_box = sample.get("bbox_xyxy")
+        bbox_format = sample.get("bbox_format")
+        coord_size = sample.get("bbox_coord_size")
+    elif dataset_type in {"genome_gcap", "genome_det"}:
+        raw_box = (
+            region.get("x", 0),
+            region.get("y", 0),
+            region.get("width", 0),
+            region.get("height", 0),
+        )
+        bbox_format = "xywh_abs"
+        coord_size = (
+            sample.get("img_w") or decoded_w,
+            sample.get("img_h") or decoded_h,
+        )
+    elif sample.get("bbox") is not None:
+        # Compatibility for already-expanded pre-canonical RefCOCO loader state.
+        # Raw storage records never enter preprocess_fn directly; old expanded
+        # items had already converted their ambiguous source bbox into xywh.
+        raw_box = sample.get("bbox")
+        bbox_format = sample.get("bbox_format") or "xywh_abs"
+        coord_size = sample.get("bbox_coord_size")
+    else:
+        return None
+
+    coord_size = coord_size or (
+        sample.get("img_w") or decoded_w,
+        sample.get("img_h") or decoded_h,
+    )
+    try:
+        bbox_xyxy = canonicalize_bbox_xyxy(
+            raw_box,
+            bbox_format,
+            coord_size=coord_size,
+            target_size=(decoded_w, decoded_h),
+        )
+    except ValueError:
+        return None
+    if bbox_xyxy is None:
+        return None
+    return {
+        "phrase": phrase,
+        "bbox_xyxy": bbox_xyxy,
+        "bbox_format": CANONICAL_BBOX_FORMAT,
+        "coord_size": (float(decoded_w), float(decoded_h)),
+    }
+
+
+def _grounded_caption_fields(sample, dataset_type, decoded_size):
+    """Backward-compatible name for box-to-phrase field extraction."""
+    return _structured_grounding_fields(sample, dataset_type, decoded_size)
+
+
+def _canonical_openimages_relationship_entity(entity, decoded_size):
+    """Adapt one structured Open Images entity to decoded-image absolute xyxy."""
+    if not isinstance(entity, dict):
+        return None
+    label = " ".join(str(entity.get("label") or entity.get("name") or "").split())
+    if not label:
+        return None
+    raw_box = entity.get("bbox_xyxy")
+    if raw_box is None:
+        raw_box = entity.get("bbox")
+    if raw_box is None:
+        return None
+    bbox_format = str(entity.get("bbox_format") or CANONICAL_BBOX_FORMAT)
+    coord_size = entity.get("bbox_coord_size") or entity.get("coord_size") or decoded_size
+    try:
+        bbox_xyxy = canonicalize_bbox_xyxy(
+            raw_box,
+            bbox_format,
+            coord_size=coord_size,
+            target_size=decoded_size,
+        )
+    except (TypeError, ValueError):
+        return None
+    if bbox_xyxy is None:
+        return None
+    return {
+        "label": label,
+        "label_mid": entity.get("label_mid"),
+        "bbox_xyxy": bbox_xyxy,
+        "bbox_format": CANONICAL_BBOX_FORMAT,
+        "coord_size": (float(decoded_size[0]), float(decoded_size[1])),
+    }
+
+
+def _structured_relationship_fields(sample, dataset_type, decoded_size):
+    """Return a mechanically supervised subject/predicate/object record.
+
+    The uploader preserves the Open Images triplet as structured fields. This
+    adapter intentionally never parses a natural-language answer to recover the
+    subject or object, which keeps role assignment exact even for overlapping
+    boxes.
+    """
+    if dataset_type not in _STRUCTURED_RELATIONSHIP_DATASET_TYPES:
+        return None
+    relation = sample.get("relationship")
+    if not isinstance(relation, dict):
+        return None
+    predicate = str(relation.get("predicate") or relation.get("relation") or "").strip()
+    if predicate not in _OPENIMAGES_RELATIONSHIP_SURFACES:
+        return None
+    subject = _canonical_openimages_relationship_entity(
+        relation.get("subject"), decoded_size
+    )
+    object_ = _canonical_openimages_relationship_entity(
+        relation.get("object"), decoded_size
+    )
+    if subject is None or object_ is None:
+        return None
+    return {
+        "subject": subject,
+        "object": object_,
+        "predicate": predicate,
+    }
+
+
+def _normalize_openimages_object_label(label):
+    """Turn an OI display label into a short natural target noun phrase."""
+    label = " ".join(str(label or "").split()).strip().lower()
+    # OI uses suffixes such as ``(Animal)`` and ``(Musical Instrument)`` only
+    # for ontology disambiguation; they are not natural grounded answers.
+    label = re.sub(r"\s+\([^()]+\)\s*$", "", label).strip()
+    return label
+
+
+def _openimages_relationship_target(structured_relationship):
+    """Realize the finite OI predicate vocabulary as one factual sentence."""
+    predicate = structured_relationship["predicate"]
+    surface = _OPENIMAGES_RELATIONSHIP_SURFACES.get(predicate)
+    if surface is None:
+        return None
+    subject = _normalize_openimages_object_label(
+        structured_relationship["subject"]["label"]
+    )
+    object_ = _normalize_openimages_object_label(
+        structured_relationship["object"]["label"]
+    )
+    if not subject or not object_:
+        return None
+    return f"The {subject} {surface} the {object_}."
+
+
+def _sample_openimages_relationship_prompt(subject_reference, object_reference):
+    """Sample 80% short prompts and 20% anti-ambiguity anchor prompts."""
+    bank = (
+        _OPENIMAGES_RELATIONSHIP_SHORT_PROMPTS
+        if random.random() < 0.8
+        else _OPENIMAGES_RELATIONSHIP_ANCHOR_PROMPTS
+    )
+    return random.choice(bank).format(
+        subject=subject_reference,
+        object=object_reference,
+    )
+
+
+def _draw_region_box(image, bbox_xyxy, coord_size, color=(255, 0, 0)):
+    """Draw one canonical unfilled box without mutating the decoded image."""
+    image_w, image_h = image.size
+    if image_w <= 0 or image_h <= 0:
+        return None
+    try:
+        canonical = canonicalize_bbox_xyxy(
+            bbox_xyxy,
+            CANONICAL_BBOX_FORMAT,
+            coord_size=coord_size,
+            target_size=(image_w, image_h),
+        )
+    except ValueError:
+        return None
+    if canonical is None:
+        return None
+    x1, y1, x2, y2 = canonical
+    left = int(math.floor(x1))
+    top = int(math.floor(y1))
+    right = int(math.ceil(x2))
+    bottom = int(math.ceil(y2))
+    left = max(0, min(left, image_w - 1))
+    top = max(0, min(top, image_h - 1))
+    right = max(0, min(right, image_w - 1))
+    bottom = max(0, min(bottom, image_h - 1))
+    if right <= left:
+        if left < image_w - 1:
+            right = left + 1
+        elif left > 0:
+            left -= 1
+        else:
+            return None
+    if bottom <= top:
+        if top < image_h - 1:
+            bottom = top + 1
+        elif top > 0:
+            top -= 1
+        else:
+            return None
+
+    box_short_side = max(1, min(right - left, bottom - top))
+    natural_width = max(2, int(round(0.006 * max(image_w, image_h))))
+    outline_width = max(1, min(natural_width, max(1, box_short_side // 4)))
+    marked = image.convert("RGB").copy()
+    ImageDraw.Draw(marked).rectangle(
+        (left, top, right, bottom),
+        outline=color,
+        width=outline_width,
+    )
+    return marked
+
+
+def _draw_relationship_boxes(image, structured_relationship, subject_color, object_color):
+    """Draw both role boxes on one copy before resize/letterbox transforms."""
+    marked = _draw_region_box(
+        image,
+        structured_relationship["subject"]["bbox_xyxy"],
+        structured_relationship["subject"]["coord_size"],
+        color=subject_color,
+    )
+    if marked is None:
+        return None
+    return _draw_region_box(
+        marked,
+        structured_relationship["object"]["bbox_xyxy"],
+        structured_relationship["object"]["coord_size"],
+        color=object_color,
+    )
+
+
+def _sample_grounded_caption_box_mode():
+    """Uniformly sample the region representation for box-to-text training."""
+    return (
+        "drawn_box"
+        if random.random() < _GROUNDED_CAPTION_DRAW_BOX_PROB
+        else "loc_tokens"
+    )
+
+
+def _sample_grounded_caption_box_color():
+    """Uniformly sample a synchronized color name and RGB outline value."""
+    return random.choice(_GCAP_DRAWN_BOX_COLORS)
+
+
+def _sample_refcoco_task_type():
+    """Uniformly choose phrase-to-box detection or box-to-phrase captioning."""
+    return (
+        "refcoco_gcap"
+        if random.random() < _REFCOCO_GCAP_TASK_PROB
+        else "refcoco"
+    )
+
+
+def _sample_relationship_box_colors():
+    """Sample distinct subject/object colors without a fixed role-color cue."""
+    return tuple(random.sample(_GCAP_DRAWN_BOX_COLORS, 2))
+
+
+def _point_to_loc_tokens(transform, x, y, img_w, img_h, point_scale=None):
     img_w = max(float(img_w), 1.0)
     img_h = max(float(img_h), 1.0)
     x = float(x)
     y = float(y)
-    # PixMo stores normalized coordinates in [0, 1]. Keep support for absolute
-    # pixel coordinates as a fallback in case future mirrors change format.
-    if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
+    if not math.isfinite(x) or not math.isfinite(y):
+        raise ValueError(f"Point coordinates must be finite, got {(x, y)}")
+    # A source-specific scale takes precedence over value heuristics: a PixMo
+    # coordinate like 0.5 means 0.5% of the image, not the fraction 0.5.
+    if point_scale is not None:
+        point_scale = float(point_scale)
+        if not math.isfinite(point_scale) or point_scale <= 0.0:
+            raise ValueError(f"point_scale must be finite and positive, got {point_scale}")
+        x = x / point_scale * img_w
+        y = y / point_scale * img_h
+    # Generic fallback for non-PixMo callers: values jointly in [0,1] are
+    # fractions, otherwise decoded-image pixels.
+    elif 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
         x = x * img_w
         y = y * img_h
     x = max(0.0, min(x, img_w))
@@ -950,7 +1389,9 @@ def _get_text_from_sample(sample, dataset_type):
         return [str(x).strip() for x in caps if str(x).strip()]
 
     caption = sample.get("txt") or sample.get("caption") or ""
-    if not isinstance(caption, str):
+    if isinstance(caption, bytes):
+        caption = caption.decode("utf-8", errors="replace")
+    elif not isinstance(caption, str):
         caption = str(caption)
     return caption
 
@@ -963,12 +1404,67 @@ def preprocess_fn(
     dataset_type="default",
     mask_token_category_probs=None,
 ):
+    # RefCOCO and RefCOCOg share one physical/config stream. Sample the task
+    # direction here so the stateful loader's saved choice RNG replays it after
+    # resume. The gcap direction independently samples coordinate vs drawn-box
+    # conditioning below.
+    if dataset_type == "refcoco":
+        dataset_type = _sample_refcoco_task_type()
+
+    structured_grounding = None
+    structured_relationship = None
     try:
         image = sample.get("jpg") or sample.get("jpeg") or sample.get("png") or sample.get("webp")
         if image is None:
             return None
         image = _decode_image_if_needed(image)
         orig_w, orig_h = image.size
+        if dataset_type in _STRUCTURED_GROUNDING_DATASET_TYPES:
+            structured_grounding = _structured_grounding_fields(
+                sample,
+                dataset_type,
+                decoded_size=(orig_w, orig_h),
+            )
+            if structured_grounding is None:
+                return None
+        if dataset_type in _GROUNDED_CAPTION_DATASET_TYPES:
+            structured_grounding["box_mode"] = _sample_grounded_caption_box_mode()
+            if structured_grounding["box_mode"] == "drawn_box":
+                color_name, color_rgb = _sample_grounded_caption_box_color()
+                structured_grounding["box_color_name"] = color_name
+                # Must happen before transform(): the box is drawn in decoded-image
+                # coordinates, then resized along with the pixels.
+                image = _draw_region_box(
+                    image,
+                    structured_grounding["bbox_xyxy"],
+                    structured_grounding["coord_size"],
+                    color=color_rgb,
+                )
+                if image is None:
+                    return None
+        if dataset_type in _STRUCTURED_RELATIONSHIP_DATASET_TYPES:
+            structured_relationship = _structured_relationship_fields(
+                sample,
+                dataset_type,
+                decoded_size=(orig_w, orig_h),
+            )
+            if structured_relationship is None:
+                return None
+            structured_relationship["box_mode"] = _sample_grounded_caption_box_mode()
+            if structured_relationship["box_mode"] == "drawn_box":
+                subject_color, object_color = _sample_relationship_box_colors()
+                structured_relationship["subject"]["box_color_name"] = subject_color[0]
+                structured_relationship["object"]["box_color_name"] = object_color[0]
+                # Must happen before transform(): boxes are drawn in decoded-image
+                # coordinates, then resized along with the pixels.
+                image = _draw_relationship_boxes(
+                    image,
+                    structured_relationship,
+                    subject_color=subject_color[1],
+                    object_color=object_color[1],
+                )
+                if image is None:
+                    return None
         pixel_values = transform(image)
     except Exception:
         return None
@@ -1112,6 +1608,11 @@ def preprocess_fn(
     elif dataset_type == "pixmo_points":
         label = (sample.get("label") or "object").strip()
         points = sample.get("points") or []
+        aux = sample.get("aux", None) or {}
+        point_scale = sample.get(
+            "point_scale",
+            aux.get("point_scale", _PIXMO_POINT_SCALE),
+        )
         locs = []
         for point in points:
             if not isinstance(point, dict):
@@ -1123,6 +1624,7 @@ def preprocess_fn(
                     point["y"],
                     orig_w,
                     orig_h,
+                    point_scale=point_scale,
                 ))
             except (KeyError, TypeError, ValueError):
                 continue
@@ -1134,60 +1636,84 @@ def preprocess_fn(
             prefix = f"Point to all instances of {label} in the image.\n{_POINTING_PROMPT_SUFFIX}\n"
         full_text = f"{prefix}{''.join(locs)}"
         prefix_tokens = tokenizer.encode(prefix, add_bos=True, add_eos=False)
-    elif dataset_type == "genome_gcap":
-        # Grounded captioning: prompt = "caption <loc_ymin><loc_xmin><loc_ymax><loc_xmax>\n"
-        # label  = region phrase (natural language description of the box)
-        region = sample.get("region")
-        if region is None:
-            return None
-        phrase = (region.get("phrase") or "").strip()
-        if len(phrase.split()) < 2:
-            return None
-        img_w = sample.get("img_w") or 1
-        img_h = sample.get("img_h") or 1
-        x = region.get("x", 0)
-        y = region.get("y", 0)
-        w = region.get("width", 0)
-        h = region.get("height", 0)
-        if w <= 0 or h <= 0:
-            return None
-        loc = _box_to_loc_tokens(transform, x, y, w, h, img_w, img_h)
-        if loc is None:
-            return None
-        prefix = random.choice(_GCAP_REGION_PROMPTS).format(loc=loc) + "\n"
+    elif dataset_type in _GROUNDED_CAPTION_DATASET_TYPES:
+        # Box-to-text supervision with a uniform choice of two equivalent box
+        # representations: textual coordinates or a colored outline in the image.
+        phrase = structured_grounding["phrase"]
+        if structured_grounding["box_mode"] == "drawn_box":
+            prefix = random.choice(_GCAP_DRAWN_BOX_PROMPTS).format(
+                color=structured_grounding["box_color_name"]
+            ) + "\n"
+        else:
+            loc = _box_xyxy_to_model_tokens(
+                transform,
+                structured_grounding["bbox_xyxy"],
+                structured_grounding["coord_size"],
+            )
+            if loc is None:
+                return None
+            prefix = random.choice(_GCAP_REGION_PROMPTS).format(loc=loc) + "\n"
         full_text = f"{prefix}{phrase}"
+        prefix_tokens = tokenizer.encode(prefix, add_bos=True, add_eos=False)
+    elif dataset_type in _STRUCTURED_RELATIONSHIP_DATASET_TYPES:
+        # Both roles use one jointly sampled representation. Never mix a drawn
+        # subject with a coordinate object (or vice versa) within one example.
+        if structured_relationship["box_mode"] == "drawn_box":
+            subject_reference = (
+                "the object in the "
+                f"{structured_relationship['subject']['box_color_name']} box"
+            )
+            object_reference = (
+                "the object in the "
+                f"{structured_relationship['object']['box_color_name']} box"
+            )
+        else:
+            subject_loc = _box_xyxy_to_model_tokens(
+                transform,
+                structured_relationship["subject"]["bbox_xyxy"],
+                structured_relationship["subject"]["coord_size"],
+            )
+            object_loc = _box_xyxy_to_model_tokens(
+                transform,
+                structured_relationship["object"]["bbox_xyxy"],
+                structured_relationship["object"]["coord_size"],
+            )
+            # Identical loc tokens make the two roles indistinguishable, so the
+            # example carries no learnable subject/object assignment.
+            if subject_loc is None or object_loc is None or subject_loc == object_loc:
+                return None
+            subject_reference = f"the object in region {subject_loc}"
+            object_reference = f"the object in region {object_loc}"
+        target = _openimages_relationship_target(structured_relationship)
+        if target is None:
+            return None
+        prefix = _sample_openimages_relationship_prompt(
+            subject_reference,
+            object_reference,
+        ) + "\n"
+        full_text = f"{prefix}{target}"
         prefix_tokens = tokenizer.encode(prefix, add_bos=True, add_eos=False)
     elif dataset_type == "genome_det":
         # Grounded detection: prompt is a phrase, target is bbox tokens.
         # Format aligned with RefCOCO-style evaluation prompting.
-        region = sample.get("region")
-        if region is None:
-            return None
-        phrase = (region.get("phrase") or "").strip()
-        if len(phrase.split()) < 2:
-            return None
-        img_w = sample.get("img_w") or 1
-        img_h = sample.get("img_h") or 1
-        x = region.get("x", 0)
-        y = region.get("y", 0)
-        w = region.get("width", 0)
-        h = region.get("height", 0)
-        if w <= 0 or h <= 0:
-            return None
-        loc = _box_to_loc_tokens(transform, x, y, w, h, img_w, img_h)
+        phrase = structured_grounding["phrase"]
+        loc = _box_xyxy_to_model_tokens(
+            transform,
+            structured_grounding["bbox_xyxy"],
+            structured_grounding["coord_size"],
+        )
         if loc is None:
             return None
         prefix = format_detection_prompt(phrase)
         full_text = f"{prefix}{loc}"
         prefix_tokens = tokenizer.encode(prefix, add_bos=True, add_eos=False)
     elif dataset_type == "refcoco":
-        phrase = (sample.get("phrase") or "").strip()
-        bbox = sample.get("bbox", [])
-        if not phrase or not bbox or len(bbox) < 4:
-            return None
-        img_w = sample.get("img_w") or orig_w or 1
-        img_h = sample.get("img_h") or orig_h or 1
-        loc = _box_to_loc_tokens(transform, bbox[0], bbox[1], bbox[2], bbox[3], img_w, img_h)
+        phrase = structured_grounding["phrase"]
+        loc = _box_xyxy_to_model_tokens(
+            transform,
+            structured_grounding["bbox_xyxy"],
+            structured_grounding["coord_size"],
+        )
         if loc is None:
             return None
         prefix = format_detection_prompt(phrase)
@@ -1451,10 +1977,15 @@ def expand_pixmo_points_sample(sample):
                 continue
         if not label or not points:
             continue
+        point_scale = ann.get(
+            "point_scale",
+            j.get("point_scale", _PIXMO_POINT_SCALE),
+        )
         out.append({
             "jpg": img,
             "label": label,
             "points": points,
+            "point_scale": point_scale,
             "aux": {
                 "dataset": j.get("dataset", "pixmo-points"),
                 "image_key": j.get("image_key"),
@@ -1462,6 +1993,7 @@ def expand_pixmo_points_sample(sample):
                 "label": label,
                 "count": ann.get("count"),
                 "points": points,
+                "point_scale": point_scale,
                 "collection_method": ann.get("collection_method"),
             },
         })
@@ -1525,58 +2057,66 @@ def _refcoco_phrases(ref):
     return deduped
 
 
-def _refcoco_bbox_xywh(ref):
-    """Return xywh bbox for RefCOCO-family records.
+def _refcoco_bbox_xyxy(ref, dataset_name, coord_size=None):
+    """Adapt one RefCOCO-family source record to canonical absolute xyxy."""
+    untagged_format = legacy_refcoco_untagged_format(dataset_name)
+    if (ref.get("bbox") is not None
+            and not explicit_bbox_format(ref, "bbox_format")
+            and not untagged_format):
+        raise ValueError(
+            f"Ambiguous untagged RefCOCO bbox for dataset={dataset_name!r}"
+        )
+    bbox_xyxy, _ = resolve_canonical_bbox(
+        ref,
+        untagged_format=untagged_format,
+        coord_size=coord_size if coord_size is not None else record_coord_size(ref),
+        label="RefCOCO",
+    )
+    return bbox_xyxy
 
-    New records write bbox_format explicitly. Legacy jxu124/refcoco shards stored
-    HF's xyxy `bbox` without a format tag, so missing format is treated as xyxy.
-    """
-    def _as_box(value):
-        if not isinstance(value, (list, tuple)) or len(value) < 4:
-            return None
-        try:
-            return [float(value[0]), float(value[1]), float(value[2]), float(value[3])]
-        except (TypeError, ValueError):
-            return None
 
-    box = _as_box(ref.get("bbox_xywh"))
-    if box is not None and box[2] > 0 and box[3] > 0:
-        return box
-
-    fmt = str(ref.get("bbox_format", "")).lower()
-    box = _as_box(ref.get("bbox"))
-    if fmt == "xywh" and box is not None and box[2] > 0 and box[3] > 0:
-        return box
-
-    xyxy = _as_box(ref.get("bbox_xyxy"))
-    if xyxy is None and box is not None and fmt in {"", "xyxy"}:
-        xyxy = box
+def _refcoco_bbox_xywh(ref, dataset_name="refcoco"):
+    """Compatibility view of the canonical adapter for external audit tools."""
+    xyxy = _refcoco_bbox_xyxy(ref, dataset_name)
     if xyxy is None:
         return None
     x1, y1, x2, y2 = xyxy
-    w = x2 - x1
-    h = y2 - y1
-    if w <= 0 or h <= 0:
-        return None
-    return [x1, y1, w, h]
+    return [x1, y1, x2 - x1, y2 - y1]
 
 
 def expand_refcoco_sample(sample):
-    """Expand grouped RefCOCO records into one phrase-to-box item per ref."""
+    """Expand grouped RefCOCO records into one phrase+box item per ref.
+
+    The single downstream ``refcoco`` stream samples phrase-to-box detection or
+    box-to-phrase region captioning uniformly inside ``preprocess_fn``.
+    """
     j = sample.get("json")
     if j is None:
         return []
     if isinstance(j, bytes):
         j = json.loads(j.decode("utf-8"))
     refs = j.get("refs", [])
+    dataset_name = str(j.get("dataset") or "").strip().lower()
     img = sample.get("jpg") or sample.get("jpeg") or sample.get("png") or sample.get("webp")
     if img is None or not refs:
+        return []
+    try:
+        if isinstance(img, Image.Image):
+            image_size = img.size
+        else:
+            image_size = Image.open(io.BytesIO(img)).size
+    except Exception:
         return []
 
     out = []
     for ref in refs:
-        bbox = _refcoco_bbox_xywh(ref)
-        if bbox is None:
+        bbox_xyxy = _refcoco_bbox_xyxy(ref, dataset_name, coord_size=image_size)
+        canonical_record = canonical_bbox_record(
+            bbox_xyxy,
+            CANONICAL_BBOX_FORMAT,
+            coord_size=image_size,
+        ) if bbox_xyxy is not None else None
+        if canonical_record is None:
             continue
         phrases = _refcoco_phrases(ref)
         if not phrases:
@@ -1584,15 +2124,17 @@ def expand_refcoco_sample(sample):
         out.append({
             "jpg": img,
             "phrase": random.choice(phrases),
-            "bbox": bbox,
+            **canonical_record,
             "aux": {
-                "dataset": j.get("dataset", "refcoco"),
+                "dataset": dataset_name,
                 "image_id": j.get("image_id"),
                 "ref_id": ref.get("ref_id"),
                 "ann_id": ref.get("ann_id"),
-                "bbox": bbox,
-                "bbox_format": "xywh",
-                "bbox_xyxy": ref.get("bbox_xyxy"),
+                **canonical_record,
+                "source_bbox_format": (
+                    ref.get("bbox_format")
+                    or legacy_refcoco_untagged_format(dataset_name)
+                ),
                 "phrases": phrases,
             },
         })
@@ -1693,6 +2235,118 @@ def expand_genome_gcap_sample(sample, region_lookup: dict) -> list:
     return out
 
 
+def _openimages_image_json_size(sample):
+    raw = sample.get("json")
+    if raw is None:
+        return None, None, None
+    if isinstance(raw, bytes):
+        try:
+            raw = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None, None, None
+    if not isinstance(raw, dict):
+        return None, None, None
+    image = (
+        sample.get("jpg")
+        or sample.get("jpeg")
+        or sample.get("png")
+        or sample.get("webp")
+    )
+    if image is None:
+        return None, None, None
+    try:
+        size = image.size if isinstance(image, Image.Image) else Image.open(io.BytesIO(image)).size
+    except Exception:
+        return None, None, None
+    return raw, image, size
+
+
+def _openimages_bbox_record(annotation, image_size):
+    """Canonicalize only explicitly tagged OI bbox fields; never guess order."""
+    if not isinstance(annotation, dict):
+        return None
+    if annotation.get("bbox_xyxy") is not None:
+        raw_box = annotation["bbox_xyxy"]
+        bbox_format = annotation.get("bbox_format") or CANONICAL_BBOX_FORMAT
+    elif annotation.get("bbox_xyxy_norm") is not None:
+        raw_box = annotation["bbox_xyxy_norm"]
+        bbox_format = "xyxy_norm"
+    elif annotation.get("bbox") is not None:
+        raw_box = annotation["bbox"]
+        bbox_format = annotation.get("bbox_format")
+        if not bbox_format:
+            return None
+    else:
+        return None
+    coord_size = (
+        annotation.get("bbox_coord_size")
+        or annotation.get("coord_size")
+        or image_size
+    )
+    try:
+        return canonical_bbox_record(
+            raw_box,
+            bbox_format,
+            coord_size=coord_size,
+            target_size=image_size,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def expand_openimages_relationship_sample(sample):
+    """Expand OI structured SPO rows without parsing any answer text."""
+    record, image, image_size = _openimages_image_json_size(sample)
+    if record is None:
+        return []
+    out = []
+    for relation in record.get("relationships", []):
+        if not isinstance(relation, dict):
+            continue
+        predicate = str(
+            relation.get("predicate") or relation.get("relation") or ""
+        ).strip()
+        if predicate not in _OPENIMAGES_RELATIONSHIP_SURFACES:
+            continue
+        subject = relation.get("subject")
+        object_ = relation.get("object")
+        if not isinstance(subject, dict) or not isinstance(object_, dict):
+            continue
+        subject_label = " ".join(
+            str(subject.get("label") or subject.get("name") or "").split()
+        )
+        object_label = " ".join(
+            str(object_.get("label") or object_.get("name") or "").split()
+        )
+        subject_bbox = _openimages_bbox_record(subject, image_size)
+        object_bbox = _openimages_bbox_record(object_, image_size)
+        if not subject_label or not object_label or subject_bbox is None or object_bbox is None:
+            continue
+        structured = {
+            "subject": {
+                "label": subject_label,
+                "label_mid": subject.get("label_mid") or subject.get("label_id"),
+                **subject_bbox,
+            },
+            "predicate": predicate,
+            "object": {
+                "label": object_label,
+                "label_mid": object_.get("label_mid") or object_.get("label_id"),
+                **object_bbox,
+            },
+        }
+        out.append({
+            "jpg": image,
+            "relationship": structured,
+            "aux": {
+                "dataset": "openimages_relationship",
+                "image_id": record.get("image_id"),
+                "relationship": structured,
+            },
+        })
+    return out
+
+
 _EXPAND_FN = {
     "vqav2":   expand_vqa_sample,
     "okvqa":   expand_vqa_sample,
@@ -1707,6 +2361,7 @@ _EXPAND_FN = {
     "pixmo_points": expand_pixmo_points_sample,
     "pixmo_cap_qa": expand_pixmo_capqa_sample,
     "refcoco": expand_refcoco_sample,
+    "openimages_relationship": expand_openimages_relationship_sample,
     "llava15": expand_llava_sample,
     "llava_ov15": expand_llava_sample,
     "ai2d": expand_llava_sample,
@@ -2628,10 +3283,10 @@ def make_dataset(
         root_preview = root
     log_for_0(f"Making dataset for {log_prefix} with root {root_preview}")
     assert dataset_type in [
-        "default", "laion_aes", "cc12m", "blip3o", "textcaps", "llava15", "llava_ov15", "ai2d", "ureader", "vqav2", "okvqa", "aokvqa", "ocrvqa", "gqa", "textvqa", "tallyqa", "dvqa", "genome", "genome_gcap", "genome_det", "refcoco", "pixmo_count", "pixmo_points", "pixmo_cap_qa", "rendered_text"
+        "default", "laion_aes", "cc12m", "blip3o", "textcaps", "llava15", "llava_ov15", "ai2d", "ureader", "vqav2", "okvqa", "aokvqa", "ocrvqa", "gqa", "textvqa", "tallyqa", "dvqa", "genome", "genome_gcap", "genome_det", "refcoco", "openimages_relationship", "pixmo_count", "pixmo_points", "pixmo_cap_qa", "rendered_text"
     ], f"Invalid dataset type: {dataset_type}"
 
-    if dataset_type in ["vqav2", "okvqa", "aokvqa", "ocrvqa", "gqa", "textvqa", "tallyqa", "dvqa", "genome", "refcoco", "pixmo_count", "pixmo_points", "pixmo_cap_qa", "llava15", "llava_ov15", "ai2d", "ureader"]:
+    if dataset_type in ["vqav2", "okvqa", "aokvqa", "ocrvqa", "gqa", "textvqa", "tallyqa", "dvqa", "genome", "refcoco", "openimages_relationship", "pixmo_count", "pixmo_points", "pixmo_cap_qa", "llava15", "llava_ov15", "ai2d", "ureader"]:
         ds = VQAv2IterableDataset(
             root,
             dataset_config,
@@ -2727,6 +3382,15 @@ def worker_init_fn(worker_id, rank, data_seed_offset=0):
     torch.manual_seed(seed % (2**63 - 1))
     random.seed(seed)
     np.random.seed(seed % (2**32 - 1))
+    # Forked DataLoader workers inherit wandb's post-import telemetry hooks; a
+    # lazy import during first-sample preprocessing then blocks forever on the
+    # parent's asyncio manager -> 900s DataLoader timeout kills the job.
+    # Clearing the hooks is process-local (fork copy); parent wandb unaffected.
+    try:
+        from wandb.sdk.lib.import_hooks import unregister_all_post_import_hooks
+        unregister_all_post_import_hooks()
+    except Exception:
+        pass
 
 
 class _StatefulRandomMixIterator(Stateful):

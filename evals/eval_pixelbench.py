@@ -11,7 +11,6 @@ created by ../beifen/PixelBench-upload.py.
 
 import io
 import json
-import os
 import re
 import tarfile
 from collections import defaultdict
@@ -21,12 +20,20 @@ import jax
 import numpy as np
 import torch
 from PIL import Image
+from absl import logging
 from jax.experimental import multihost_utils as mu
-from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data import DataLoader, Dataset
 
 from input_pipeline import get_transforms, prepare_batch_data
 from utils.logging_util import log_for_0, log_for_all
 from utils.eval_io_util import ensure_eval_result_base_dir, eval_result_prefix
+from evals.eval_dist_util import (
+    DistributedEvalSampler,
+    broadcast_merge_ok,
+    collate_fn,
+    gather_rank_json_results,
+    write_rank_json_results,
+)
 
 
 PIXELBENCH_BENCHMARKS = ("mmvp", "vstar", "ocrbench", "countbenchqa")
@@ -67,23 +74,6 @@ _NUMBER_WORDS = {
     "forty": 40,
     "fifty": 50,
 }
-
-
-class DistributedEvalSampler(Sampler):
-    """Deterministic eval sampler without duplicate samples."""
-
-    def __init__(self, dataset, num_replicas=None, rank=None):
-        self.dataset = dataset
-        self.num_replicas = int(num_replicas if num_replicas is not None else jax.process_count())
-        self.rank = int(rank if rank is not None else jax.process_index())
-        self.dataset_len = len(dataset)
-        self.num_samples = (self.dataset_len - self.rank + self.num_replicas - 1) // self.num_replicas
-
-    def __iter__(self):
-        return iter(range(self.rank, self.dataset_len, self.num_replicas))
-
-    def __len__(self):
-        return self.num_samples
 
 
 def _canon_bench(name):
@@ -225,6 +215,9 @@ class PixelBenchDataset(Dataset):
         self.images_tar = _bench_tar_path(root, self.bench, "images")
         log_for_0(f"PixelBench/{self.bench}: loading metadata from {self.metadata_tar}")
         self.rows = _read_manifest(self.metadata_tar)
+        limit = int(getattr(config.eval, "pixelbench_num_samples_per_benchmark", 0) or 0)
+        if limit > 0:
+            self.rows = self.rows[:limit]
         log_for_0(f"PixelBench/{self.bench}: loading images from {self.images_tar}")
         self.images = _read_image_tar(self.images_tar)
 
@@ -253,18 +246,6 @@ class PixelBenchDataset(Dataset):
             "prefix_len": prefix_len,
             "aux": aux,
         }
-
-
-def collate_fn(batch):
-    batch = [b for b in batch if b is not None]
-    if not batch:
-        return {}
-    return {
-        "pixel_values": torch.stack([b["pixel_values"] for b in batch]),
-        "input_ids": torch.stack([b["input_ids"] for b in batch]),
-        "prefix_len": torch.stack([b["prefix_len"] for b in batch]).to(torch.int32),
-        "aux": [b["aux"] for b in batch],
-    }
 
 
 def _dummy_aux(bench):
@@ -315,8 +296,15 @@ def _normalize_text(text):
     return " ".join(text.split())
 
 
-def _normalize_ocr(text):
-    return re.sub(r"[^a-z0-9]+", "", _safe_str(text).lower())
+def _normalize_ocr(text, dataset=""):
+    """Apply the official OCRBench-v1 comparison preprocessing."""
+    text = _safe_str(text).replace("\n", " ")
+    if _safe_str(dataset).lower() == "hme100k":
+        # HME100k answers are LaTeX: preserve case and syntax, ignoring only
+        # literal spaces as in the official OCRBench scorer.
+        return text.replace(" ", "")
+    # OCRBench deliberately preserves Unicode, punctuation, and word spaces.
+    return text.lower()
 
 
 def _extract_number(text):
@@ -348,10 +336,15 @@ def _score_one(record):
         return float(pred_option == gt_option), {"pred_norm": pred_option, "gt_norm": gt_option}
 
     if bench == "ocrbench":
-        pred_norm = _normalize_ocr(pred)
-        answers = record.get("answers") or [gt]
-        gt_norms = [_normalize_ocr(a) for a in answers if _safe_str(a)]
-        correct = any(g and (pred_norm == g or g in pred_norm) for g in gt_norms)
+        dataset = record.get("dataset") or record.get("dataset_name") or ""
+        pred_norm = _normalize_ocr(pred, dataset)
+        answers = record.get("answers")
+        if not answers:
+            answers = [gt]
+        elif not isinstance(answers, (list, tuple)):
+            answers = [answers]
+        gt_norms = [_normalize_ocr(a, dataset) for a in answers if _safe_str(a)]
+        correct = any(g and g in pred_norm for g in gt_norms)
         return float(correct), {"pred_norm": pred_norm, "gt_norm": gt_norms[0] if gt_norms else ""}
 
     if bench == "countbenchqa":
@@ -360,6 +353,79 @@ def _score_one(record):
         return float(pred_num == gt_num), {"pred_norm": pred_num, "gt_norm": gt_num}
 
     raise ValueError(f"Cannot score unknown benchmark: {bench}")
+
+
+def _record_category(record):
+    return record.get("category") or record.get("dataset") or record.get("question_type") or "all"
+
+
+def _score_breakdown(scored, field):
+    grouped = defaultdict(list)
+    for row in scored:
+        grouped[str(row.get(field) or "unknown")].append(float(row["score"]))
+    return {
+        name: {
+            "official_score": int(sum(scores)),
+            "num_samples": len(scores),
+            "acc": float(np.mean(scores) * 100.0),
+        }
+        for name, scores in sorted(grouped.items())
+    }
+
+
+def _score_mmvp_pairs(scored):
+    """Aggregate MMVP's 300 items into 150 blind pairs."""
+    pairs = defaultdict(list)
+    seen_ids = set()
+    for row in scored:
+        raw_id = _safe_str(row.get("id"))
+        if not re.fullmatch(r"[1-9]\d*", raw_id):
+            raise ValueError(f"MMVP requires a positive numeric item id, got {raw_id!r}")
+        item_id = int(raw_id)
+        if item_id in seen_ids:
+            raise ValueError(f"Duplicate MMVP item id: {item_id}")
+        seen_ids.add(item_id)
+        pair_id = (item_id + 1) // 2
+        pairs[pair_id].append((item_id, row))
+
+    pair_scores = []
+    pair_by_category = defaultdict(list)
+    for pair_id, members in sorted(pairs.items()):
+        members.sort(key=lambda item: item[0])
+        expected_ids = {2 * pair_id - 1, 2 * pair_id}
+        actual_ids = {item_id for item_id, _ in members}
+        if len(members) != 2 or actual_ids != expected_ids:
+            raise ValueError(
+                f"Incomplete MMVP pair {pair_id}: expected item ids "
+                f"{sorted(expected_ids)}, got {sorted(actual_ids)}"
+            )
+        questions = {_safe_str(row.get("question")) for _, row in members}
+        if len(questions) != 1:
+            raise ValueError(f"MMVP pair {pair_id} contains different questions")
+
+        pair_score = float(all(row["score"] == 1.0 for _, row in members))
+        pair_scores.append(pair_score)
+        category = str(_record_category(members[0][1]))
+        pair_by_category[category].append(pair_score)
+        for _, row in members:
+            row["pair_id"] = pair_id
+            row["pair_score"] = pair_score
+
+    item_scores = [float(row["score"]) for row in scored]
+    pair_acc = float(np.mean(pair_scores) * 100.0)
+    return {
+        "acc": pair_acc,
+        "pair_acc": pair_acc,
+        "item_acc": float(np.mean(item_scores) * 100.0),
+        "num_correct_pairs": int(sum(pair_scores)),
+        "num_pairs": len(pair_scores),
+        "num_samples": len(scored),
+        "by_category": {
+            key: float(np.mean(values) * 100.0)
+            for key, values in sorted(pair_by_category.items())
+        },
+        "scored": scored,
+    }
 
 
 def _score_records(records):
@@ -374,8 +440,14 @@ def _score_records(records):
         out["score"] = score
         out.update(norm)
         scored.append(out)
-        category = item.get("category") or item.get("dataset") or item.get("question_type") or "all"
+        category = _record_category(item)
         by_category[str(category)].append(score)
+
+    benchmarks = {row.get("benchmark") for row in scored}
+    if "mmvp" in benchmarks:
+        if benchmarks != {"mmvp"}:
+            raise ValueError("MMVP paired scoring cannot be mixed with other benchmarks")
+        return _score_mmvp_pairs(scored)
 
     metrics = {
         "acc": float(np.mean([x["score"] for x in scored]) * 100.0),
@@ -383,6 +455,20 @@ def _score_records(records):
         "by_category": {k: float(np.mean(v) * 100.0) for k, v in sorted(by_category.items())},
         "scored": scored,
     }
+    if benchmarks == {"ocrbench"}:
+        by_question_type = _score_breakdown(scored, "question_type")
+        metrics.update(
+            {
+                # OCRBench-v1's headline score is a raw count (normally /1000).
+                "official_score": int(sum(row["score"] for row in scored)),
+                "max_score": len(scored),
+                "by_category": {
+                    name: values["acc"] for name, values in by_question_type.items()
+                },
+                "by_question_type": by_question_type,
+                "by_dataset": _score_breakdown(scored, "dataset"),
+            }
+        )
     return metrics
 
 
@@ -411,14 +497,6 @@ def _run_one_benchmark(p_sample_step, run_p_sample_step, model, tokenizer, param
 
     log_for_0(f"PixelBench/{bench}: root={root}")
     dataset = PixelBenchDataset(root, bench, config, tokenizer)
-    max_samples = int(
-        getattr(config.eval, "pixelbench_max_samples", 0)
-        or getattr(config.eval, "debug_max_samples", 0)
-        or 0
-    )
-    if max_samples > 0 and len(dataset.rows) > max_samples:
-        dataset.rows = dataset.rows[:max_samples]
-        log_for_0(f"PixelBench/{bench}: capped to {len(dataset.rows)} samples")
     device_batch_size = int(getattr(config.eval, "pixelbench_device_batch_size", config.eval.device_batch_size))
     batch_size = device_batch_size * jax.local_device_count()
     sampler = DistributedEvalSampler(dataset, num_replicas=jax.process_count(), rank=jax.process_index())
@@ -485,42 +563,56 @@ def _run_one_benchmark(p_sample_step, run_p_sample_step, model, tokenizer, param
     base_dir, result_prefix = _result_prefix(config, bench)
     ensure_eval_result_base_dir(base_dir)
 
-    rank_file = f"{result_prefix}.results_{jax.process_index()}.json"
-    with open(rank_file, "w", encoding="utf-8") as f:
-        json.dump(all_outs, f, ensure_ascii=False, indent=2)
+    write_rank_json_results(result_prefix, all_outs)
 
     mu.sync_global_devices(f"pixelbench {bench} write done")
 
+    merge_exception = None
     if jax.process_index() == 0:
-        merged = []
-        for rank in range(jax.process_count()):
-            path = f"{result_prefix}.results_{rank}.json"
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"During PixelBench/{bench} eval, process {rank} results file missing: {path}")
-            with open(path, "r", encoding="utf-8") as f:
-                merged.extend(json.load(f))
+        try:
+            merged = gather_rank_json_results(
+                result_prefix,
+                missing_file_msg=f"During PixelBench/{bench} eval, process {{rank}} results file missing: {{path}}",
+            )
 
-        dedup = {}
-        for item in merged:
-            key = (item.get("benchmark", bench), str(item.get("id", "")))
-            dedup[key] = item
-        merged = [dedup[k] for k in sorted(dedup)]
-        metrics = _score_records(merged)
-        scored = metrics.pop("scored")
+            dedup = {}
+            for item in merged:
+                key = (item.get("benchmark", bench), str(item.get("id", "")))
+                dedup[key] = item
+            merged = [dedup[k] for k in sorted(dedup)]
+            metrics = _score_records(merged)
+            scored = metrics.pop("scored")
 
-        with open(f"{result_prefix}.results_final.json", "w", encoding="utf-8") as f:
-            json.dump(merged, f, ensure_ascii=False, indent=2)
-        with open(f"{result_prefix}.scored_results.json", "w", encoding="utf-8") as f:
-            json.dump(scored, f, ensure_ascii=False, indent=2)
-        with open(f"{result_prefix}.metrics.json", "w", encoding="utf-8") as f:
-            json.dump(metrics, f, ensure_ascii=False, indent=2)
+            with open(f"{result_prefix}.results_final.json", "w", encoding="utf-8") as f:
+                json.dump(merged, f, ensure_ascii=False, indent=2)
+            with open(f"{result_prefix}.scored_results.json", "w", encoding="utf-8") as f:
+                json.dump(scored, f, ensure_ascii=False, indent=2)
+            with open(f"{result_prefix}.metrics.json", "w", encoding="utf-8") as f:
+                json.dump(metrics, f, ensure_ascii=False, indent=2)
 
-        log_for_0(f"PixelBench/{bench}: accuracy={metrics['acc']:.2f}% ({metrics['num_samples']} samples)")
-        log_for_0(f"PixelBench/{bench}: merged results saved with prefix: {result_prefix}")
-        sample_outputs = [_vis_record(item) for item in scored[:samples_per_benchmark]]
+            if bench == "mmvp":
+                log_for_0(
+                    f"PixelBench/MMVP: paired accuracy={metrics['pair_acc']:.2f}% "
+                    f"({metrics['num_correct_pairs']}/{metrics['num_pairs']} pairs), "
+                    f"item accuracy={metrics['item_acc']:.2f}%"
+                )
+            elif bench == "ocrbench":
+                log_for_0(
+                    f"PixelBench/OCRBench: official score={metrics['official_score']}/"
+                    f"{metrics['max_score']} (accuracy={metrics['acc']:.2f}%)"
+                )
+            else:
+                log_for_0(f"PixelBench/{bench}: accuracy={metrics['acc']:.2f}% ({metrics['num_samples']} samples)")
+            log_for_0(f"PixelBench/{bench}: merged results saved with prefix: {result_prefix}")
+            sample_outputs = [_vis_record(item) for item in scored[:samples_per_benchmark]]
+        except Exception as exc:  # Keep every rank out of the final barrier on failure.
+            logging.exception(f"PixelBench/{bench} rank-0 merge/scoring failed")
+            merge_exception = exc
     else:
         log_for_all(f"Process {jax.process_index()} waiting for PixelBench/{bench} scoring...")
         metrics = {"acc": 0.0, "num_samples": 0, "by_category": {}}
+
+    broadcast_merge_ok(merge_exception, f"PixelBench/{bench}")
 
     mu.sync_global_devices(f"pixelbench {bench} eval done")
     return metrics["acc"], sample_outputs, metrics
@@ -548,25 +640,58 @@ def eval_pixelbench(p_sample_step, run_p_sample_step, model, tokenizer, params, 
         if samples:
             all_samples.extend(samples)
 
-    if jax.process_index() == 0:
-        macro_acc = float(np.mean([m["acc"] for m in all_metrics.values()])) if all_metrics else 0.0
-    else:
-        macro_acc = 0.0
-    metric_dict = {"macro_acc": macro_acc, "benchmarks": all_metrics}
-    return macro_acc, all_samples, metric_dict
+    # These benchmarks have incompatible official metrics (for example MMVP
+    # pair accuracy versus OCRBench's point total), so do not fabricate a
+    # cross-benchmark "PixelBench overall". A scalar primary is meaningful
+    # only when the caller requested exactly one benchmark.
+    primary_acc = next(iter(all_metrics.values()))["acc"] if len(all_metrics) == 1 else 0.0
+    metric_dict = {"benchmarks": all_metrics}
+    return float(primary_acc), all_samples, metric_dict
 
 
 def eval_mmvp(p_sample_step, run_p_sample_step, model, tokenizer, params, config):
-    return eval_pixelbench(p_sample_step, run_p_sample_step, model, tokenizer, params, config, benchmarks=["mmvp"])
+    return eval_pixelbench(
+        p_sample_step,
+        run_p_sample_step,
+        model,
+        tokenizer,
+        params,
+        config,
+        benchmarks=["mmvp"],
+    )
 
 
 def eval_vstar(p_sample_step, run_p_sample_step, model, tokenizer, params, config):
-    return eval_pixelbench(p_sample_step, run_p_sample_step, model, tokenizer, params, config, benchmarks=["vstar"])
+    return eval_pixelbench(
+        p_sample_step,
+        run_p_sample_step,
+        model,
+        tokenizer,
+        params,
+        config,
+        benchmarks=["vstar"],
+    )
 
 
 def eval_ocrbench(p_sample_step, run_p_sample_step, model, tokenizer, params, config):
-    return eval_pixelbench(p_sample_step, run_p_sample_step, model, tokenizer, params, config, benchmarks=["ocrbench"])
+    return eval_pixelbench(
+        p_sample_step,
+        run_p_sample_step,
+        model,
+        tokenizer,
+        params,
+        config,
+        benchmarks=["ocrbench"],
+    )
 
 
 def eval_countbenchqa(p_sample_step, run_p_sample_step, model, tokenizer, params, config):
-    return eval_pixelbench(p_sample_step, run_p_sample_step, model, tokenizer, params, config, benchmarks=["countbenchqa"])
+    return eval_pixelbench(
+        p_sample_step,
+        run_p_sample_step,
+        model,
+        tokenizer,
+        params,
+        config,
+        benchmarks=["countbenchqa"],
+    )

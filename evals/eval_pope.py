@@ -12,44 +12,22 @@ import jax
 import numpy as np
 import torch
 from PIL import Image
+from absl import logging
 from jax.experimental import multihost_utils as mu
-from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data import DataLoader, Dataset
 
 from input_pipeline import get_transforms, prepare_batch_data
 from utils.logging_util import log_for_0, log_for_all
 from utils.eval_io_util import ensure_eval_result_base_dir, eval_result_prefix
-
-
-class DistributedEvalSampler(Sampler):
-    """Deterministic eval-only sampler without padding/duplication."""
-
-    def __init__(self, dataset, num_replicas=None, rank=None):
-        if num_replicas is None:
-            num_replicas = jax.process_count()
-        if rank is None:
-            rank = jax.process_index()
-        self.dataset = dataset
-        self.num_replicas = int(num_replicas)
-        self.rank = int(rank)
-        self.dataset_len = len(dataset)
-        self.num_samples = (
-            self.dataset_len - self.rank + self.num_replicas - 1
-        ) // self.num_replicas
-
-    def __iter__(self):
-        return iter(range(self.rank, self.dataset_len, self.num_replicas))
-
-    def __len__(self):
-        return self.num_samples
-
-
-def _path_exists(path: str) -> bool:
-    fs, fs_path = fsspec.core.url_to_fs(path)
-    return fs.exists(fs_path)
-
-
-def _join_path(root: str, leaf: str) -> str:
-    return f"{root.rstrip('/')}/{leaf.lstrip('/')}"
+from evals.eval_dist_util import (
+    DistributedEvalSampler,
+    _join_path,
+    _path_exists,
+    broadcast_merge_ok,
+    collate_fn,
+    gather_rank_json_results,
+    write_rank_json_results,
+)
 
 
 def _is_json_annotation_path(path: str) -> bool:
@@ -421,19 +399,6 @@ class POPEDataset(Dataset):
         return self.preprocess_fn(sample)
 
 
-def collate_fn(batch):
-    batch = [b for b in batch if b is not None]
-    if len(batch) == 0:
-        return {}
-
-    return {
-        "pixel_values": torch.stack([b["pixel_values"] for b in batch]),
-        "input_ids": torch.stack([b["input_ids"] for b in batch]),
-        "prefix_len": torch.stack([b["prefix_len"] for b in batch]).to(torch.int32),
-        "aux": [b["aux"] for b in batch],
-    }
-
-
 def _make_dummy_pope_batch(batch_size, image_size, max_len):
     return {
         "pixel_values": torch.zeros((batch_size, 3, image_size, image_size), dtype=torch.float32),
@@ -572,7 +537,7 @@ def eval_pope(p_sample_step, run_p_sample_step, model, tokenizer, params, config
     image_record_rows = None
     image_record_shards = [] if _is_json_annotation_path(pope_root) else _glob_tar_shards(pope_root)
     max_samples = int(
-        getattr(config.eval, "pope_max_samples_per_split", 0)
+        getattr(config.eval, "pope_num_samples_per_split", 0)
         or getattr(config.eval, "debug_max_samples", 0)
         or 0
     )
@@ -713,72 +678,72 @@ def eval_pope(p_sample_step, run_p_sample_step, model, tokenizer, params, config
     )
     ensure_eval_result_base_dir(base_dir)
 
-    rank_file = f"{result_prefix}.results_{jax.process_index()}.json"
-    with open(rank_file, "w", encoding="utf-8") as f:
-        json.dump(all_outs, f, ensure_ascii=False, indent=2)
+    write_rank_json_results(result_prefix, all_outs)
 
     mu.sync_global_devices("pope write done")
 
+    merge_exception = None
     if jax.process_index() == 0:
-        merged = []
-        for r in range(jax.process_count()):
-            pf = f"{result_prefix}.results_{r}.json"
-            if not os.path.exists(pf):
-                raise FileNotFoundError(
-                    f"During POPE eval, process {r} results file missing: {pf}"
-                )
-            with open(pf, "r", encoding="utf-8") as f:
-                merged.extend(json.load(f))
-
-        dedup = {}
-        for rec in merged:
-            uid = rec.get("sample_uid")
-            if uid not in dedup:
-                dedup[uid] = rec
-        merged = list(dedup.values())
-
-        split_metrics = {}
-        for split in splits:
-            split_records = [r for r in merged if r.get("split") == split]
-            split_metrics[split] = compute_pope_metrics(split_records)
-
-        f1s = [split_metrics[s]["f1"] for s in splits if s in split_metrics]
-        accs = [split_metrics[s]["acc"] for s in splits if s in split_metrics]
-        macro_f1 = float(np.mean(f1s) * 100.0) if f1s else 0.0
-        macro_acc = float(np.mean(accs) * 100.0) if accs else 0.0
-
-        metrics_dict = {
-            "macro": {
-                "f1": float(np.mean(f1s)) if f1s else 0.0,
-                "acc": float(np.mean(accs)) if accs else 0.0,
-                "f1_percent": macro_f1,
-                "acc_percent": macro_acc,
-            },
-            "splits": split_metrics,
-            "num_samples": len(merged),
-        }
-
-        with open(
-            f"{result_prefix}.results_final.json", "w", encoding="utf-8"
-        ) as f:
-            json.dump(merged, f, ensure_ascii=False, indent=2)
-
-        with open(f"{result_prefix}.metrics.json", "w", encoding="utf-8") as f:
-            json.dump(metrics_dict, f, ensure_ascii=False, indent=2)
-
-        for split in splits:
-            m = split_metrics[split]
-            log_for_0(
-                f"POPE/{split}: acc={m['acc'] * 100:.2f}%, "
-                f"f1={m['f1'] * 100:.2f}%, yes_ratio={m['yes_ratio'] * 100:.2f}%"
+        try:
+            merged = gather_rank_json_results(
+                result_prefix,
+                missing_file_msg="During POPE eval, process {rank} results file missing: {path}",
             )
-        log_for_0(f"POPE macro Acc: {macro_acc:.2f}%")
-        log_for_0(f"POPE macro F1: {macro_f1:.2f}%")
-        log_for_0(f"POPE merged results saved with prefix: {result_prefix}")
+
+            dedup = {}
+            for rec in merged:
+                uid = rec.get("sample_uid")
+                if uid not in dedup:
+                    dedup[uid] = rec
+            merged = list(dedup.values())
+
+            split_metrics = {}
+            for split in splits:
+                split_records = [r for r in merged if r.get("split") == split]
+                split_metrics[split] = compute_pope_metrics(split_records)
+
+            f1s = [split_metrics[s]["f1"] for s in splits if s in split_metrics]
+            accs = [split_metrics[s]["acc"] for s in splits if s in split_metrics]
+            macro_f1 = float(np.mean(f1s) * 100.0) if f1s else 0.0
+            macro_acc = float(np.mean(accs) * 100.0) if accs else 0.0
+
+            metrics_dict = {
+                "macro": {
+                    "f1": float(np.mean(f1s)) if f1s else 0.0,
+                    "acc": float(np.mean(accs)) if accs else 0.0,
+                    "f1_percent": macro_f1,
+                    "acc_percent": macro_acc,
+                },
+                "splits": split_metrics,
+                "num_samples": len(merged),
+            }
+
+            with open(
+                f"{result_prefix}.results_final.json", "w", encoding="utf-8"
+            ) as f:
+                json.dump(merged, f, ensure_ascii=False, indent=2)
+
+            with open(f"{result_prefix}.metrics.json", "w", encoding="utf-8") as f:
+                json.dump(metrics_dict, f, ensure_ascii=False, indent=2)
+
+            for split in splits:
+                m = split_metrics[split]
+                log_for_0(
+                    f"POPE/{split}: acc={m['acc'] * 100:.2f}%, "
+                    f"f1={m['f1'] * 100:.2f}%, yes_ratio={m['yes_ratio'] * 100:.2f}%"
+                )
+            log_for_0(f"POPE macro Acc: {macro_acc:.2f}%")
+            log_for_0(f"POPE macro F1: {macro_f1:.2f}%")
+            log_for_0(f"POPE merged results saved with prefix: {result_prefix}")
+        except Exception as exc:  # Keep every rank out of the final barrier on failure.
+            logging.exception("POPE rank-0 merge/scoring failed")
+            merge_exception = exc
     else:
         log_for_all(f"Process {jax.process_index()} waiting for POPE scoring...")
         macro_f1 = 0.0
         metrics_dict = {"macro": {}, "splits": {}, "num_samples": 0}
+
+    broadcast_merge_ok(merge_exception, "POPE")
 
     mu.sync_global_devices("pope eval done")
     return macro_f1, sample_outputs, metrics_dict

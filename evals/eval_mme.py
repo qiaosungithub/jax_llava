@@ -12,12 +12,20 @@ import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
+from absl import logging
 from jax.experimental import multihost_utils as mu
-from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data import DataLoader, Dataset
 
 from input_pipeline import get_transforms, prepare_batch_data
 from utils.logging_util import log_for_0, log_for_all
 from utils.eval_io_util import ensure_eval_result_base_dir, eval_result_prefix
+from evals.eval_dist_util import (
+    DistributedEvalSampler,
+    broadcast_merge_ok,
+    collate_fn,
+    gather_rank_json_results,
+    write_rank_json_results,
+)
 
 
 PERCEPTION_TASKS = [
@@ -39,29 +47,6 @@ COGNITION_TASKS = [
     "text_translation",
     "code_reasoning",
 ]
-
-
-class DistributedEvalSampler(Sampler):
-    """Deterministic eval-only sampler without padding/duplication."""
-
-    def __init__(self, dataset, num_replicas=None, rank=None):
-        if num_replicas is None:
-            num_replicas = jax.process_count()
-        if rank is None:
-            rank = jax.process_index()
-        self.dataset = dataset
-        self.num_replicas = int(num_replicas)
-        self.rank = int(rank)
-        self.dataset_len = len(dataset)
-        self.num_samples = (
-            self.dataset_len - self.rank + self.num_replicas - 1
-        ) // self.num_replicas
-
-    def __iter__(self):
-        return iter(range(self.rank, self.dataset_len, self.num_replicas))
-
-    def __len__(self):
-        return self.num_samples
 
 
 _mme_load_count = 0
@@ -192,23 +177,6 @@ class MMEDataset(Dataset):
         return self.preprocess_fn(sample)
 
 
-def collate_fn(batch):
-    batch = [b for b in batch if b is not None]
-    if len(batch) == 0:
-        return {}
-
-    collated = {}
-    first = batch[0]
-    for key, value in first.items():
-        if isinstance(value, torch.Tensor):
-            collated[key] = torch.stack([b[key] for b in batch])
-        elif key == "prefix_len":
-            collated[key] = torch.tensor([b[key] for b in batch], dtype=torch.int32)
-        elif key == "aux":
-            collated[key] = [b[key] for b in batch]
-    return collated
-
-
 def parse_pred_ans(pred_ans: str):
     pred_ans = (pred_ans or "").strip().lower()
     if pred_ans in ["yes", "no"]:
@@ -328,7 +296,7 @@ def eval_mme(p_sample_step, run_p_sample_step, model, tokenizer, params, config)
     log_for_0(f"MME eval: loading parquet files from {mme_root}")
     dataset = MMEDataset(mme_root, config, tokenizer)
     max_samples = int(
-        getattr(config.eval, "mme_max_samples", 0)
+        getattr(config.eval, "mme_num_samples", 0)
         or getattr(config.eval, "debug_max_samples", 0)
         or 0
     )
@@ -441,75 +409,40 @@ def eval_mme(p_sample_step, run_p_sample_step, model, tokenizer, params, config)
     )
     ensure_eval_result_base_dir(base_dir)
 
-    rank_file = f"{result_prefix}.results_{jax.process_index()}.json"
-    with open(rank_file, "w", encoding="utf-8") as f:
-        json.dump(all_outs, f, ensure_ascii=False, indent=2)
+    write_rank_json_results(result_prefix, all_outs)
 
     mu.sync_global_devices("mme write done")
 
+    merge_exception = None
     if jax.process_index() == 0:
-        merged = []
-        for r in range(jax.process_count()):
-            pf = f"{result_prefix}.results_{r}.json"
-            if not os.path.exists(pf):
-                raise FileNotFoundError(f"During MME eval, process {r} results file missing: {pf}")
-            with open(pf, "r", encoding="utf-8") as f:
-                merged.extend(json.load(f))
+        try:
+            merged = gather_rank_json_results(
+                result_prefix,
+                missing_file_msg="During MME eval, process {rank} results file missing: {path}",
+            )
 
-        with open(f"{result_prefix}.results_final.json", "w", encoding="utf-8") as f:
-            json.dump(merged, f, ensure_ascii=False, indent=2)
+            with open(f"{result_prefix}.results_final.json", "w", encoding="utf-8") as f:
+                json.dump(merged, f, ensure_ascii=False, indent=2)
 
-        metric_dict = score_mme(merged)
-        with open(f"{result_prefix}.metrics.json", "w", encoding="utf-8") as f:
-            json.dump(metric_dict, f, ensure_ascii=False, indent=2)
+            metric_dict = score_mme(merged)
+            with open(f"{result_prefix}.metrics.json", "w", encoding="utf-8") as f:
+                json.dump(metric_dict, f, ensure_ascii=False, indent=2)
 
-        mme_p = float(metric_dict["MME-P"])
-        mme_s = float(metric_dict["MME-S"])
-        log_for_0(f"MME-P: {mme_p:.2f}")
-        log_for_0(f"MME-S: {mme_s:.2f}")
-        log_for_0(f"MME merged results saved with prefix: {result_prefix}")
+            mme_p = float(metric_dict["MME-P"])
+            mme_s = float(metric_dict["MME-S"])
+            log_for_0(f"MME-P: {mme_p:.2f}")
+            log_for_0(f"MME-S: {mme_s:.2f}")
+            log_for_0(f"MME merged results saved with prefix: {result_prefix}")
+        except Exception as exc:  # Keep every rank out of the final barrier on failure.
+            logging.exception("MME rank-0 merge/scoring failed")
+            merge_exception = exc
     else:
         log_for_all(f"Process {jax.process_index()} waiting for MME scoring...")
         metric_dict = {"task_metrics": {}}
         mme_p = 0.0
         mme_s = 0.0
 
+    broadcast_merge_ok(merge_exception, "MME")
+
     mu.sync_global_devices("mme eval done")
     return mme_p, mme_s, sample_outputs, metric_dict
-
-def collate_fn(batch):
-    """
-    加强版 Collate Function:
-    1. 过滤 None (处理坏图)
-    2. 智能堆叠: 只会对 Tensor 类型的字段进行 Stack
-    3. 自动忽略: 字符串(str)、数字(int/float)等非 Tensor 字段，防止报错
-    """
-    # 1. 过滤 None
-    batch = [b for b in batch if b is not None]
-    if len(batch) == 0:
-        return {}
-
-    collated = {}
-    
-    # 2. 获取第一个样本的 Keys 作为参考
-    first_sample = batch[0]
-    
-    for key, value in first_sample.items():
-        # 3. type check: only stack tensors
-        if isinstance(value, torch.Tensor):
-            # ensure all samples have this key, prevent KeyError
-            try:
-                collated[key] = torch.stack([b[key] for b in batch])
-            except RuntimeError as e:
-                log_for_0(f"⚠️ Stack error for key '{key}': {e}")
-                # 可能是 tensor 形状不一致 (比如没 resize 好)，跳过该字段
-                raise e
-        elif key == 'prefix_len':
-            collated[key] = torch.tensor([b[key] for b in batch], dtype=torch.int32)
-        else:
-            # 如果是字符串 (如 'txt', '__key__', 'url')，直接忽略，不传给模型
-            # pass
-            if key == 'aux':
-                collated[key] = [b[key] for b in batch] # 保留 aux 供后续使用
-            
-    return collated

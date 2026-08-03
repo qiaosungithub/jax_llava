@@ -5,19 +5,17 @@ Format: each sample = {image_id}.jpg + {image_id}.json with
   {"image_id", "split", "qas": [{"question_id", "question", "answers": [...10 strings...], ...}, ...]}
 
 Key differences from VQAv2:
-  - Prompt asks for a short answer while still requiring scene-text reading.
+  - Prefix: "{question}\\n" (TextVQA requires reading scene text)
   - answers: list of 10 plain strings (no dict wrapping)
   - No answer_type field
   - image_id is an OpenImages hex string, not an integer
   - Dataset is small (val: 5000 Qs over 3166 images, 1 shard) so we cannot shard by tar file.
     Instead every process reads the full shard, but only runs inference on its own slice
-    (sample_index % num_processes == process_index). Dummy batches keep compiled calls
-    in sync across all processes for steps where a process has no real work. Each process writes its
+    (sample_index % num_processes == process_index). Dummy batches keep pmap calls in sync
+    across all processes for steps where a process has no real work. Each process writes its
     own results file; rank-0 merges and deduplicates by question_id before computing accuracy.
 """
 import json
-import re
-import os
 from absl import logging
 
 import fsspec
@@ -31,68 +29,18 @@ from jax.experimental import multihost_utils as mu
 from utils.logging_util import log_for_0, log_for_all
 from utils.eval_io_util import ensure_eval_result_base_dir, eval_result_prefix
 from input_pipeline import get_transforms, prepare_batch_data
-
-
-# --- VQA accuracy (same as VQAv2, from big_vision / https://visualqa.org/evaluation.html) ---
-REPLACEMENTS = {
-    "aint": "ain't", "arent": "aren't", "cant": "can't", "couldve": "could've", "couldnt": "couldn't",
-    "couldn'tve": "couldn't've", "couldnt've": "couldn't've", "didnt": "didn't", "doesnt": "doesn't",
-    "dont": "don't", "hadnt": "hadn't", "hasnt": "hasn't", "havent": "haven't", "hed": "he'd",
-    "hes": "he's", "howd": "how'd", "hows": "how's", "Im": "I'm", "Ive": "I've", "isnt": "isn't",
-    "itd": "it'd", "itll": "it'll", "maam": "ma'am", "mustve": "must've", "neednt": "needn't",
-    "oclock": "o'clock", "shant": "shan't", "shes": "she's", "shouldve": "should've",
-    "shouldnt": "shouldn't", "somebodys": "somebody's", "someones": "someone's",
-    "somethings": "something's", "thats": "that's", "thered": "there'd", "theres": "there's",
-    "theyd": "they'd", "theyll": "they'll", "theyre": "they're", "theyve": "they've",
-    "twas": "'twas", "wasnt": "wasn't", "wed": "we'd", "weve": "we've", "werent": "weren't",
-    "whatll": "what'll", "whatre": "what're", "whats": "what's", "whens": "when's",
-    "whered": "where'd", "wheres": "where's", "whod": "who'd", "wholl": "who'll",
-    "whos": "who's", "wont": "won't", "wouldve": "would've", "wouldnt": "wouldn't",
-    "yall": "y'all", "youd": "you'd", "youll": "you'll", "youre": "you're", "youve": "you've",
-    "none": "0", "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
-    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
-}
-PUNCT = [";", "/", "[", "]", '"', "{", "}", "(", ")", "=", "+", "\\", "_", "-", ">", "<", "@", "`", ",", "?", "!"]
-ARTICLES = {"a", "an", "the"}
-
-
-def stripspace_vqa(txt):
-    return txt.replace("\n", " ").replace("\t", " ").strip()
-
-
-def postprocess_vqa_text(txt):
-    has_digit_comma = re.search(r"(\d)(\,)(\d)", txt) is not None
-    out = txt
-    for p in PUNCT:
-        if has_digit_comma or f"{p} " in txt or f" {p}" in txt:
-            out = out.replace(p, "")
-        else:
-            out = out.replace(p, " ")
-    out = re.sub(r"(?<!\d)\.(?!\d)", "", out)
-    words = []
-    for word in out.lower().split():
-        if word not in ARTICLES:
-            words.append(REPLACEMENTS.get(word, word))
-    return " ".join(words)
+from evals.vqa_scoring import vqa_accuracy_one as _shared_vqa_accuracy_one
+from evals.eval_dist_util import (
+    broadcast_merge_ok,
+    collate_fn,
+    gather_rank_json_results,
+    write_rank_json_results,
+)
 
 
 def vqa_accuracy_one(answer: str, gt_answers: list) -> float:
-    """Per-question VQA accuracy: avg over 10 leave-one-out GT sets. min(1, count/3)."""
-    if not gt_answers or len(gt_answers) < 10:
-        return 0.0
-    gt_answers = [stripspace_vqa(a) for a in gt_answers[:10]]
-    answer = stripspace_vqa(answer)
-    # Always apply VQA normalization. Unanimous GT answers still need case,
-    # punctuation, article, and number-word normalization.
-    answer = postprocess_vqa_text(answer)
-    gt_answers = [postprocess_vqa_text(a) for a in gt_answers]
-    gt_arr = np.array(gt_answers)
-    matches = (answer == gt_arr)
-    accs = []
-    for i_leave_out in range(10):
-        m = np.delete(matches, i_leave_out)
-        accs.append(min(1.0, float(np.sum(m)) / 3))
-    return float(np.mean(accs))
+    """TextVQA applies VQA text normalization even for unanimous answers."""
+    return _shared_vqa_accuracy_one(answer, gt_answers, normalize_unanimous=True)
 
 
 def _format_vqa_prompt(question: str) -> str:
@@ -104,7 +52,7 @@ def _format_vqa_prompt(question: str) -> str:
 
 def preprocess_textvqa_sample(sample, transform, tokenizer, max_len):
     """Preprocess one (image, question) for TextVQA inference.
-    Prompt format matches the short-answer VQA evals in eval_vlm_benchmarks.py.
+    Prompt format matches LLaVA-1.5 short-answer VQA evaluation.
     """
     try:
         image = sample.get("jpg") or sample.get("png")
@@ -225,18 +173,6 @@ class TextVQAIterableDataset(IterableDataset):
                 sample_idx += 1
 
 
-def collate_fn(batch):
-    batch = [b for b in batch if b is not None]
-    if not batch:
-        return {}
-    return {
-        "pixel_values": torch.stack([b["pixel_values"] for b in batch]),
-        "input_ids": torch.stack([b["input_ids"] for b in batch]),
-        "prefix_len": torch.stack([b["prefix_len"] for b in batch]).to(torch.int32),
-        "aux": [b["aux"] for b in batch],
-    }
-
-
 def _make_dummy_textvqa_batch(batch_size, image_size, max_len):
     return {
         "pixel_values": torch.zeros((batch_size, 3, image_size, image_size), dtype=torch.float32),
@@ -257,7 +193,7 @@ def eval_textvqa(p_sample_step, run_p_sample_step, model, tokenizer, params, con
 
     Each process reads the full val shard but only runs inference on its assigned
     sample slice (sample_index % num_processes == process_rank). Dummy batches pad
-    out the fixed step budget so all processes execute the same number of compiled calls.
+    out the fixed step budget so all processes execute the same number of pmap calls.
     Rank-0 merges per-process result files, deduplicates by question_id, and computes
     the final VQA accuracy.
     """
@@ -348,46 +284,48 @@ def eval_textvqa(p_sample_step, run_p_sample_step, model, tokenizer, params, con
     )
     ensure_eval_result_base_dir(base_dir)
 
-    res_file = f"{result_prefix}.results_{jax.process_index()}.json"
-    with open(res_file, "w", encoding="utf-8") as f:
-        json.dump(ALL_OUTS, f, ensure_ascii=False, indent=2)
+    write_rank_json_results(result_prefix, ALL_OUTS)
 
     mu.sync_global_devices("textvqa write done")
 
+    merge_exception = None
     if jax.process_index() == 0:
-        all_results = []
-        for r in range(jax.process_count()):
-            pf = f"{result_prefix}.results_{r}.json"
-            if os.path.exists(pf):
-                all_results.extend(json.load(open(pf, encoding="utf-8")))
-            else:
-                log_for_0(f"Process {r} results file not found: {pf}")
-                raise FileNotFoundError(f"During TextVQA evaluation, process {r} results file not found: {pf}")
+        try:
+            all_results = gather_rank_json_results(
+                result_prefix,
+                missing_file_msg="During TextVQA evaluation, process {rank} results file not found: {path}",
+                log_missing=True,
+            )
 
-        # Each process handled a disjoint subset of questions, so there should be no
-        # duplicates in normal operation. Dedup anyway as a safety net.
-        dedup_by_qid = {}
-        for o in all_results:
-            qid = o.get("question_id")
-            if qid not in dedup_by_qid:
-                dedup_by_qid[qid] = o
-        all_results = list(dedup_by_qid.values())
+            # Each process handled a disjoint subset of questions, so there should be no
+            # duplicates in normal operation. Dedup anyway as a safety net.
+            dedup_by_qid = {}
+            for o in all_results:
+                qid = o.get("question_id")
+                if qid not in dedup_by_qid:
+                    dedup_by_qid[qid] = o
+            all_results = list(dedup_by_qid.values())
 
-        out_path = f"{result_prefix}.results_final.json"
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump([{"question_id": o["question_id"], "answer": o["answer"]} for o in all_results], f, ensure_ascii=False, indent=2)
+            out_path = f"{result_prefix}.results_final.json"
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump([{"question_id": o["question_id"], "answer": o["answer"]} for o in all_results], f, ensure_ascii=False, indent=2)
 
-        all_accs = []
-        for o in all_results:
-            answers = o.get("answers", [])
-            if answers:
-                all_accs.append(vqa_accuracy_one(o["answer"], answers))
-        overall_acc = np.mean(all_accs) * 100 if all_accs else 0.0
-        log_for_0(f"TextVQA results: {out_path} ({len(all_results)} samples)")
-        log_for_0(f"TextVQA accuracy: {overall_acc:.2f}%")
+            all_accs = []
+            for o in all_results:
+                answers = o.get("answers", [])
+                if answers:
+                    all_accs.append(vqa_accuracy_one(o["answer"], answers))
+            overall_acc = np.mean(all_accs) * 100 if all_accs else 0.0
+            log_for_0(f"TextVQA results: {out_path} ({len(all_results)} samples)")
+            log_for_0(f"TextVQA accuracy: {overall_acc:.2f}%")
+        except Exception as exc:  # Keep every rank out of the final barrier on failure.
+            logging.exception("TextVQA rank-0 merge/validation failed")
+            merge_exception = exc
     else:
         log_for_all(f"Process {jax.process_index()} waiting for evaluation to finish...")
         overall_acc = 0.0
+
+    broadcast_merge_ok(merge_exception, "TextVQA")
 
     mu.sync_global_devices("textvqa eval done")
     return overall_acc, [vis_qa(o) for o in ALL_OUTS[:16]], []

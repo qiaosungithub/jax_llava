@@ -11,43 +11,31 @@ import jax
 import numpy as np
 import torch
 from PIL import Image, ImageDraw
+from absl import logging
 from jax.experimental import multihost_utils as mu
-from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data import DataLoader, Dataset
 
 from input_pipeline import LetterboxPadTransform, format_detection_prompt, get_transforms, prepare_batch_data
+from utils.bbox_util import (
+    CANONICAL_BBOX_FORMAT,
+    legacy_refcoco_untagged_format,
+    record_coord_size,
+    resolve_canonical_bbox,
+)
 from utils.logging_util import log_for_0, log_for_all
 from utils.eval_io_util import ensure_eval_result_base_dir, eval_result_prefix
+from evals.eval_dist_util import (
+    DistributedEvalSampler,
+    _join_path,
+    _path_exists,
+    broadcast_merge_ok,
+    collate_fn,
+    gather_rank_json_results,
+    write_rank_json_results,
+)
 
 
 DEFAULT_REFCOCOG_NUM_VIS = 8
-
-
-class DistributedEvalSampler(Sampler):
-    def __init__(self, dataset, num_replicas=None, rank=None):
-        if num_replicas is None:
-            num_replicas = jax.process_count()
-        if rank is None:
-            rank = jax.process_index()
-        self.dataset = dataset
-        self.num_replicas = int(num_replicas)
-        self.rank = int(rank)
-        self.dataset_len = len(dataset)
-        self.num_samples = (self.dataset_len - self.rank + self.num_replicas - 1) // self.num_replicas
-
-    def __iter__(self):
-        return iter(range(self.rank, self.dataset_len, self.num_replicas))
-
-    def __len__(self):
-        return self.num_samples
-
-
-def _join_path(root: str, leaf: str) -> str:
-    return f"{root.rstrip('/')}/{leaf.lstrip('/')}"
-
-
-def _path_exists(path: str) -> bool:
-    fs, fs_path = fsspec.core.url_to_fs(path)
-    return fs.exists(fs_path)
 
 
 def _glob_tar_shards(root: str):
@@ -178,11 +166,20 @@ def _normalize_bbox_xyxy(box):
     return [x1, y1, x2, y2]
 
 
-def _xywh_to_xyxy(box):
-    if box is None or len(box) != 4:
-        return None
-    x, y, w, h = [float(v) for v in box]
-    return [x, y, x + max(0.0, w), y + max(0.0, h)]
+def _canonical_gt_bbox(row):
+    """Adapt supported RefCOCOg row schemas to explicit absolute xyxy.
+
+    The local legacy ``val.json`` schema stores an untagged COCO ``xywh`` list
+    in ``bbox``, the same convention the training adapter reads for RefCOCOg.
+    Every other representation is identified by either its field name or an
+    explicit ``bbox_format``; numeric values are never used to guess.
+    """
+    return resolve_canonical_bbox(
+        row,
+        untagged_format=legacy_refcoco_untagged_format("refcocog"),
+        coord_size=record_coord_size(row),
+        label="RefCOCOg",
+    )
 
 
 def _choose_first_text(value):
@@ -237,11 +234,7 @@ def load_refcocog_image_record_rows(root):
                             phrase = _choose_first_text(ref.get("phrase")) or _choose_first_text(ref.get("answers"))
                             if not phrase:
                                 continue
-                            gt = ref.get("bbox_xyxy")
-                            if gt is None:
-                                gt = _xywh_to_xyxy(ref.get("bbox_xywh"))
-                            else:
-                                gt = _normalize_bbox_xyxy(gt)
+                            gt, _ = _canonical_gt_bbox(ref)
                             if gt is None:
                                 continue
                             sample_id = ref.get(
@@ -296,24 +289,7 @@ def _parse_row(row, idx):
     if not image:
         return None
 
-    gt = None
-    if "bbox" in row:
-        b = row["bbox"]
-        if isinstance(b, dict):
-            if all(k in b for k in ["x", "y", "w", "h"]):
-                gt = _xywh_to_xyxy([b["x"], b["y"], b["w"], b["h"]])
-            elif all(k in b for k in ["x1", "y1", "x2", "y2"]):
-                gt = _normalize_bbox_xyxy([b["x1"], b["y1"], b["x2"], b["y2"]])
-        elif isinstance(b, (list, tuple)) and len(b) == 4:
-            # Default as xywh for common RefCOCO dumps.
-            gt = _xywh_to_xyxy(b)
-
-    if gt is None and "box" in row and isinstance(row["box"], (list, tuple)) and len(row["box"]) == 4:
-        gt = _xywh_to_xyxy(row["box"])
-    if gt is None and all(k in row for k in ["x", "y", "w", "h"]):
-        gt = _xywh_to_xyxy([row["x"], row["y"], row["w"], row["h"]])
-    if gt is None and all(k in row for k in ["x1", "y1", "x2", "y2"]):
-        gt = _normalize_bbox_xyxy([row["x1"], row["y1"], row["x2"], row["y2"]])
+    gt, source_formats = _canonical_gt_bbox(row)
     if gt is None:
         return None
 
@@ -323,6 +299,8 @@ def _parse_row(row, idx):
         "image": image,
         "phrase": phrase,
         "gt_bbox_xyxy": gt,
+        "gt_bbox_format": CANONICAL_BBOX_FORMAT,
+        "gt_bbox_source_formats": source_formats,
     }
 
 
@@ -636,18 +614,6 @@ class RefCOCOgDataset(Dataset):
         return self.preprocess_fn(sample)
 
 
-def collate_fn(batch):
-    batch = [b for b in batch if b is not None]
-    if len(batch) == 0:
-        return {}
-    return {
-        "pixel_values": torch.stack([b["pixel_values"] for b in batch]),
-        "input_ids": torch.stack([b["input_ids"] for b in batch]),
-        "prefix_len": torch.stack([b["prefix_len"] for b in batch]).to(torch.int32),
-        "aux": [b["aux"] for b in batch],
-    }
-
-
 def _make_dummy_refcocog_batch(batch_size, image_size, max_len):
     return {
         "pixel_values": torch.zeros((batch_size, 3, image_size, image_size), dtype=torch.float32),
@@ -686,7 +652,7 @@ def eval_refcocog(p_sample_step, run_p_sample_step, model, tokenizer, params, co
     else:
         rows = load_refcocog_rows(ann_root)
     max_samples = int(
-        getattr(config.eval, "refcocog_max_samples", 0)
+        getattr(config.eval, "refcocog_num_samples", 0)
         or getattr(config.eval, "debug_max_samples", 0)
         or 0
     )
@@ -794,9 +760,10 @@ def eval_refcocog(p_sample_step, run_p_sample_step, model, tokenizer, params, co
             if is_pad:
                 continue
             pred_loc = _extract_loc_tokens(out_str)
+            valid_answer = pred_loc is not None
             pred_xyxy = None
             iou = 0.0
-            if pred_loc is not None:
+            if valid_answer:
                 pred_xyxy = _loc1023_to_xyxy(
                     pred_loc,
                     aux["img_w"],
@@ -812,6 +779,7 @@ def eval_refcocog(p_sample_step, run_p_sample_step, model, tokenizer, params, co
                 "pred_text": out_str,
                 "pred_bbox_xyxy": pred_xyxy,
                 "gt_bbox_xyxy": aux["gt_bbox_xyxy"],
+                "valid_answer": bool(valid_answer),
                 "iou": float(iou),
                 "hit": float(iou >= iou_thr),
             }
@@ -833,36 +801,47 @@ def eval_refcocog(p_sample_step, run_p_sample_step, model, tokenizer, params, co
     )
     ensure_eval_result_base_dir(base_dir)
 
-    res_file = f"{result_prefix}.results_{jax.process_index()}.json"
-    with open(res_file, "w", encoding="utf-8") as f:
-        json.dump(all_outs, f, ensure_ascii=False, indent=2)
+    write_rank_json_results(result_prefix, all_outs)
 
     mu.sync_global_devices("refcocog write done")
 
+    valid_answer_count = 0
+    total_count = 0
+    valid_answer_ratio = 0.0
+    merge_exception = None
     if jax.process_index() == 0:
-        merged = []
-        for r in range(jax.process_count()):
-            pf = f"{result_prefix}.results_{r}.json"
-            if os.path.exists(pf):
-                merged.extend(json.load(open(pf, encoding="utf-8")))
-        dedup = {}
-        for o in merged:
-            if o["id"] not in dedup:
-                dedup[o["id"]] = o
-        merged = list(dedup.values())
-        out_path = f"{result_prefix}.results_final.json"
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(merged, f, ensure_ascii=False, indent=2)
-        ious = [o["iou"] for o in merged]
-        hits = [o["hit"] for o in merged]
-        miou = float(np.mean(ious)) if ious else 0.0
-        acc = float(np.mean(hits) * 100.0) if hits else 0.0
-        log_for_0(f"RefCOCOg results: {out_path} ({len(merged)} samples)")
-        log_for_0(f"RefCOCOg Acc@IoU{iou_thr:.2f}: {acc:.2f}% | mIoU: {miou:.4f}")
+        try:
+            merged = gather_rank_json_results(result_prefix)
+            dedup = {}
+            for o in merged:
+                if o["id"] not in dedup:
+                    dedup[o["id"]] = o
+            merged = list(dedup.values())
+            out_path = f"{result_prefix}.results_final.json"
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(merged, f, ensure_ascii=False, indent=2)
+            ious = [o["iou"] for o in merged]
+            hits = [o["hit"] for o in merged]
+            miou = float(np.mean(ious)) if ious else 0.0
+            acc = float(np.mean(hits) * 100.0) if hits else 0.0
+            valid_answer_count = int(sum(1 for o in merged if o.get("valid_answer")))
+            total_count = int(len(merged))
+            valid_answer_ratio = float(valid_answer_count / total_count) if total_count else 0.0
+            log_for_0(f"RefCOCOg results: {out_path} ({len(merged)} samples)")
+            log_for_0(f"RefCOCOg Acc@IoU{iou_thr:.2f}: {acc:.2f}% | mIoU: {miou:.4f}")
+            log_for_0(
+                f"RefCOCOg valid answers: {valid_answer_count}/{total_count} "
+                f"({valid_answer_ratio * 100.0:.2f}%)"
+            )
+        except Exception as exc:  # Keep every rank out of the final barrier on failure.
+            logging.exception("RefCOCOg rank-0 merge/scoring failed")
+            merge_exception = exc
     else:
         log_for_all(f"Process {jax.process_index()} waiting for RefCOCOg merge...")
         acc = 0.0
         miou = 0.0
+
+    broadcast_merge_ok(merge_exception, "RefCOCOg")
 
     mu.sync_global_devices("refcocog eval done")
     sample_texts = [
@@ -876,7 +855,13 @@ def eval_refcocog(p_sample_step, run_p_sample_step, model, tokenizer, params, co
         )
         for o in all_outs[:16]
     ]
-    metric_dict = {"miou": miou, "iou_threshold": iou_thr}
+    metric_dict = {
+        "miou": miou,
+        "iou_threshold": iou_thr,
+        "valid_answer_count": valid_answer_count,
+        "total_count": total_count,
+        "valid_answer_ratio": valid_answer_ratio,
+    }
     vis_grid = _make_refcocog_vis_grid(
         vis_outs,
         tile_size=vis_tile_size,

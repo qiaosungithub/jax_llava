@@ -4,8 +4,6 @@ Data: WebDataset tar shards at gs://.../vqav2_image_records_wds/val2014/shard-*.
 Format: each sample = {image_id}.jpg + {image_id}.json with {"image_id", "qas": [{question_id, question, answers, answer_type}, ...]}
 """
 import json
-import re
-import os
 from absl import logging
 
 import fsspec
@@ -19,70 +17,15 @@ from jax.experimental import multihost_utils as mu
 from utils.logging_util import log_for_0, log_for_all
 from utils.eval_io_util import ensure_eval_result_base_dir, eval_result_prefix
 from input_pipeline import get_transforms, prepare_batch_data
+from evals.vqa_scoring import postprocess_vqav2_text, stripspace_vqav2, vqa_accuracy_one
+from evals.eval_dist_util import (
+    broadcast_merge_ok,
+    collate_fn,
+    gather_rank_json_results,
+    write_rank_json_results,
+)
 
 # GCS support: input_pipeline.register_gcsfs() is called on import
-
-
-# --- VQA accuracy (from big_vision, https://visualqa.org/evaluation.html) ---
-REPLACEMENTS = {
-    "aint": "ain't", "arent": "aren't", "cant": "can't", "couldve": "could've", "couldnt": "couldn't",
-    "couldn'tve": "couldn't've", "couldnt've": "couldn't've", "didnt": "didn't", "doesnt": "doesn't",
-    "dont": "don't", "hadnt": "hadn't", "hasnt": "hasn't", "havent": "haven't", "hed": "he'd",
-    "hes": "he's", "howd": "how'd", "hows": "how's", "Im": "I'm", "Ive": "I've", "isnt": "isn't",
-    "itd": "it'd", "itll": "it'll", "maam": "ma'am", "mustve": "must've", "neednt": "needn't",
-    "oclock": "o'clock", "shant": "shan't", "shes": "she's", "shouldve": "should've",
-    "shouldnt": "shouldn't", "somebodys": "somebody's", "someones": "someone's",
-    "somethings": "something's", "thats": "that's", "thered": "there'd", "theres": "there's",
-    "theyd": "they'd", "theyll": "they'll", "theyre": "they're", "theyve": "they've",
-    "twas": "'twas", "wasnt": "wasn't", "wed": "we'd", "weve": "we've", "werent": "weren't",
-    "whatll": "what'll", "whatre": "what're", "whats": "what's", "whens": "when's",
-    "whered": "where'd", "wheres": "where's", "whod": "who'd", "wholl": "who'll",
-    "whos": "who's", "wont": "won't", "wouldve": "would've", "wouldnt": "wouldn't",
-    "yall": "y'all", "youd": "you'd", "youll": "you'll", "youre": "you're", "youve": "you've",
-    "none": "0", "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
-    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
-}
-PUNCT = [";", "/", "[", "]", '"', "{", "}", "(", ")", "=", "+", "\\", "_", "-", ">", "<", "@", "`", ",", "?", "!"]
-ARTICLES = {"a", "an", "the"}
-
-
-def stripspace_vqav2(txt):
-    return txt.replace("\n", " ").replace("\t", " ").strip()
-
-
-def postprocess_vqav2_text(txt):
-    has_digit_comma = re.search(r"(\d)(\,)(\d)", txt) is not None
-    out = txt
-    for p in PUNCT:
-        if has_digit_comma or f"{p} " in txt or f" {p}" in txt:
-            out = out.replace(p, "")
-        else:
-            out = out.replace(p, " ")
-    out = re.sub(r"(?<!\d)\.(?!\d)", "", out)
-    words = []
-    for word in out.lower().split():
-        if word not in ARTICLES:
-            words.append(REPLACEMENTS.get(word, word))
-    return " ".join(words)
-
-
-def vqa_accuracy_one(answer: str, gt_answers: list) -> float:
-    """Per-question accuracy: avg over 10 leave-one-out GT sets. min(1, count/3)."""
-    if not gt_answers or len(gt_answers) < 10:
-        return 0.0
-    gt_answers = [stripspace_vqav2(a) for a in gt_answers[:10]]
-    answer = stripspace_vqav2(answer)
-    # Always apply VQA normalization. Unanimous GT answers still need case,
-    # punctuation, article, and number-word normalization, e.g. "Two." vs "2".
-    answer = postprocess_vqav2_text(answer)
-    gt_answers = [postprocess_vqav2_text(a) for a in gt_answers]
-    gt_arr = np.array(gt_answers)
-    matches = (answer == gt_arr)
-    accs = []
-    for i_leave_out in range(10):
-        m = np.delete(matches, i_leave_out)
-        accs.append(min(1.0, np.sum(m) / 3))
-    return float(np.mean(accs))
 
 
 def _format_vqa_prompt(question: str) -> str:
@@ -94,7 +37,7 @@ def _format_vqa_prompt(question: str) -> str:
 
 def preprocess_vqa_sample(sample, transform, tokenizer, max_len):
     """Preprocess one (image, question) for VQA inference.
-    Prompt format matches the short-answer VQA evals in eval_vlm_benchmarks.py.
+    Prompt format matches LLaVA-1.5 short-answer VQA evaluation.
     prefix_len is the number of valid (non-pad) tokens in input_ids (clipped to max_len).
     """
     try:
@@ -208,21 +151,8 @@ class VQAv2IterableDataset(IterableDataset):
                     yield out
 
 
-def collate_fn(batch):
-    batch = [b for b in batch if b is not None]
-    if len(batch) == 0:
-        return {}
-
-    return {
-        "pixel_values": torch.stack([b["pixel_values"] for b in batch]),
-        "input_ids": torch.stack([b["input_ids"] for b in batch]),
-        "prefix_len": torch.stack([b["prefix_len"] for b in batch]).to(torch.int32),
-        "aux": [b["aux"] for b in batch],
-    }
-
-
 def _make_dummy_vqav2_batch(batch_size, image_size, max_len):
-    """Create a full-size dummy batch so all ranks keep compiled calls in sync."""
+    """Create a full-size dummy batch so all ranks can keep pmap calls in sync."""
     return {
         "pixel_values": torch.zeros((batch_size, 3, image_size, image_size), dtype=torch.float32),
         "input_ids": torch.zeros((batch_size, max_len), dtype=torch.long),
@@ -263,6 +193,28 @@ def _resolve_vqav2_num_samples(config):
     return online_total
 
 
+def _allocate_vqav2_batch(local_counts, remaining):
+    """Deterministically accept up to ``remaining`` interleaved rank samples."""
+    local_counts = [int(value) for value in local_counts]
+    if remaining < 0 or any(value < 0 for value in local_counts):
+        raise ValueError(f"Invalid VQAv2 allocation: counts={local_counts}, remaining={remaining}")
+    accepted = [0] * len(local_counts)
+    left = int(remaining)
+    for local_index in range(max(local_counts, default=0)):
+        for rank, count in enumerate(local_counts):
+            if left == 0:
+                return accepted
+            if local_index < count:
+                accepted[rank] += 1
+                left -= 1
+    return accepted
+
+
+def _gather_vqav2_batch_counts(local_count):
+    gathered = mu.process_allgather(np.asarray(local_count, dtype=np.int32))
+    return [int(value) for value in np.asarray(jax.device_get(gathered)).reshape(-1)]
+
+
 def eval_vqav2(p_sample_step, run_p_sample_step, model, tokenizer, params, config):
     """
     Run VQAv2 evaluation.
@@ -284,22 +236,21 @@ def eval_vqav2(p_sample_step, run_p_sample_step, model, tokenizer, params, confi
     )
     loader_iter = iter(loader)
 
-    # Force all ranks to execute the same number of sampling steps.
     total_vqav2_samples = _resolve_vqav2_num_samples(config)
-    samples_per_process = (total_vqav2_samples + jax.process_count() - 1) // jax.process_count()
-    fixed_num_steps = (samples_per_process + batch_size - 1) // batch_size
+    if total_vqav2_samples <= 0:
+        raise ValueError(f"VQAv2 target sample count must be positive, got {total_vqav2_samples}")
     log_for_0(
-        "VQAv2 fixed eval schedule: "
-        f"total_samples={total_vqav2_samples}, "
-        f"samples_per_process={samples_per_process}, "
-        f"fixed_num_steps={fixed_num_steps}, "
+        "VQAv2 synchronized exact-target schedule: "
+        f"total_samples={total_vqav2_samples}, process_count={jax.process_count()}, "
         f"batch_size={batch_size}"
     )
 
     ALL_OUTS = []
     accuracies_by_type = {"yes/no": [], "number": [], "other": []}
 
-    for i in range(fixed_num_steps):
+    global_collected = 0
+    i = 0
+    while global_collected < total_vqav2_samples:
         try:
             raw_batch = next(loader_iter)
             if not raw_batch:
@@ -315,6 +266,19 @@ def eval_vqav2(p_sample_step, run_p_sample_step, model, tokenizer, params, confi
                 max_len=config.dataset.max_txt_len,
             )
 
+        local_real_count = 0 if raw_batch.get("_all_pad", False) else len(raw_batch.get("aux", []))
+        local_counts = _gather_vqav2_batch_counts(local_real_count)
+        if sum(local_counts) == 0:
+            raise RuntimeError(
+                "VQAv2 dataset exhausted before reaching configured target: "
+                f"collected={global_collected}, target={total_vqav2_samples}"
+            )
+        accepted_counts = _allocate_vqav2_batch(
+            local_counts,
+            total_vqav2_samples - global_collected,
+        )
+        local_accepted = accepted_counts[jax.process_index()]
+
         # Keep aux aligned with is_pad length so zip can cover the whole batch.
         if "aux" not in raw_batch:
             raw_batch["aux"] = []
@@ -329,22 +293,24 @@ def eval_vqav2(p_sample_step, run_p_sample_step, model, tokenizer, params, confi
         batch = prepare_batch_data(raw_batch, batch_size=batch_size)
         if raw_batch.get("_all_pad", False):
             batch["is_pad"] = np.ones((batch_size,), dtype=bool)
+        elif local_accepted < local_real_count:
+            batch["is_pad"][local_accepted:local_real_count] = True
 
         input_ids = batch["input_ids"]
         prefix_len = batch["prefix_len"]  # (LDC, B) or (B,) - per-sample prefix length
 
         out_strs = run_p_sample_step(p_sample_step, model, tokenizer, params, batch["pixel_values"], input_ids, prefix_len=prefix_len)
 
+        local_collected = 0
         for aux, out_str, is_pad in zip(batch["aux"], out_strs, batch["is_pad"].tolist()):
             if is_pad:
                 continue
+            local_collected += 1
             qid = aux["question_id"]
             answers = aux.get("answers", [])
             answer_type = aux.get("answer_type", "other")
             if answer_type not in accuracies_by_type:
                 answer_type = "other"
-
-            # TODO: postprocess out_str, by normalizing output. e.g. remove 'the answer is ' and so on
 
             acc = vqa_accuracy_one(out_str, answers)
             accuracies_by_type[answer_type].append(acc)
@@ -359,9 +325,23 @@ def eval_vqav2(p_sample_step, run_p_sample_step, model, tokenizer, params, confi
                 }
             )
         
+        collected_counts = _gather_vqav2_batch_counts(local_collected)
+        if collected_counts != accepted_counts:
+            raise RuntimeError(
+                "VQAv2 accepted/output count mismatch across ranks: "
+                f"accepted={accepted_counts}, collected={collected_counts}"
+            )
+        global_collected += sum(accepted_counts)
         if i % 50 == 0:
-            n = len(ALL_OUTS)
-            logging.info(f"rank {jax.process_index()}, VQAv2 batch {i}, collected {n} results...")
+            logging.info(
+                "rank %d, VQAv2 batch %d, local=%d, global=%d/%d",
+                jax.process_index(),
+                i,
+                len(ALL_OUTS),
+                global_collected,
+                total_vqav2_samples,
+            )
+        i += 1
     
 
     # All-reduce for multi-host
@@ -376,49 +356,63 @@ def eval_vqav2(p_sample_step, run_p_sample_step, model, tokenizer, params, confi
     )
     ensure_eval_result_base_dir(base_dir)
 
-    res_file = f"{result_prefix}.results_{jax.process_index()}.json"
-    with open(res_file, "w", encoding="utf-8") as f:
-        json.dump(ALL_OUTS, f, ensure_ascii=False, indent=2)
+    write_rank_json_results(result_prefix, ALL_OUTS)
 
     mu.sync_global_devices("vqav2 write done")
 
     # Merge and recompute global accuracy on rank 0 (answers in each output for correct gather)
+    merge_exception = None
     if jax.process_index() == 0:
-        all_results = []
-        for r in range(jax.process_count()):
-            pf = f"{result_prefix}.results_{r}.json"
-            if os.path.exists(pf):
-                all_results.extend(json.load(open(pf, encoding="utf-8")))
-            else:
-                log_for_0(f"Process {r} results file not found: {pf}")
-                raise FileNotFoundError(f"During VQAv2 evaluation, process {r} results file not found: {pf}")
+        try:
+            all_results = gather_rank_json_results(
+                result_prefix,
+                missing_file_msg="During VQAv2 evaluation, process {rank} results file not found: {path}",
+            )
 
-        # All ranks run the same eval stream for synchronized compiled calls, so
-        # merged outputs contain duplicates. Keep one prediction per question_id.
-        dedup_by_qid = {}
-        for o in all_results:
-            qid = o.get("question_id")
-            if qid not in dedup_by_qid:
+            raw_result_count = len(all_results)
+            dedup_by_qid = {}
+            for o in all_results:
+                qid = o.get("question_id")
+                if qid in (None, -1):
+                    raise ValueError(f"Invalid VQAv2 question_id in result: {qid!r}")
+                if qid in dedup_by_qid:
+                    raise ValueError(f"Duplicate VQAv2 question_id across rank outputs: {qid}")
                 dedup_by_qid[qid] = o
-        all_results = list(dedup_by_qid.values())
+            all_results = list(dedup_by_qid.values())
+            if raw_result_count != total_vqav2_samples or len(all_results) != total_vqav2_samples:
+                raise ValueError(
+                    "VQAv2 result count mismatch: "
+                    f"raw={raw_result_count}, unique={len(all_results)}, "
+                    f"expected={total_vqav2_samples}"
+                )
 
-        out_path = f"{result_prefix}.results_final.json"
-        # Save merged (question_id, answer) for submission; full for debug
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump([{"question_id": o["question_id"], "answer": o["answer"]} for o in all_results], f, ensure_ascii=False, indent=2)
+            out_path = f"{result_prefix}.results_final.json"
+            # Save merged (question_id, answer) for submission; full for debug
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    [{"question_id": o["question_id"], "answer": o["answer"]} for o in all_results],
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
 
-        # Recompute global accuracy from merged (each sample has answers)
-        all_accs = []
-        for o in all_results:
-            answers = o.get("answers", [])
-            if answers:
-                all_accs.append(vqa_accuracy_one(o["answer"], answers))
-        overall_acc = np.mean(all_accs) * 100 if all_accs else 0.0
-        log_for_0(f"VQAv2 results: {out_path} ({len(all_results)} samples)")
-        log_for_0(f"VQAv2 accuracy: {overall_acc:.2f}%")
+            # Recompute and round exactly like the official VQA-v2 evaluator.
+            all_accs = []
+            for o in all_results:
+                answers = o.get("answers", [])
+                if answers:
+                    all_accs.append(vqa_accuracy_one(o["answer"], answers))
+            overall_acc = round(float(np.mean(all_accs) * 100), 2) if all_accs else 0.0
+            log_for_0(f"VQAv2 results: {out_path} ({len(all_results)} samples)")
+            log_for_0(f"VQAv2 accuracy: {overall_acc:.2f}%")
+        except Exception as exc:  # Keep every rank out of the final barrier on failure.
+            logging.exception("VQAv2 rank-0 merge/validation failed")
+            merge_exception = exc
     else:
         log_for_all(f"Process {jax.process_index()} waiting for evaluation to finish...")
         overall_acc = 0.0
+
+    broadcast_merge_ok(merge_exception, "VQAv2")
 
     mu.sync_global_devices("vqav2 eval done")
     return overall_acc, [vis_qa(o) for o in ALL_OUTS[:16]], []

@@ -5,6 +5,10 @@ Supported datasets:
   - VisWiz-VQA val/test shards
   - ScienceQA-IMG train/validation/test shards
   - SEED-Bench image-only shards
+  - Cambrian CV-Bench official test set
+  - VLMs Are Blind (BlindTest) official validation set
+  - DocVQA 2020 single-document validation set
+  - xAI RealWorldQA official test set
 
 The uploader stores each record as image + json in a WebDataset tar. GQA and
 SEED-Bench records are image-level and contain multiple QAs in the json; the
@@ -29,12 +33,46 @@ from absl import logging
 from jax.experimental import multihost_utils as mu
 from torch.utils.data import DataLoader, IterableDataset
 
-from evals.eval_vqav2 import postprocess_vqav2_text, vqa_accuracy_one
+from evals.vqa_scoring import postprocess_vqav2_text, vqa_accuracy_one
+from evals.eval_dist_util import (
+    broadcast_merge_ok,
+    collate_fn,
+    gather_rank_json_results,
+    write_rank_json_results,
+)
 from input_pipeline import get_transforms, prepare_batch_data
 from utils.eval_io_util import ensure_eval_result_base_dir, eval_result_prefix
 from utils.logging_util import log_for_0, log_for_all
 
 LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+CVBENCH_ANSWER_INSTRUCTION = (
+    "Answer with the option's letter from the given choices directly."
+)
+
+DOCVQA_ANSWER_INSTRUCTION = "Answer the question using a single word or phrase."
+
+BLINDTEST_TASK_MAP = {
+    "counting grid - blank grids": "counting_grid",
+    "counting grid - word grids": "counting_grid",
+    "line plot intersections": "line_plot_intersections",
+    "touching circles": "touching_circles",
+    "circled letter": "circled_letter",
+    "olympic counting - circles": "olympic_counting_circles",
+    "olympic counting - pentagons": "olympic_counting_pentagons",
+    "nested squares": "nested_squares",
+    "subway connections": "subway_connections",
+}
+BLINDTEST_REPORT_TASKS = (
+    "line_plot_intersections",
+    "touching_circles",
+    "circled_letter",
+    "olympic_counting_circles",
+    "olympic_counting_pentagons",
+    "nested_squares",
+    "counting_grid",
+    "subway_connections",
+)
 
 
 # -----------------------------------------------------------------------------
@@ -73,6 +111,168 @@ def _exact_answer_score(pred: str, answers: Sequence[Any]) -> float:
         if pred_norm == _normalize_short_answer(_as_text(ans)):
             return 1.0
     return 0.0
+
+
+def _normalize_docvqa_text(text: Any) -> str:
+    """Match the case-insensitive, otherwise text-preserving DocVQA protocol."""
+    return _as_text(text).strip().lower()
+
+
+def _levenshtein_distance(left: str, right: str) -> int:
+    """Compute exact character edit distance without an optional dependency."""
+    if left == right:
+        return 0
+    if len(left) < len(right):
+        left, right = right, left
+    previous = list(range(len(right) + 1))
+    for row_index, left_char in enumerate(left, start=1):
+        current = [row_index]
+        for column_index, right_char in enumerate(right, start=1):
+            current.append(
+                min(
+                    current[-1] + 1,
+                    previous[column_index] + 1,
+                    previous[column_index - 1] + (left_char != right_char),
+                )
+            )
+        previous = current
+    return previous[-1]
+
+
+def _docvqa_anls_score(
+    pred: str,
+    answers: Sequence[Any],
+    threshold: float = 0.5,
+) -> float:
+    """Return the best official-style ANLS score over accepted answer variants."""
+    prediction = _normalize_docvqa_text(pred)
+    best = 0.0
+    for answer in answers:
+        target = _normalize_docvqa_text(answer)
+        if not target:
+            similarity = float(prediction == "")
+        else:
+            normalized_distance = _levenshtein_distance(target, prediction) / max(
+                len(target), len(prediction)
+            )
+            similarity = (
+                1.0 - normalized_distance
+                if normalized_distance < threshold
+                else 0.0
+            )
+        best = max(best, similarity)
+    return best
+
+
+def _docvqa_exact_score(pred: str, answers: Sequence[Any]) -> float:
+    prediction = _normalize_docvqa_text(pred)
+    return float(
+        any(prediction == _normalize_docvqa_text(answer) for answer in answers)
+    )
+
+
+_REALWORLDQA_ANSWER_PHRASES = (
+    "the answer is",
+    "answer is",
+    "the correct answer is",
+    "correct answer is",
+    "the best answer is",
+    "best answer is",
+    "the correct option is",
+    "correct option is",
+    "the best option is",
+    "best option is",
+    "the choice is",
+    "choice is",
+    "the correct choice is",
+    "correct choice is",
+    "i choose",
+    "i select",
+    "i pick",
+    "my answer is",
+    "my choice is",
+    "答案是",
+    "答案为",
+    "选",
+)
+
+
+def _extract_realworldqa_mcq_answer(response: str) -> str:
+    """Port lmms-eval's ranked MCQ extractor for the A-D RealWorldQA rows."""
+    choices = ("A", "B", "C", "D")
+    text = _as_text(response).strip()
+    if not text:
+        return ""
+    for char in ",.!?;:'\"":
+        text = text.strip(char)
+    padded = f" {text} "
+    candidates = []
+    priorities = {
+        "start": 10,
+        "end": 9,
+        "phrase": 7,
+        "parentheses": 6,
+        "period": 5,
+        "colon": 4,
+        "right_paren": 3,
+        "space": 2,
+        "fallback": 0,
+    }
+    for choice in choices:
+        for marker, format_name in (
+            (f"({choice})", "parentheses"),
+            (f"{choice}.", "period"),
+            (f"{choice}:", "colon"),
+            (f"{choice})", "right_paren"),
+            (f"{choice} ", "space"),
+        ):
+            if marker in padded:
+                candidates.append((choice, padded.rfind(marker), format_name))
+
+    lowered = padded.lower()
+    for phrase in _REALWORLDQA_ANSWER_PHRASES:
+        phrase_index = lowered.find(phrase)
+        if phrase_index == -1:
+            continue
+        after = phrase_index + len(phrase)
+        for choice in choices:
+            choice_index = padded.find(choice, after)
+            if choice_index != -1:
+                candidates.append((choice, choice_index, "phrase"))
+
+    stripped = padded.strip()
+    for choice in choices:
+        if stripped.startswith(choice) and (
+            len(stripped) == 1 or not stripped[1].isalpha()
+        ):
+            candidates.append((choice, 0, "start"))
+        if stripped.endswith(choice) and (
+            len(stripped) == 1 or not stripped[-2].isalpha()
+        ):
+            candidates.append((choice, len(padded) - 1, "end"))
+
+    if not candidates:
+        for choice in choices:
+            if choice in padded:
+                candidates.append((choice, padded.rfind(choice), "fallback"))
+    if not candidates:
+        return ""
+    candidates.sort(
+        key=lambda item: (priorities[item[2]], item[1]),
+        reverse=True,
+    )
+    return candidates[0][0]
+
+
+def _realworldqa_exact_score(pred: str, answer: Any) -> float:
+    """Match the public lmms-eval RealWorldQA exact-match protocol."""
+    target = _as_text(answer).strip()
+    prediction = _as_text(pred).strip()
+    if not target:
+        return 0.0
+    if target.upper() in {"A", "B", "C", "D"}:
+        return float(_extract_realworldqa_mcq_answer(prediction) == target.upper())
+    return float(prediction.lower().rstrip(".") == target.lower())
 
 
 def _extract_answers(payload: Dict[str, Any]) -> List[str]:
@@ -136,6 +336,25 @@ def _list_tar_urls(root: str | Sequence[str]) -> List[str]:
         matches = sorted(fs.glob(fs_path))
         return [p if str(p).startswith("gs://") else f"{protocol}://{p}" for p in matches]
     return sorted(glob(pattern))
+
+
+def _require_success_marker(root: str, benchmark: str) -> None:
+    """Refuse a partially committed strict benchmark replica."""
+    root = str(root).rstrip("/")
+    if root.endswith(".tar") or "*" in root or "{" in root:
+        raise ValueError(
+            f"{benchmark} requires a committed dataset root, got shard pattern {root!r}"
+        )
+    marker = f"{root}/_SUCCESS"
+    if marker.startswith("gs://"):
+        fs, fs_path = fsspec.core.url_to_fs(marker)
+        exists = fs.exists(fs_path)
+    else:
+        exists = os.path.isfile(marker)
+    if not exists:
+        raise FileNotFoundError(
+            f"{benchmark} replica is not committed: missing {marker}"
+        )
 
 
 def _format_vqa_prompt(question: str, instruction: str) -> str:
@@ -224,6 +443,67 @@ def _parse_choice_prediction(pred: str, choices: Sequence[str]) -> Optional[int]
     return None
 
 
+def _parse_cvbench_choice_prediction(pred: str, choices: Sequence[str]) -> Optional[int]:
+    """Parse only direct option-label answers accepted by CV-Bench.
+
+    A model may emit a bare label, a parenthesized label, or a short
+    ``answer`` prefix.  Do not search arbitrary prose for a convenient option
+    letter.  In particular, ordinary words such as ``Blue`` and ``Cat`` must
+    not be interpreted as options B and C.
+    """
+    text = _as_text(pred).strip()
+    match = re.match(
+        r"^(?:(?:the\s+)?answer(?:\s+is)?\s*[:\-]?\s*)?"
+        r"\(?([A-Z])\)?(?:[.)](?:\s+|$)|\s+|$)",
+        text,
+        flags=re.I,
+    )
+    if match:
+        idx = LETTERS.find(match.group(1).upper())
+        if 0 <= idx < len(choices):
+            return idx
+    return None
+
+
+def _parse_blindtest_prediction(pred: str, task: str) -> Optional[str]:
+    """Parse only BlindTest's official constrained answer formats."""
+    text = _as_text(pred).strip().lower()
+    task_key = BLINDTEST_TASK_MAP.get(_as_text(task).strip().lower())
+    if task_key is None:
+        return None
+
+    if task_key == "touching_circles":
+        match = re.fullmatch(r"(yes|no)\s*[.!]?", text)
+        return match.group(1) if match else None
+
+    if task_key in {
+        "line_plot_intersections",
+        "nested_squares",
+        "olympic_counting_circles",
+        "olympic_counting_pentagons",
+        "subway_connections",
+    }:
+        match = re.fullmatch(r"(?:\{\s*)?(\d+)(?:\s*\})?\s*[.!]?", text)
+        return str(int(match.group(1))) if match else None
+
+    if task_key == "circled_letter":
+        match = re.fullmatch(r"(?:\{\s*)?([a-z])(?:\s*\})?\s*[.!]?", text)
+        return match.group(1) if match else None
+
+    if task_key == "counting_grid":
+        patterns = (
+            r"rows\s*=\s*\{\s*(\d+)\s*\}\s*columns\s*=\s*\{\s*(\d+)\s*\}",
+            r"\(\s*(\d+)\s*,\s*(\d+)\s*\)",
+            r"\{\s*(\d+)\s*\}\s*\{\s*(\d+)\s*\}",
+            r"(\d+)\s*,\s*(\d+)",
+        )
+        for pattern in patterns:
+            match = re.fullmatch(pattern + r"\s*[.!]?", text)
+            if match:
+                return f"{int(match.group(1))},{int(match.group(2))}"
+    return None
+
+
 # -----------------------------------------------------------------------------
 # Dataset expansion
 # -----------------------------------------------------------------------------
@@ -300,7 +580,9 @@ def _expand_scienceqa(sample: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
         return []
     key = _as_text(sample.get("__key__", "scienceqa"))
     qid = _record_id(record, f"{key}_{record.get('pid', '')}")
-    context = record.get("hint", "") or record.get("lecture", "")
+    # `lecture` and `solution` are target-side explanations in ScienceQA. They
+    # must never be exposed to the model; only the input-side hint is allowed.
+    context = record.get("hint", "")
     return [
         {
             "image": image,
@@ -364,11 +646,141 @@ def _expand_seed_bench(sample: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
     return out
 
 
+def _expand_cambrian_cvbench(sample: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
+    """Expand one official CV-Bench row without rebuilding its content prompt."""
+    record = _load_json(sample)
+    image = _sample_image(sample)
+    official_prompt = _as_text(record.get("prompt", "")).strip()
+    choices = _extract_choices(record)
+    if image is None or not official_prompt or not choices:
+        return []
+
+    raw_answer = _as_text(record.get("answer", "")).strip()
+    answer_match = re.fullmatch(r"\(?\s*([A-Z])\s*\)?", raw_answer, flags=re.I)
+    answer_idx = None
+    if answer_match:
+        candidate = LETTERS.find(answer_match.group(1).upper())
+        if 0 <= candidate < len(choices):
+            answer_idx = candidate
+
+    idx = _as_text(record.get("idx", sample.get("__key__", "cvbench")))
+    prompt = f"{official_prompt}\n{CVBENCH_ANSWER_INSTRUCTION}"
+    return [
+        {
+            "image": image,
+            "prompt": prompt,
+            "aux": {
+                "id": idx,
+                "question": _as_text(record.get("question", "")).strip(),
+                "official_prompt": official_prompt,
+                "choices": choices,
+                "answer_idx": answer_idx,
+                "answer": raw_answer,
+                "metric": "cvbench_mc",
+                "type": _as_text(record.get("type", "")),
+                "task": _as_text(record.get("task", "")),
+                "source": _as_text(record.get("source", "")),
+                "source_dataset": _as_text(record.get("source_dataset", "")),
+                "filename": _as_text(record.get("filename", "")),
+            },
+        }
+    ]
+
+
+def _expand_vlms_are_blind(sample: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
+    """Expand one BlindTest row, preserving the benchmark-provided prompt."""
+    record = _load_json(sample)
+    image = _sample_image(sample)
+    prompt = _as_text(record.get("prompt", "")).strip()
+    task = _as_text(record.get("task", "")).strip()
+    groundtruth = _as_text(record.get("groundtruth", "")).strip()
+    if image is None or not prompt or not task or not groundtruth:
+        return []
+
+    row_id = _as_text(
+        record.get("id", record.get("idx", sample.get("__key__", "blindtest")))
+    )
+    return [
+        {
+            "image": image,
+            "prompt": prompt,
+            "aux": {
+                "id": row_id,
+                "question": prompt,
+                "official_prompt": prompt,
+                "task": task,
+                "groundtruth": groundtruth,
+                "metadata": record.get("metadata", ""),
+                "metric": "blindtest",
+            },
+        }
+    ]
+
+
+def _expand_docvqa(sample: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
+    """Expand one DocVQA validation row using the community-standard prompt."""
+    record = _load_json(sample)
+    image = _sample_image(sample)
+    question = _as_text(record.get("question", "")).strip()
+    answers = _extract_answers(record)
+    if image is None or not question or not answers:
+        return []
+
+    key = _as_text(sample.get("__key__", "docvqa"))
+    question_id = _record_id(record, key)
+    prompt = f"{question}\n{DOCVQA_ANSWER_INSTRUCTION}"
+    return [
+        {
+            "image": image,
+            "prompt": prompt,
+            "aux": {
+                "id": question_id,
+                "question_id": question_id,
+                "question": question,
+                "answers": answers,
+                "question_types": _as_list(record.get("question_types")),
+                "doc_id": record.get("docId"),
+                "metric": "docvqa_anls",
+            },
+        }
+    ]
+
+
+def _expand_realworldqa(sample: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
+    """Expand one xAI RealWorldQA row without altering its bundled prompt."""
+    record = _load_json(sample)
+    image = _sample_image(sample)
+    question = _as_text(record.get("question", "")).strip()
+    answer = _as_text(record.get("answer", "")).strip()
+    if image is None or not question or not answer:
+        return []
+
+    key = _as_text(sample.get("__key__", "realworldqa"))
+    row_id = _record_id(record, key)
+    return [
+        {
+            "image": image,
+            "prompt": question,
+            "aux": {
+                "id": row_id,
+                "question": question,
+                "official_prompt": question,
+                "answer": answer,
+                "metric": "realworldqa_exact",
+            },
+        }
+    ]
+
+
 EXPANDERS: Dict[str, Callable[[Dict[str, Any]], Iterable[Dict[str, Any]]]] = {
     "gqa": _expand_gqa,
     "vizwiz": _expand_vizwiz,
     "scienceqa_img": _expand_scienceqa,
     "seed_bench": _expand_seed_bench,
+    "cambrian_cvbench": _expand_cambrian_cvbench,
+    "vlms_are_blind": _expand_vlms_are_blind,
+    "docvqa": _expand_docvqa,
+    "realworldqa": _expand_realworldqa,
 }
 
 
@@ -388,6 +800,8 @@ class WDSUnderstandingEvalDataset(IterableDataset):
         self.process_rank = jax.process_index()
 
     def __iter__(self):
+        if self.benchmark in {"docvqa", "realworldqa"}:
+            _require_success_marker(self.root_url, self.benchmark)
         urls = _list_tar_urls(self.root_url)
         if not urls:
             raise FileNotFoundError(f"No tar shards found for {self.benchmark}: {self.root_url}")
@@ -429,18 +843,6 @@ class WDSUnderstandingEvalDataset(IterableDataset):
         }
 
 
-def collate_fn(batch):
-    batch = [b for b in batch if b is not None]
-    if not batch:
-        return {}
-    return {
-        "pixel_values": torch.stack([b["pixel_values"] for b in batch]),
-        "input_ids": torch.stack([b["input_ids"] for b in batch]),
-        "prefix_len": torch.stack([b["prefix_len"] for b in batch]).to(torch.int32),
-        "aux": [b["aux"] for b in batch],
-    }
-
-
 def _dummy_batch(batch_size: int, image_size: int, max_len: int) -> Dict[str, Any]:
     return {
         "pixel_values": torch.zeros((batch_size, 3, image_size, image_size), dtype=torch.float32),
@@ -473,7 +875,132 @@ def _score_result(row: Dict[str, Any]) -> Optional[float]:
             return None
         pred_idx = _parse_choice_prediction(pred, choices)
         return float(pred_idx == int(gt)) if pred_idx is not None else 0.0
+    if metric == "cvbench_mc":
+        gt = row.get("answer_idx")
+        choices = row.get("choices", [])
+        if gt is None:
+            return None
+        pred_idx = _parse_cvbench_choice_prediction(pred, choices)
+        return float(pred_idx == int(gt)) if pred_idx is not None else 0.0
+    if metric == "blindtest":
+        target = _as_text(row.get("groundtruth", "")).strip().lower()
+        if not target:
+            return None
+        parsed = _parse_blindtest_prediction(pred, row.get("task", ""))
+        return float(parsed == target) if parsed is not None else 0.0
+    if metric == "docvqa_anls":
+        answers = row.get("answers", [])
+        if not answers:
+            return None
+        return _docvqa_anls_score(pred, answers)
+    if metric == "realworldqa_exact":
+        answer = row.get("answer", "")
+        if not _as_text(answer).strip():
+            return None
+        return _realworldqa_exact_score(pred, answer)
     return None
+
+
+def _percent(scores: Sequence[float]) -> float:
+    return float(np.mean(scores) * 100.0) if scores else 0.0
+
+
+def _aggregate_cambrian_cvbench(
+    scored_rows: Sequence[Dict[str, Any]],
+) -> Tuple[float, Dict[str, Any]]:
+    by_source = defaultdict(list)
+    by_task = defaultdict(list)
+    for row in scored_rows:
+        score = float(row["score"])
+        by_source[_as_text(row.get("source", "")).strip()].append(score)
+        by_task[_as_text(row.get("task", "")).strip()].append(score)
+
+    required_sources = ("ADE20K", "COCO", "Omni3D")
+    missing = [source for source in required_sources if not by_source.get(source)]
+    if missing:
+        raise ValueError(f"CV-Bench is missing required source slices: {missing}")
+
+    source_acc = {source: _percent(by_source[source]) for source in required_sources}
+    acc_2d = (source_acc["ADE20K"] + source_acc["COCO"]) / 2.0
+    acc_3d = source_acc["Omni3D"]
+    official = (acc_2d + acc_3d) / 2.0
+    micro = _percent([float(row["score"]) for row in scored_rows])
+    metrics = {
+        "accuracy": official,
+        "official_accuracy": official,
+        "micro_accuracy": micro,
+        "by_type": {
+            "2D": {
+                "accuracy": acc_2d,
+                "count": sum(len(by_source[s]) for s in ("ADE20K", "COCO")),
+            },
+            "3D": {"accuracy": acc_3d, "count": len(by_source["Omni3D"])},
+        },
+        "by_source": {
+            source: {"accuracy": source_acc[source], "count": len(by_source[source])}
+            for source in required_sources
+        },
+        "by_task": {
+            task: {"accuracy": _percent(scores), "count": len(scores)}
+            for task, scores in sorted(by_task.items())
+        },
+    }
+    return official, metrics
+
+
+def _aggregate_vlms_are_blind(
+    scored_rows: Sequence[Dict[str, Any]],
+) -> Tuple[float, Dict[str, Any]]:
+    by_task = {task: [] for task in BLINDTEST_REPORT_TASKS}
+    unknown = defaultdict(int)
+    for row in scored_rows:
+        raw_task = _as_text(row.get("task", "")).strip().lower()
+        task = BLINDTEST_TASK_MAP.get(raw_task)
+        if task is None:
+            unknown[raw_task or "<empty>"] += 1
+            continue
+        by_task[task].append(float(row["score"]))
+    if unknown:
+        raise ValueError(f"Unknown VLMs Are Blind task labels: {dict(unknown)}")
+
+    missing = [task for task, scores in by_task.items() if not scores]
+    if missing:
+        raise ValueError(f"VLMs Are Blind is missing required report tasks: {missing}")
+
+    task_metrics = {
+        task: {"accuracy": _percent(scores), "count": len(scores)}
+        for task, scores in by_task.items()
+    }
+    task_mean = float(
+        np.mean([task_metrics[task]["accuracy"] for task in BLINDTEST_REPORT_TASKS])
+    )
+    micro = _percent([float(row["score"]) for row in scored_rows])
+    metrics = {
+        "accuracy": task_mean,
+        "task_mean": task_mean,
+        "micro_accuracy": micro,
+        "by_task": task_metrics,
+    }
+    return task_mean, metrics
+
+
+def _aggregate_docvqa(
+    scored_rows: Sequence[Dict[str, Any]],
+) -> Tuple[float, Dict[str, Any]]:
+    anls = _percent([float(row["score"]) for row in scored_rows])
+    exact = _percent(
+        [
+            _docvqa_exact_score(
+                row.get("prediction", ""),
+                row.get("answers", []),
+            )
+            for row in scored_rows
+        ]
+    )
+    return anls, {
+        "anls": anls,
+        "exact_accuracy": exact,
+    }
 
 
 def _merge_and_score(
@@ -484,13 +1011,10 @@ def _merge_and_score(
     result_name: str,
     result_prefix: str,
 ) -> Tuple[float, Dict[str, Any]]:
-    all_results = []
-    for rank in range(jax.process_count()):
-        path = f"{result_prefix}.results_{rank}.json"
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Missing {benchmark} result file from rank {rank}: {path}")
-        with open(path, encoding="utf-8") as f:
-            all_results.extend(json.load(f))
+    all_results = gather_rank_json_results(
+        result_prefix,
+        missing_file_msg=f"Missing {benchmark} result file from rank {{rank}}: {{path}}",
+    )
 
     dedup = {}
     for row in all_results:
@@ -499,7 +1023,23 @@ def _merge_and_score(
             dedup[key] = row
     all_results = list(dedup.values())
 
+    strict_benchmarks = {
+        "cambrian_cvbench",
+        "vlms_are_blind",
+        "docvqa",
+        "realworldqa",
+    }
+    expected = None
+    if benchmark in strict_benchmarks:
+        expected = int(getattr(config.eval, f"{benchmark}_num_samples"))
+        if len(all_results) != expected:
+            raise ValueError(
+                f"{result_name} expected {expected} unique predictions, "
+                f"got {len(all_results)}"
+            )
+
     scores = []
+    scored_rows = []
     by_type = defaultdict(list)
     no_gt = 0
     for row in all_results:
@@ -508,16 +1048,31 @@ def _merge_and_score(
             no_gt += 1
             continue
         scores.append(float(score))
+        scored_rows.append({**row, "score": float(score)})
         if row.get("question_type"):
             by_type[row["question_type"]].append(float(score))
 
-    primary = float(np.mean(scores) * 100.0) if scores else 0.0
+    if expected is not None and len(scores) != expected:
+        raise ValueError(
+            f"{result_name} expected {expected} scored predictions, got {len(scores)}; "
+            f"{no_gt} rows were missing usable ground truth"
+        )
+
+    if benchmark == "cambrian_cvbench":
+        primary, benchmark_metrics = _aggregate_cambrian_cvbench(scored_rows)
+    elif benchmark == "vlms_are_blind":
+        primary, benchmark_metrics = _aggregate_vlms_are_blind(scored_rows)
+    elif benchmark == "docvqa":
+        primary, benchmark_metrics = _aggregate_docvqa(scored_rows)
+    else:
+        primary = _percent(scores)
+        benchmark_metrics = {"accuracy": primary}
     metrics = {
         "benchmark": benchmark,
         "num_predictions": len(all_results),
         "num_scored": len(scores),
         "num_without_gt": no_gt,
-        "accuracy": primary,
+        **benchmark_metrics,
     }
     if by_type:
         metrics["by_question_type"] = {
@@ -533,7 +1088,10 @@ def _merge_and_score(
         json.dump(metrics, f, ensure_ascii=False, indent=2)
     log_for_0(f"{result_name} results: {final_path} ({len(all_results)} predictions)")
     log_for_0(f"{result_name} metrics: {metrics_path}")
-    log_for_0(f"{result_name} accuracy: {primary:.2f}% over {len(scores)} scored samples")
+    log_for_0(
+        f"{result_name} primary score: {primary:.2f}% "
+        f"over {len(scores)} scored samples"
+    )
     return primary, metrics
 
 
@@ -544,12 +1102,40 @@ def _vis_row(row: Dict[str, Any]) -> str:
     lines.append(f"prediction: {row.get('prediction', '')}")
     if row.get("answers"):
         lines.append(f"gt_answers: {row.get('answers')}")
+    elif row.get("answer") not in (None, ""):
+        lines.append(f"gt_answer: {row.get('answer')}")
     if row.get("choices"):
         lines.append(f"choices: {row.get('choices')}")
         lines.append(f"gt: {row.get('answer')}")
     if row.get("question_type"):
         lines.append(f"type: {row.get('question_type')}")
     return "\n".join(lines)
+
+
+def _understanding_loader_settings(config, benchmark: str) -> Tuple[int, int]:
+    """Resolve safe per-benchmark loader settings.
+
+    The iterable stream is partitioned at sample level across JAX processes so
+    every host executes a synchronized, exact-count decode schedule. PyTorch
+    workers independently split WebDataset shards, which breaks that global
+    sample ordering and can leave the merged result short or duplicated. Keep
+    these exact-count benchmarks single-worker until the dataset owns a joint
+    process/worker partitioner.
+    """
+    device_batch_size = int(
+        getattr(
+            config.eval,
+            f"{benchmark}_device_batch_size",
+            config.eval.device_batch_size,
+        )
+    )
+    num_workers = int(getattr(config.eval, f"{benchmark}_num_workers", 0))
+    if num_workers != 0:
+        raise ValueError(
+            f"{benchmark}_num_workers must be 0 for synchronized exact-count "
+            f"evaluation, got {num_workers}"
+        )
+    return device_batch_size, num_workers
 
 
 def _eval_understanding_benchmark(
@@ -573,9 +1159,15 @@ def _eval_understanding_benchmark(
     log_for_0(f"{result_name} eval: loading from {root_url}")
 
     dataset = WDSUnderstandingEvalDataset(root_url, benchmark, config, tokenizer)
-    batch_size = int(config.eval.device_batch_size) * jax.local_device_count()
+    device_batch_size, num_workers = _understanding_loader_settings(config, benchmark)
+    batch_size = device_batch_size * jax.local_device_count()
     max_len = int(getattr(config.eval, f"{benchmark}_max_txt_len", config.dataset.max_txt_len))
-    loader = DataLoader(dataset, batch_size=batch_size, num_workers=0, collate_fn=collate_fn)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+    )
     loader_iter = iter(loader)
 
     total_samples = int(getattr(config.eval, total_key, default_total))
@@ -632,17 +1224,22 @@ def _eval_understanding_benchmark(
 
     base_dir, prefix = eval_result_prefix(config, cache_key, cache_default, benchmark)
     ensure_eval_result_base_dir(base_dir)
-    out_file = f"{prefix}.results_{jax.process_index()}.json"
-    with open(out_file, "w", encoding="utf-8") as f:
-        json.dump(all_outs, f, ensure_ascii=False, indent=2)
+    write_rank_json_results(prefix, all_outs)
 
     mu.sync_global_devices(f"{benchmark} write done")
 
+    merge_exception = None
     if jax.process_index() == 0:
-        primary, metrics = _merge_and_score(config, benchmark, cache_key, cache_default, result_name, prefix)
+        try:
+            primary, metrics = _merge_and_score(config, benchmark, cache_key, cache_default, result_name, prefix)
+        except Exception as exc:  # Keep every rank out of the final barrier on failure.
+            logging.exception(f"{result_name} rank-0 merge/scoring failed")
+            merge_exception = exc
     else:
         log_for_all(f"Process {jax.process_index()} waiting for {result_name} evaluation to finish...")
         primary, metrics = 0.0, {}
+
+    broadcast_merge_ok(merge_exception, result_name)
 
     mu.sync_global_devices(f"{benchmark} eval done")
     return primary, [_vis_row(o) for o in all_outs[:16]], metrics
@@ -722,4 +1319,87 @@ def eval_seed_bench(p_sample_step, run_p_sample_step, model, tokenizer, params, 
         cache_key="seed_bench_cache_dir",
         cache_default="/kmh-nfs-ssd-us-mount/data/cached/zhh/seed_bench_eval",
         result_name="SEED-Bench",
+    )
+
+
+def eval_cambrian_cvbench(
+    p_sample_step, run_p_sample_step, model, tokenizer, params, config
+):
+    return _eval_understanding_benchmark(
+        p_sample_step,
+        run_p_sample_step,
+        model,
+        tokenizer,
+        params,
+        config,
+        benchmark="cambrian_cvbench",
+        root_key="cambrian_cvbench_root",
+        total_key="cambrian_cvbench_num_samples",
+        default_total=2638,
+        cache_key="cambrian_cvbench_cache_dir",
+        cache_default="/kmh-nfs-ssd-us-mount/data/cached/zhh/cambrian_cvbench_eval",
+        result_name="Cambrian CV-Bench",
+    )
+
+
+def eval_vlms_are_blind(
+    p_sample_step, run_p_sample_step, model, tokenizer, params, config
+):
+    return _eval_understanding_benchmark(
+        p_sample_step,
+        run_p_sample_step,
+        model,
+        tokenizer,
+        params,
+        config,
+        benchmark="vlms_are_blind",
+        root_key="vlms_are_blind_root",
+        total_key="vlms_are_blind_num_samples",
+        default_total=8016,
+        cache_key="vlms_are_blind_cache_dir",
+        cache_default="/kmh-nfs-ssd-us-mount/data/cached/zhh/vlms_are_blind_eval",
+        result_name="VLMs Are Blind",
+    )
+
+
+def eval_docvqa(p_sample_step, run_p_sample_step, model, tokenizer, params, config):
+    return _eval_understanding_benchmark(
+        p_sample_step,
+        run_p_sample_step,
+        model,
+        tokenizer,
+        params,
+        config,
+        benchmark="docvqa",
+        root_key="docvqa_root",
+        total_key="docvqa_num_samples",
+        default_total=5349,
+        cache_key="docvqa_cache_dir",
+        cache_default="/kmh-nfs-ssd-us-mount/data/cached/zhh/docvqa_eval",
+        result_name="DocVQA validation",
+    )
+
+
+def eval_realworldqa(
+    p_sample_step,
+    run_p_sample_step,
+    model,
+    tokenizer,
+    params,
+    config,
+):
+    return _eval_understanding_benchmark(
+        p_sample_step,
+        run_p_sample_step,
+        model,
+        tokenizer,
+        params,
+        config,
+        benchmark="realworldqa",
+        root_key="realworldqa_root",
+        total_key="realworldqa_num_samples",
+        default_total=765,
+        cache_key="realworldqa_cache_dir",
+        cache_default="/kmh-nfs-ssd-us-mount/data/cached/zhh/realworldqa_eval",
+        result_name="RealWorldQA",
     )

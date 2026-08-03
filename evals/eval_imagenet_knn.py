@@ -73,6 +73,76 @@ LDC = jax.local_device_count()
 PRI = jax.process_index()
 PRC = jax.process_count()
 
+
+# --- HSDP-correct global-shape helpers (mirror train.py's _local_array_to_global) ---
+# The kNN eval feeds a per-process image batch into a HSDP-sharded encoder via
+# jax.make_array_from_process_local_data. The global dim0 must be derived from the
+# DATA-axis process-group count, NOT batch_size*process_count: on v5p-128 the
+# model/fsdp axis replicates the batch across processes, so the data axis spans
+# fewer process-groups than PRC. Using batch_size*PRC over-counted dim0 and raised
+# "process addresses N elements, has M". These mirror train.py exactly.
+def _axis_rule_tuple(axis_rule):
+    if axis_rule is None:
+        return ()
+    if isinstance(axis_rule, str):
+        return (axis_rule,)
+    return tuple(axis_rule)
+
+
+def _mesh_axis_size(mesh, axis_rule):
+    mesh_shape = {name: size for name, size in zip(mesh.axis_names, mesh.devices.shape)}
+    size = 1
+    for axis_name in _axis_rule_tuple(axis_rule):
+        size *= int(mesh_shape[axis_name])
+    return size
+
+
+def _process_local_axis_size(mesh, axis_rule):
+    axes = _axis_rule_tuple(axis_rule)
+    if not axes:
+        return 1
+    axis_to_dim = {name: i for i, name in enumerate(mesh.axis_names)}
+    coords = {axis_name: set() for axis_name in axes}
+    for index in np.ndindex(mesh.devices.shape):
+        device = mesh.devices[index]
+        if getattr(device, "process_index", None) != PRI:
+            continue
+        for axis_name in axes:
+            coords[axis_name].add(index[axis_to_dim[axis_name]])
+    local_size = 1
+    for axis_name in axes:
+        count = len(coords[axis_name])
+        if count == 0:
+            raise ValueError(f"Process {PRI} has no addressable devices on mesh axis {axis_name}")
+        local_size *= count
+    return local_size
+
+
+def _spec_tuple_for_shape(spec, ndim):
+    spec_tuple = tuple(spec) if spec is not None else ()
+    if len(spec_tuple) < ndim:
+        spec_tuple = spec_tuple + (None,) * (ndim - len(spec_tuple))
+    elif len(spec_tuple) > ndim:
+        spec_tuple = spec_tuple[:ndim]
+    return spec_tuple
+
+
+def _global_shape_from_process_local_shape(local_shape, mesh, spec):
+    spec_tuple = _spec_tuple_for_shape(spec, len(local_shape))
+    global_shape = []
+    for dim_size, axis_rule in zip(local_shape, spec_tuple):
+        global_axis = _mesh_axis_size(mesh, axis_rule)
+        local_axis = _process_local_axis_size(mesh, axis_rule)
+        global_dim = int(dim_size) * global_axis
+        if global_dim % local_axis:
+            raise ValueError(
+                f"Cannot infer global dim from local dim {dim_size}, "
+                f"axis_rule={axis_rule}, global_axis={global_axis}, local_axis={local_axis}"
+            )
+        global_shape.append(global_dim // local_axis)
+    return tuple(global_shape)
+
+
 # ── Zone-local TFDS paths ────────────────────────────────────────────────────
 _KNN_TFDS_DATA_DIRS: dict[str, str] = {
     "us-central1": "gs://kmh-gcp-us-central1/tensorflow_datasets",
@@ -456,7 +526,15 @@ def _extract_features_local(
                     labels = batch_labels[:B].astype(np.int32)
                     seen_examples += B
 
-        global_shape = (batch_size * PRC,) + x_np.shape[1:]
+        # HSDP-correct: derive global dim0 from the data-axis process-group count
+        # (see helpers above), not batch_size*PRC. Under jax's hsdp_legacy_data the
+        # DATA batch is sharded over ALL mesh axes, so this equals batch_size*PRC
+        # (verified numerically); the helper additionally stays correct if the
+        # sharding ever replicates the batch over a model axis (plain hsdp), where
+        # batch_size*PRC would over-count and raise "process addresses N, has M".
+        global_shape = _global_shape_from_process_local_shape(
+            x_np.shape, p_encode._mesh, p_encode._image_spec
+        )
         global_images = jax.make_array_from_process_local_data(
             jax.sharding.NamedSharding(p_encode._mesh, p_encode._image_spec),
             x_np,

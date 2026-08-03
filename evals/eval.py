@@ -14,10 +14,14 @@ from evals.eval_imagenet_knn import eval_imagenet_knn
 from evals.eval_refcocog import eval_refcocog
 from evals.eval_pixelbench import eval_pixelbench
 from evals.eval_vlm_benchmarks import (
+    eval_cambrian_cvbench,
+    eval_docvqa,
     eval_gqa,
-    eval_vizwiz,
+    eval_realworldqa,
     eval_scienceqa_img,
     eval_seed_bench,
+    eval_vizwiz,
+    eval_vlms_are_blind,
 )
 from utils.logging_util import log_for_0
 from utils.eval_io_util import set_eval_result_context
@@ -274,6 +278,123 @@ def run_eval_tasks(
             log_for_0("GQA evaluation finished.")
             continue
 
+        if t in {"docvqa", "docqa", "docvqa_val", "docvqa-val"}:
+            log_for_0(f"Evaluating DocVQA validation at step {step}...")
+            anls, sample_outputs, metric_dict = eval_docvqa(
+                _select_sample_fn(p_sample_fn, "docvqa"),
+                run_p_sample_step,
+                model,
+                tokenizer,
+                params,
+                config,
+            )
+            writer.write_scalars(
+                step,
+                {
+                    f"docvqa_anls{suffix}": anls,
+                    f"docvqa_exact_acc{suffix}": float(
+                        metric_dict.get("exact_accuracy", 0.0)
+                    ),
+                    "step": step,
+                },
+            )
+            if sample_outputs:
+                writer.write_texts(step, f"docvqa_samples{suffix}", sample_outputs)
+            log_for_0(f"DocVQA validation ANLS: {anls:.2f}%")
+            continue
+
+        if t in {"realworldqa", "real_world_qa", "realworld_qa", "real-world-qa"}:
+            log_for_0(f"Evaluating RealWorldQA at step {step}...")
+            acc, sample_outputs, _ = eval_realworldqa(
+                _select_sample_fn(p_sample_fn, "realworldqa"),
+                run_p_sample_step,
+                model,
+                tokenizer,
+                params,
+                config,
+            )
+            writer.write_scalars(
+                step,
+                {f"realworldqa_acc{suffix}": acc, "step": step},
+            )
+            if sample_outputs:
+                writer.write_texts(
+                    step,
+                    f"realworldqa_samples{suffix}",
+                    sample_outputs,
+                )
+            log_for_0(f"RealWorldQA accuracy: {acc:.2f}%")
+            continue
+
+        if t in {"cambrian_cvbench", "cambrian-cvbench", "cvbench", "cv_bench"}:
+            log_for_0(f"Evaluating Cambrian CV-Bench at step {step}...")
+            acc, sample_outputs, metric_dict = eval_cambrian_cvbench(
+                _select_sample_fn(p_sample_fn, "cvbench"),
+                run_p_sample_step,
+                model,
+                tokenizer,
+                params,
+                config,
+            )
+            scalar_dict = {
+                f"cambrian_cvbench_acc{suffix}": acc,
+                f"cambrian_cvbench_micro_acc{suffix}": float(
+                    metric_dict.get("micro_accuracy", 0.0)
+                ),
+                "step": step,
+            }
+            for name, metrics in metric_dict.get("by_type", {}).items():
+                safe = str(name).lower().replace(" ", "_").replace("/", "_")
+                scalar_dict[f"cambrian_cvbench_{safe}_acc{suffix}"] = float(
+                    metrics["accuracy"]
+                )
+            for name, metrics in metric_dict.get("by_source", {}).items():
+                safe = str(name).lower().replace(" ", "_").replace("/", "_")
+                scalar_dict[f"cambrian_cvbench_source_{safe}_acc{suffix}"] = float(
+                    metrics["accuracy"]
+                )
+            for name, metrics in metric_dict.get("by_task", {}).items():
+                safe = str(name).lower().replace(" ", "_").replace("/", "_")
+                scalar_dict[f"cambrian_cvbench_task_{safe}_acc{suffix}"] = float(
+                    metrics["accuracy"]
+                )
+            writer.write_scalars(step, scalar_dict)
+            if sample_outputs:
+                writer.write_texts(
+                    step, f"cambrian_cvbench_samples{suffix}", sample_outputs
+                )
+            log_for_0(f"Cambrian CV-Bench official accuracy: {acc:.2f}%")
+            continue
+
+        if t in {"vlms_are_blind", "vlmsareblind", "vlms-are-blind", "blindtest"}:
+            log_for_0(f"Evaluating VLMs Are Blind at step {step}...")
+            acc, sample_outputs, metric_dict = eval_vlms_are_blind(
+                _select_sample_fn(p_sample_fn, "blindtest"),
+                run_p_sample_step,
+                model,
+                tokenizer,
+                params,
+                config,
+            )
+            scalar_dict = {
+                f"vlms_are_blind_task_mean{suffix}": acc,
+                f"vlms_are_blind_micro_acc{suffix}": float(
+                    metric_dict.get("micro_accuracy", 0.0)
+                ),
+                "step": step,
+            }
+            for name, metrics in metric_dict.get("by_task", {}).items():
+                scalar_dict[f"vlms_are_blind_{name}_acc{suffix}"] = float(
+                    metrics["accuracy"]
+                )
+            writer.write_scalars(step, scalar_dict)
+            if sample_outputs:
+                writer.write_texts(
+                    step, f"vlms_are_blind_samples{suffix}", sample_outputs
+                )
+            log_for_0(f"VLMs Are Blind official task mean: {acc:.2f}%")
+            continue
+
         if t == "vizwiz":
             log_for_0(f"Evaluating VisWiz at step {step}...")
             acc, sample_outputs, metric_dict = eval_vizwiz(
@@ -410,6 +531,12 @@ def run_eval_tasks(
             scalar_dict = {f"refcocog_acc{suffix}": acc, "step": step}
             if isinstance(metric_dict, dict) and "miou" in metric_dict:
                 scalar_dict[f"refcocog_miou{suffix}"] = float(metric_dict["miou"])
+            if isinstance(metric_dict, dict) and "valid_answer_count" in metric_dict:
+                scalar_dict[f"refcocog_valid_answer_count{suffix}"] = int(metric_dict["valid_answer_count"])
+                scalar_dict[f"refcocog_total_count{suffix}"] = int(metric_dict.get("total_count", 0))
+                scalar_dict[f"refcocog_valid_answer_ratio{suffix}"] = float(
+                    metric_dict.get("valid_answer_ratio", 0.0)
+                )
             writer.write_scalars(step, scalar_dict)
             if sample_outputs:
                 writer.write_texts(step, f"refcocog_samples{suffix}", sample_outputs)
@@ -448,8 +575,18 @@ def run_eval_tasks(
                 scalar_dict[f"pixelbench_macro_acc{suffix}"] = acc
                 for name, metrics in metric_dict.get("benchmarks", {}).items():
                     scalar_dict[f"{name}_acc{suffix}"] = float(metrics.get("acc", 0.0))
+                    if name == "mmvp" and "item_acc" in metrics:
+                        scalar_dict[f"mmvp_item_acc{suffix}"] = float(metrics["item_acc"])
+                    if name == "ocrbench" and "official_score" in metrics:
+                        scalar_dict[f"ocrbench_score{suffix}"] = float(metrics["official_score"])
             else:
-                scalar_dict[f"{pixelbench_aliases[t]}_acc{suffix}"] = acc
+                benchmark = pixelbench_aliases[t]
+                scalar_dict[f"{benchmark}_acc{suffix}"] = acc
+                metrics = metric_dict.get("benchmarks", {}).get(benchmark, {})
+                if benchmark == "mmvp" and "item_acc" in metrics:
+                    scalar_dict[f"mmvp_item_acc{suffix}"] = float(metrics["item_acc"])
+                if benchmark == "ocrbench" and "official_score" in metrics:
+                    scalar_dict[f"ocrbench_score{suffix}"] = float(metrics["official_score"])
             writer.write_scalars(step, scalar_dict)
             if sample_outputs:
                 writer.write_texts(step, f"{t.replace('*', 'star')}_samples{suffix}", sample_outputs)

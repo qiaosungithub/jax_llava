@@ -26,7 +26,6 @@ training:
 
     sample_on_training: True
     sample_per_step: 1
-    cider_per_step: -1
 
     seed: 42
 
