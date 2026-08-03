@@ -1,14 +1,47 @@
 import jax
 import jax.experimental.multihost_utils as mu
 from flax.training import checkpoints
+from utils import g3_env
 from utils.logging_util import log_for_0, print0, Emoji
 import os
 import re
-import gcsfs
 import contextlib
 import orbax.checkpoint as ocp
 
-FS = gcsfs.GCSFileSystem()
+
+class _GfileFS:
+    """The three `gcsfs.GCSFileSystem` methods this module uses, over gfile.
+
+    `gcsfs` does not exist in google3, and importing it at module scope killed
+    the binary before `main()` ever ran. `pyglib.gfile` covers the same three
+    operations and additionally reaches `/cns/`, which gcsfs never could.
+    """
+
+    @staticmethod
+    def _gfile():
+        from google3.pyglib import gfile
+        return gfile
+
+    def exists(self, path):
+        return self._gfile().Exists(path)
+
+    def copy(self, src, dst, recursive=False):
+        gfile = self._gfile()
+        if recursive:
+            gfile.RecursivelyCopyDir(src.rstrip('/'), dst.rstrip('/'),
+                                     overwrite=True)
+        else:
+            gfile.Copy(src, dst, overwrite=True)
+
+
+def _make_fs():
+    if g3_env.in_google3():
+        return _GfileFS()
+    import gcsfs
+    return gcsfs.GCSFileSystem()
+
+
+FS = _make_fs()
 _CHECKPOINT_RE = re.compile(r"^checkpoint_(\d+)$")
 _NORMAL_CKPT_PREFIX = "/qiao_zhicheng_hanhong_files/"
 _PRETRAINED_CKPT_PREFIX = "/pretrained-ckpts/qiao_zhicheng_hanhong_files/"
@@ -39,6 +72,14 @@ def _convert_known_gs_to_zone(path: str, zone: str):
     return path
 
 def infer_zone_card(config, workdir):
+    # On Borg the workdir is a task-local scratch path with no zone in its
+    # name; the truth is the cell the scheduler placed us in. Ask the
+    # environment first, and only fall back to parsing the workdir (which is
+    # how the GCP TPU-VM path has always worked, where the launcher encodes
+    # the zone in the path).
+    env_zone = g3_env.infer_zone_from_environment()
+    if env_zone:
+        return env_zone
     matched_zones = [z for z in ['us-central1', 'us-east1', 'us-east5', 'us-central2', 'asia-northeast1-b', 'europe-west4'] if z in workdir]
     if not matched_zones:
         if not config.local_debug:
@@ -49,7 +90,46 @@ def infer_zone_card(config, workdir):
     zone = matched_zones[0]
     return zone
 
+# Under Borg the durable root is handed to the job as $CHECKPOINT_BUCKET (a
+# /cns/ prefix derived from the XManager experiment id, so it is stable across
+# restarts -- which is what makes in-process auto-resume well defined). The
+# workdir itself is task-local and is wiped by the very restart a checkpoint
+# exists to survive, so it is never a checkpoint location.
+CNS_CKPT_SUBDIR = 'checkpoints'
+CNS_PRETRAINED_SUBDIR = 'pretrained-ckpts'
+
+
+def checkpoint_bucket():
+    """The durable /cns/ root for this run, or '' if none was provided."""
+    return (os.environ.get('CHECKPOINT_BUCKET', '') or '').strip().rstrip('/')
+
+
+def _convert_to_cns(path: str):
+    """Map any checkpoint-ish path to this run's durable CNS prefix."""
+    if path.startswith('/cns/'):
+        return path.rstrip('/')
+    bucket = checkpoint_bucket()
+    if not bucket:
+        raise ValueError(
+            f'Cannot resolve checkpoint path {path!r} in google3: no '
+            '$CHECKPOINT_BUCKET in the environment. The launcher sets it; for '
+            'a local run export it to a /cns/ prefix you can write.'
+        )
+    if not bucket.startswith('/cns/'):
+        raise ValueError(
+            f'$CHECKPOINT_BUCKET={bucket!r} is not a /cns/ path. A Borg task '
+            'runs as <user>@prod.google.com and cannot write our gs:// '
+            'buckets; CNS is the one filesystem its identity owns.'
+        )
+    return f'{bucket}/{CNS_CKPT_SUBDIR}'
+
+
 def convert_to_gs(path: str, zone=None):
+    # In google3 there is no GCS bucket to convert to; everything durable is on
+    # CNS. Do this before the gs:// branch so a stale gs:// path in a config
+    # cannot smuggle a cross-identity write past us.
+    if g3_env.in_google3():
+        return _convert_to_cns(path)
     if path.startswith('gs://'):
         if zone is not None:
             return _convert_known_gs_to_zone(path, zone)
@@ -77,13 +157,24 @@ def convert_to_gs(path: str, zone=None):
     return out
 
 def exist_general(path):
-    if path.startswith('gs://'):
+    # `os.path.exists` on a /cns/ path silently answers False -- the stdlib has
+    # no idea the filesystem exists. Route every distributed path through the
+    # client that does.
+    if path.startswith(('gs://', '/cns/', '/bigstore/', '/placer/')):
         return FS.exists(path)
     return os.path.exists(path)
 
 def convert_to_pretrained_gs(path: str, zone=None):
     """Maps a normal regional checkpoint path to the same bucket's durable prefix."""
     gs_path = convert_to_gs(path, zone).rstrip('/')
+    if g3_env.in_google3():
+        if f'/{CNS_PRETRAINED_SUBDIR}' in gs_path:
+            return gs_path
+        assert gs_path.endswith(f'/{CNS_CKPT_SUBDIR}') or f'/{CNS_CKPT_SUBDIR}/' in gs_path, (
+            f'cannot convert {gs_path} to a pretrained path: it is not under '
+            f'/{CNS_CKPT_SUBDIR}'
+        )
+        return gs_path.replace(f'/{CNS_CKPT_SUBDIR}', f'/{CNS_PRETRAINED_SUBDIR}', 1)
     if _PRETRAINED_CKPT_PREFIX in gs_path:
         return gs_path
     assert _NORMAL_CKPT_PREFIX in gs_path, (

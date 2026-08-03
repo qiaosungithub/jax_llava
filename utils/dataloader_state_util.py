@@ -3,15 +3,90 @@ import pickle
 import re
 
 import jax
-import tensorflow as tf
 
+from utils import g3_env
 from utils.ckpt_util import _resolve_checkpoint_path, convert_to_gs
 from utils.logging_util import log_for_0
 
 
+class _Filesystem:
+    """The `tf.io.gfile` surface this module uses, over whichever backend exists.
+
+    TensorFlow is a heavyweight dependency pulled in for five filesystem calls,
+    and in google3 `pyglib.gfile` covers all of them while additionally
+    reaching `/cns/`. Selecting at import time keeps every call site unchanged.
+    """
+
+    def __init__(self, backend):
+        self._backend = backend
+
+    @staticmethod
+    def _g3():
+        from google3.pyglib import gfile
+        return gfile
+
+    def makedirs(self, path):
+        if self._backend == "gfile":
+            g = self._g3()
+            if not g.Exists(path):
+                g.MakeDirs(path)
+        else:
+            self._tf().io.gfile.makedirs(path)
+
+    def exists(self, path):
+        if self._backend == "gfile":
+            return self._g3().Exists(path)
+        return self._tf().io.gfile.exists(path)
+
+    def remove(self, path):
+        if self._backend == "gfile":
+            self._g3().Remove(path)
+        else:
+            self._tf().io.gfile.remove(path)
+
+    def rename(self, src, dst, overwrite=False):
+        if self._backend == "gfile":
+            self._g3().Rename(src, dst, overwrite=overwrite)
+        else:
+            self._tf().io.gfile.rename(src, dst, overwrite=overwrite)
+
+    def GFile(self, path, mode):  # noqa: N802 - mirrors tf.io.gfile.GFile
+        if self._backend == "gfile":
+            return self._g3().Open(path, mode)
+        return self._tf().io.gfile.GFile(path, mode)
+
+    @staticmethod
+    def _tf():
+        import tensorflow
+        return tensorflow
+
+
+class _TfCompat:
+    """`tf.io.gfile.<x>` spelled over the selected backend."""
+
+    def __init__(self, fs):
+        self.io = type("_Io", (), {"gfile": fs})()
+
+
+tf = _TfCompat(_Filesystem("gfile" if g3_env.in_google3() else "tf"))
+
+
 STATE_VERSION = 1
+# A dataloader state file records the shard URLs it was reading. Resuming in a
+# different region is legal only when the new root is the SAME dataset in a
+# different replica, so the comparison is done on a canonical form with the
+# replica name masked out. The alternation is a closed list on purpose: it can
+# only ever equate two roots we know hold identical bytes, never arbitrary
+# paths that happen to look alike.
+#
+# Both storage systems appear here, because a run can be resumed on Borg from
+# state written on a GCP TPU VM only if their roots canonicalize the same way
+# -- and they do not, which is the correct answer: the shard COUNT differs
+# (1097 on GCS, 150 on CNS), so that state is genuinely incompatible and the
+# strict check should reject it rather than silently replay a different corpus.
 _REPLICA_DATA_BUCKET_RE = re.compile(
-    r"^(gs://kmh-gcp-(?:us-central1|us-east5|asia-northeast1-b)/data)(/.*)?$"
+    r"^(gs://kmh-gcp-(?:us-central1|us-east5|asia-northeast1-b)/data"
+    r"|/cns/(?:go-d|yucmhcg-d)/home/qiaos/data)(/.*)?$"
 )
 _LOGICAL_DATA_BUCKET_PREFIX = "gs://kmh-gcp-<replica>/data"
 
