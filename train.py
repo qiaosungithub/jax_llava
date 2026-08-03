@@ -54,11 +54,42 @@ from utils.trainstate_util import create_train_state
 warnings.filterwarnings("ignore", message=".*EOF occurred in violation of protocol.*")
 absl_logging.set_verbosity(absl_logging.INFO)
 
-LDC = jax.local_device_count()
-PRC = jax.process_count()
-PRI = jax.process_index()
-GDC = jax.device_count()
-assert GDC == LDC * PRC, f"{GDC} != {LDC} * {PRC}"
+# ---------------------------------------------------------------------------
+# Process/device topology, resolved on FIRST USE rather than at import
+# ---------------------------------------------------------------------------
+# These four used to be plain module-level assignments. Under google3, JAX
+# refuses to answer before `absl.app.run()` has run InitGoogle():
+#
+#   RuntimeError: Attempted call to JAX before absl.app.run() is called.
+#
+# and a module-level call therefore kills the binary during `import`, before
+# main() and before any logging exists -- on Borg that surfaces only as an
+# empty status message and no log at all.
+#
+# PEP 562 module `__getattr__` keeps every existing `LDC` / `PRI` / `PRC` /
+# `GDC` reference in this file working untouched, while deferring the actual
+# JAX call to the first one that runs -- by which time we are inside main().
+# The values are cached after the first resolution, so this stays a
+# module-level constant in every way that matters.
+_TOPOLOGY_CACHE = {}
+
+
+def _topology(name):
+    if name not in _TOPOLOGY_CACHE:
+        ldc = int(jax.local_device_count())
+        prc = int(jax.process_count())
+        gdc = int(jax.device_count())
+        assert gdc == ldc * prc, f"{gdc} != {ldc} * {prc}"
+        _TOPOLOGY_CACHE.update(
+            LDC=ldc, PRC=prc, PRI=int(jax.process_index()), GDC=gdc)
+    return _TOPOLOGY_CACHE[name]
+
+
+def __getattr__(name):
+    if name in ("LDC", "PRC", "PRI", "GDC"):
+        return _topology(name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 
 FIXED_PAIRS = {

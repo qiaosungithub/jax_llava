@@ -76,6 +76,17 @@ _CNS_DATA_ROOTS = {
     "yucmhcg-d": "/cns/yucmhcg-d/home/qiaos/data",
 }
 
+# Pretrained third-party weights (CLIP). Unlike the dataset these are small and
+# read once at startup, so the list is tried in order and a same-metro read is
+# acceptable. Gemma is absent on purpose: it comes from /tfhub/, which is
+# globally addressable and needs no replica choice.
+_CNS_MODEL_ROOTS = {
+    "cmh": (
+        "/cns/yucmhcg-d/home/qiaos/models",
+        "/cns/go-d/home/qiaos/models",
+    ),
+}
+
 
 def borg_cell():
     """The Borg cell this task runs in, or None off Borg."""
@@ -163,6 +174,32 @@ def resolve_data_root():
             )
         return root
     return cns_data_root()
+
+
+def cns_model_roots(cell=None):
+    """CNS directories to search for pretrained weights, nearest metro first.
+
+    Falls back to every registered root when the cell is unknown -- a model
+    read is a few hundred MB, once, at startup, so "slower but correct" beats
+    "refuses to start". That is deliberately the opposite of the dataset rule,
+    where a wrong choice means streaming 200 GiB across a region for hours.
+    """
+    override = (os.environ.get("JAX_LLAVA_MODEL_ROOT") or "").strip()
+    if override:
+        return (override.rstrip("/"),)
+    metro = metro_of_cell(cell or borg_cell())
+    if metro and metro in _CNS_MODEL_ROOTS:
+        return _CNS_MODEL_ROOTS[metro]
+    return tuple(r for roots in _CNS_MODEL_ROOTS.values() for r in roots)
+
+
+def cns_dir_exists(path):
+    """True if `path` exists on CNS. MUST be called after InitGoogle()."""
+    try:
+        from google3.pyglib import gfile
+        return bool(gfile.Exists(path))
+    except Exception:  # noqa: BLE001 - an unreadable path is not an existing one
+        return False
 
 
 def infer_zone_from_environment():

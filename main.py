@@ -91,7 +91,7 @@ def _install_webdataset_shim():
     except ImportError:
         pass
     import types
-    from wds_shim import wds_shim
+    import wds_shim
 
     sys.modules["webdataset"] = wds_shim
     for name in ("gopen", "filters", "shardlists"):
