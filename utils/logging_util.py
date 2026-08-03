@@ -16,14 +16,38 @@ from functools import partial
 #     if jax.process_index() == 0:
 #         print(*args, **kwargs)
 
+def process_index_or_zero():
+    """`jax.process_index()`, or 0 when JAX is not initialised yet.
+
+    Under google3 Bazel, JAX refuses to answer before `absl.app.run()` has
+    run (`jax_google.py::_lazy_initialization`), raising
+
+        RuntimeError: Attempted call to JAX before absl.app.run() is called.
+
+    That happens for real in a torch DataLoader worker: absl_spawn re-execs
+    the binary, the child unpickles the dataset, which re-imports
+    `input_pipeline` -> this module, all before the child's InitGoogle(). A
+    logging helper that raises there kills the worker and the parent then
+    waits forever for a batch that never comes.
+
+    Logging is a diagnostic; it must never be able to kill the thing it
+    watches. Before initialisation every process is indistinguishable from
+    process 0, which is also the answer that makes `log_for_0` print.
+    """
+    try:
+        return jax.process_index()
+    except RuntimeError:
+        return 0
+
+
 def log_for_0(*args, stacklevel=2):
-    if jax.process_index() == 0:
+    if process_index_or_zero() == 0:
         logging.info(*args, stacklevel=stacklevel)
 
 print0 = lambda *args, **kwargs: log_for_0(*args, stacklevel=3)
 
 def log_for_all(msg):
-    logging.info(f"[Rank {jax.process_index()}] {msg}")
+    logging.info(f"[Rank {process_index_or_zero()}] {msg}")
 
 class ExcludeInfo(_logging.Filter):
     def __init__(self, exclude_files):
@@ -37,7 +61,7 @@ class ExcludeInfo(_logging.Filter):
 
 
 # Suppress orbax/flax checkpoint INFO logs: CommitFuture blocking, "No metadata found", etc.
-exclude_files = [
+_EXCLUDE_FILES_BASE = [
     'orbax/checkpoint/async_checkpointer.py',
     'orbax/checkpoint/abstract_checkpointer.py',
     'orbax/checkpoint/multihost/utils.py',
@@ -49,15 +73,25 @@ exclude_files = [
     'orbax/checkpoint/metadata/array_metadata_store.py',
     'array_metadata_store.py',
     'orbax/checkpoint/',  # catch any other checkpoint INFO under orbax (e.g. future.py path variants)
-] + [
+]
+# Non-zero processes additionally silence the two files process 0 keeps, so the
+# checkpoint story is told once rather than once per host.
+_EXCLUDE_FILES_NONZERO = [
     'orbax/checkpoint/checkpointer.py',
     'flax/training/checkpoints.py',
-] * jax.process_index()
-file_filter = ExcludeInfo(exclude_files)
+]
+
+
+def _exclude_files():
+    # Resolved lazily: asking JAX for the process index at MODULE scope raises
+    # in any process that has not run InitGoogle() yet -- see
+    # process_index_or_zero() above. supress_checkpt_info() is only ever
+    # called from main(), where the answer is real.
+    return _EXCLUDE_FILES_BASE + _EXCLUDE_FILES_NONZERO * process_index_or_zero()
 
 
 def supress_checkpt_info():
-    logging.get_absl_handler().addFilter(file_filter)
+    logging.get_absl_handler().addFilter(ExcludeInfo(_exclude_files()))
 
 
 class Timer:

@@ -13,7 +13,14 @@ import numpy as np
 from gemma import gm
 from gemma.gm.utils import _file_cache
 from etils import epath
-from sentencepiece import sentencepiece_model_pb2
+try:
+    from sentencepiece import sentencepiece_model_pb2
+except ImportError:
+    # google3's //third_party/py/sentencepiece does not re-export the generated
+    # proto module; it lives in its own target
+    # //third_party/sentencepiece/src:sentencepiece_model_py_pb2. Same message
+    # type, different spelling. (gemma's own _tokenizer.py imports it this way.)
+    from google3.third_party.sentencepiece.src import sentencepiece_model_pb2
 import sentencepiece as spm
 
 # ---------------------------------------------------------------------------

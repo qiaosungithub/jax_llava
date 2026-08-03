@@ -1,4 +1,5 @@
 
+from utils import g3_env
 from utils.llava_ov15_groups import (
     LLAVA_OV15_GROUP_ALIAS,
     LLAVA_OV15_GROUP_ALIASES,
@@ -203,11 +204,43 @@ dataset_name_to_type_dict = {
 }
 
 
+# ---------------------------------------------------------------------------
+# google3 / Borg: the same datasets, on Colossus instead of GCS
+# ---------------------------------------------------------------------------
+# Under Borg there is no `gs://kmh-gcp-<zone>` bucket to substitute into, so a
+# dataset name resolves against the CNS replica local to this task's cell
+# (utils/g3_env.py owns the cell -> metro -> region -> root mapping).
+#
+# The shard RANGE is part of the entry, and it is the range that actually
+# exists on CNS -- not the GCS range. cc12m upstream has 1097 shards; we copied
+# 150. Writing 01096 here would produce a shard list whose tail does not exist,
+# and a loader that resolves its list at startup treats that as data it will
+# never reach rather than as an error. Missing shards are configuration errors.
+# Verified with `fileutil ls /cns/go-d/home/qiaos/data/cc12m/`: 150 .tar,
+# 00000..00149, plus 150 _stats.json, manifest.jsonl and _SUCCESS.
+CNS_DATASET_RELPATHS = {
+    'cc12m': 'cc12m/{00000..00149}.tar',
+}
+
+
+def cns_dataset_path(name, data_root=None):
+    """CNS path for a dataset name, or None if it has no CNS replica."""
+    relpath = CNS_DATASET_RELPATHS.get(name)
+    if relpath is None:
+        return None
+    root = data_root if data_root else g3_env.resolve_data_root()
+    return f"{root.rstrip('/')}/{relpath}"
+
+
 def _resolve_one(name, zone: str):
     """Resolve a single dataset name or raw GCS path to a full path."""
     if isinstance(name, (list, tuple)):
         return [_resolve_one(item, zone) for item in name]
     _assert_zone_allowed(name, zone)
+    # On Borg, prefer the co-located CNS replica over the GCS mirror. An
+    # explicit path (already a /cns/ or gs:// URL) is never rewritten.
+    if g3_env.in_google3() and name in CNS_DATASET_RELPATHS:
+        return cns_dataset_path(name)
     if name in dataset_name_to_path_dict:
         return _resolve_one(dataset_name_to_path_dict[name], zone)
     if '💣' in name:

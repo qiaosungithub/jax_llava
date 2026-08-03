@@ -18,6 +18,7 @@ from torchvision.transforms import functional as TF
 from functools import partial
 from PIL import Image, ImageDraw, ImageFile
 
+from utils import g3_env
 from utils.logging_util import log_for_0
 from utils.llm_util import create_tokenizer
 from utils.bbox_util import (
@@ -90,8 +91,28 @@ def _load_region_lookup(gcs_path: str, local_path: str = _REGION_DESC_LOCAL) -> 
     return lookup
 
 
+def _glob(pattern):
+    """List paths matching `pattern`, on whichever filesystem it names.
+
+    `fsspec.filesystem("gs")` needs `gcsfs`, which does not exist in google3
+    (it raises `ImportError: Please install gcsfs`), and it cannot see `/cns/`
+    at all. `pyglib.gfile` reaches CNS, bigstore and POSIX natively, so it is
+    what a google3 build uses.
+    """
+    if g3_env.in_google3():
+        from google3.pyglib import gfile
+        return list(gfile.Glob(pattern))
+    return list(fsspec.filesystem("gs").glob(pattern))
+
+
 def register_gcsfs():
-    """Patches webdataset to use fsspec for gs:// urls."""
+    """Patches webdataset to open gs:// urls through fsspec.
+
+    Only meaningful outside google3: the wds shim opens /cns/ and /bigstore/
+    through pyglib.gfile itself, and `gs://` shard roots do not survive the
+    fail-closed locality guard on Borg anyway. Keeping the registration for
+    the GCP path means one less behaviour difference between the two.
+    """
     try:
         gopen_module = importlib.import_module("webdataset.gopen")
 
@@ -433,6 +454,79 @@ def _dataset_config_int(dataset_config, field: str, dataset_type: str, default: 
 _SHUFFLE_SIZE_REFERENCE_STREAMS = 32
 
 
+# ---------------------------------------------------------------------------
+# Process topology, captured once and inherited by DataLoader workers
+# ---------------------------------------------------------------------------
+# `jax.process_index()` / `jax.process_count()` decide which shards a stream
+# reads and which seeds it draws. Both are asked for INSIDE dataset iterators,
+# i.e. inside DataLoader workers -- and a worker is a different process.
+#
+# Under fork that used to be harmless: the child inherited an initialised JAX.
+# Under google3 the only usable start method is absl_spawn, which re-execs the
+# binary, and the child's JAX is a fresh, UNINITIALISED runtime that knows
+# nothing about the gang. Asking it who we are has two failure modes and both
+# are silent:
+#   * before InitGoogle() it raises RuntimeError, killing the worker while the
+#     parent waits forever for a batch (the hang the feasibility study found);
+#   * after InitGoogle() it answers 0-of-1, so EVERY host's workers select the
+#     SAME shard slice -- a 4-host job then trains on a quarter of the data,
+#     four times over, with no error anywhere.
+#
+# So the topology is read once in the parent, where it is true, and shipped to
+# the workers as plain ints (pickled with the dataset). A worker that somehow
+# has no captured value fails closed rather than guessing 0-of-1.
+_PROCESS_TOPOLOGY = None
+
+
+def capture_process_topology():
+    """Record (process_index, process_count) from the parent process.
+
+    Call once from the main process, after JAX is up and before any loader is
+    built. Returns the captured pair.
+    """
+    global _PROCESS_TOPOLOGY
+    _PROCESS_TOPOLOGY = (int(jax.process_index()), int(jax.process_count()))
+    return _PROCESS_TOPOLOGY
+
+
+def _in_dataloader_worker() -> bool:
+    return get_worker_info() is not None
+
+
+def process_index() -> int:
+    """This process's rank in the JAX gang, safe inside a DataLoader worker."""
+    if _PROCESS_TOPOLOGY is not None:
+        return _PROCESS_TOPOLOGY[0]
+    if _in_dataloader_worker():
+        raise RuntimeError(
+            "DataLoader worker has no captured process topology. Under "
+            "absl_spawn a worker's JAX is uninitialised and would report "
+            "0-of-1, silently making every host read the same shards. Call "
+            "input_pipeline.capture_process_topology() in the main process "
+            "before building a loader."
+        )
+    return int(jax.process_index())
+
+
+def process_count() -> int:
+    """Size of the JAX gang, safe inside a DataLoader worker."""
+    if _PROCESS_TOPOLOGY is not None:
+        return _PROCESS_TOPOLOGY[1]
+    if _in_dataloader_worker():
+        raise RuntimeError(
+            "DataLoader worker has no captured process topology; see "
+            "input_pipeline.process_index()."
+        )
+    return int(jax.process_count())
+
+
+def _adopt_process_topology(topology):
+    """Install a topology captured by the parent (used by worker_init_fn)."""
+    global _PROCESS_TOPOLOGY
+    if topology is not None:
+        _PROCESS_TOPOLOGY = (int(topology[0]), int(topology[1]))
+
+
 def _shuffle_total_streams(dataset_config) -> int:
     num_workers = max(1, int(getattr(dataset_config, "num_workers", 1)))
     total_streams_override = getattr(dataset_config, "shuffle_total_streams_override", None)
@@ -440,7 +534,7 @@ def _shuffle_total_streams(dataset_config) -> int:
         total_streams_override = os.environ.get("LLAVA_SHUFFLE_TOTAL_STREAMS_OVERRIDE")
     if total_streams_override not in (None, ""):
         return max(1, int(total_streams_override))
-    return jax.process_count() * num_workers
+    return process_count() * num_workers
 
 
 def _scaled_shuffle_size(raw: int, dataset_config) -> int:
@@ -617,22 +711,61 @@ def _gcs_bucket(url):
 
 
 def _assert_same_zone_roots(roots, zone, local_debug=False):
-    """Fail fast before a loader can silently read another region's bucket."""
+    """Fail fast before a loader can silently read another region's storage.
+
+    Two storage systems, one rule: every root must live in storage that is
+    local to `zone`.
+
+      * `gs://kmh-gcp-<zone>/...`  -> the bucket name must be the one this zone
+        owns (`_ALLOWED_ZONE_BUCKETS`).
+      * `/cns/<cell>/...`          -> the CNS cell must sit in a metro whose
+        GCP region IS this zone (`utils/g3_env.py`).
+
+    Fail-closed in both directions: an unknown zone, an unknown CNS cell, or a
+    root in a scheme we do not recognise all raise. "Cannot tell" is not
+    permission to read -- that is the whole point of the guard, and the reason
+    it is a total comparison rather than a blocklist.
+    """
     if local_debug:
         return
     expected = _expected_bucket_for_zone(zone)
-    if expected is None:
+    allowed_cns_cells = g3_env.cns_cells_for_zone(zone)
+    if expected is None and not allowed_cns_cells:
         raise ValueError(f"Unsupported training zone for dataset roots: {zone}")
     for root in _iter_roots(roots):
         if not isinstance(root, str):
             continue
         for expanded in (root.split("::") if "::" in root else [root]):
             bucket = _gcs_bucket(expanded)
-            if bucket is not None and bucket != expected:
-                raise ValueError(
-                    f"Refusing cross-zone dataset read: root={expanded}, "
-                    f"zone={zone}, expected_bucket={expected}"
-                )
+            if bucket is not None:
+                if expected is None:
+                    raise ValueError(
+                        f"Refusing GCS dataset read from zone {zone}, which has "
+                        f"no bucket registered: root={expanded}"
+                    )
+                if bucket != expected:
+                    raise ValueError(
+                        f"Refusing cross-zone dataset read: root={expanded}, "
+                        f"zone={zone}, expected_bucket={expected}"
+                    )
+                continue
+            cns_cell = g3_env.cns_cell_of_path(expanded)
+            if cns_cell is not None:
+                if cns_cell not in allowed_cns_cells:
+                    raise ValueError(
+                        f"Refusing cross-region dataset read: root={expanded} "
+                        f"is on CNS cell {cns_cell!r}, but zone={zone} is "
+                        f"served by {list(allowed_cns_cells) or 'no known CNS cell'}"
+                    )
+                continue
+            # Neither gs:// nor /cns/. A local path is legitimate only in
+            # local_debug, which returned above, so this is an unrecognised
+            # root and we cannot prove it is co-located.
+            raise ValueError(
+                f"Refusing dataset read from an unrecognised storage root: "
+                f"{expanded!r} (expected gs://... or /cns/...). Set "
+                f"config.local_debug=True for local paths."
+            )
 
 
 def _require_stateful_dependency():
@@ -2388,8 +2521,7 @@ def _expand_gcs_glob_if_needed(root):
     if root in _GCS_GLOB_CACHE:
         return list(_GCS_GLOB_CACHE[root])
 
-    fs = fsspec.filesystem("gs")
-    matches = sorted(fs.glob(root))
+    matches = sorted(_glob(root))
     assert len(matches) > 0, f"No GCS files matched dataset glob: {root}"
     urls = [m if str(m).startswith("gs://") else f"gs://{m}" for m in matches]
     _GCS_GLOB_CACHE[root] = tuple(urls)
@@ -2425,8 +2557,8 @@ def _shuffled_worker_urls(root_url, data_seed_offset: int, epoch: int):
     worker = get_worker_info()
     worker_id = 0 if worker is None else int(worker.id)
     num_workers = 1 if worker is None else int(worker.num_workers)
-    rank = jax.process_index()
-    world = jax.process_count()
+    rank = process_index()
+    world = process_count()
     stream_id = rank * num_workers + worker_id
     num_streams = max(1, world * num_workers)
 
@@ -2588,8 +2720,8 @@ class _StatefulBufferedMapIterator(Stateful):
             dataset.config,
             dataset.data_seed_offset,
         )
-        self.rng = random.Random(_worker_seed(dataset.shuffle_seed, jax.process_index(), dataset.data_seed_offset))
-        self.choice_rng = random.Random(_worker_seed(dataset.choice_seed, jax.process_index(), dataset.data_seed_offset))
+        self.rng = random.Random(_worker_seed(dataset.shuffle_seed, process_index(), dataset.data_seed_offset))
+        self.choice_rng = random.Random(_worker_seed(dataset.choice_seed, process_index(), dataset.data_seed_offset))
         self.shuffle_buf = []
 
     def state_dict(self):
@@ -2683,7 +2815,7 @@ class StatefulBufferedWebDataset(IterableDataset, Stateful):
         self.shuffle_size = _scaled_shuffle_size(
             int(getattr(config, "webdataset_shuffle_size", 10000)), config
         )
-        self.shuffle_seed = 115 + jax.process_index() * 514
+        self.shuffle_seed = 115 + process_index() * 514
         self.choice_seed = 1193
 
     def __iter__(self):
@@ -2865,8 +2997,8 @@ class _StatefulGenomeIterator(Stateful):
             dataset.data_seed_offset,
         )
         seed = 2027 if output_dataset_type == "genome_gcap" else 2029
-        self.rng = random.Random(_worker_seed(seed, jax.process_index(), dataset.data_seed_offset))
-        self.choice_rng = random.Random(_worker_seed(seed + 37, jax.process_index(), dataset.data_seed_offset))
+        self.rng = random.Random(_worker_seed(seed, process_index(), dataset.data_seed_offset))
+        self.choice_rng = random.Random(_worker_seed(seed + 37, process_index(), dataset.data_seed_offset))
         self.shuffle_buf = []
 
     def state_dict(self):
@@ -3001,8 +3133,8 @@ class VQAv2IterableDataset(IterableDataset):
             resize_mode=_resize_mode_from_config(config),
         )
         self.max_len = config.max_txt_len
-        self.num_shards = num_shards or jax.process_count()
-        self.shard_rank = jax.process_index()
+        self.num_shards = num_shards or process_count()
+        self.shard_rank = process_index()
         self.dataset_type = dataset_type
         self.data_seed_offset = int(data_seed_offset)
         self.mask_token_category_probs = _build_mask_category_distribution(config, dataset_type)
@@ -3141,7 +3273,7 @@ class GenomeGCapIterableDataset(IterableDataset):
         return self._legacy_iter()
 
     def _legacy_iter(self):
-        rng = random.Random(_worker_seed(2027, jax.process_index(), self.data_seed_offset))
+        rng = random.Random(_worker_seed(2027, process_index(), self.data_seed_offset))
         region_lookup = self.region_lookup  # local ref inside worker
 
         ds = (
@@ -3222,7 +3354,7 @@ class GenomeDetIterableDataset(IterableDataset):
         return self._legacy_iter()
 
     def _legacy_iter(self):
-        rng = random.Random(_worker_seed(2029, jax.process_index(), self.data_seed_offset))
+        rng = random.Random(_worker_seed(2029, process_index(), self.data_seed_offset))
         region_lookup = self.region_lookup
 
         ds = (
@@ -3332,7 +3464,7 @@ def make_dataset(
     )
     mask_token_category_probs = _build_mask_category_distribution(dataset_config, dataset_type)
 
-    rank = jax.process_index()
+    rank = process_index()
 
     ds = (
         wds.WebDataset(
@@ -3377,7 +3509,12 @@ def custom_collate_fn(batch):
     return collated
 
 
-def worker_init_fn(worker_id, rank, data_seed_offset=0):
+def worker_init_fn(worker_id, rank, data_seed_offset=0, topology=None):
+    # FIRST, before anything can ask who this process is: install the topology
+    # the parent captured. Under absl_spawn this worker is a re-exec with a
+    # fresh JAX that would otherwise answer 0-of-1. `topology` is bound into
+    # the partial in create_split, so it travels with the pickled callable.
+    _adopt_process_topology(topology)
     seed = _fold_data_seed(worker_id + rank * 1000, data_seed_offset)
     torch.manual_seed(seed % (2**63 - 1))
     random.seed(seed)
@@ -3399,7 +3536,7 @@ class _StatefulRandomMixIterator(Stateful):
         self.sources = [iter(d) for d in dataset.datasets]
         self.probs = list(dataset.probs)
         self.active = [True] * len(self.sources)
-        self.rng = random.Random(_worker_seed(4073, jax.process_index(), dataset.data_seed_offset))
+        self.rng = random.Random(_worker_seed(4073, process_index(), dataset.data_seed_offset))
         # Cached weighted-choice distribution over currently-active sources,
         # invalidated only when `self.active` changes (source exhaustion in
         # longest mode, or restore). Avoids rebuilding indices/probs/sum per sample.
@@ -3481,7 +3618,11 @@ class StatefulRandomMix(IterableDataset, Stateful):
 
 
 def create_split(config, batch_size, data_seed_offset=0):
-    rank = jax.process_index()
+    # Capture the gang topology here, in the main process, while JAX can still
+    # answer truthfully; every stream and every worker uses this pair from now
+    # on. See _PROCESS_TOPOLOGY above for why a worker must not ask JAX itself.
+    topology = capture_process_topology()
+    rank = process_index()
     data_seed_offset = int(data_seed_offset)
     _assert_same_zone_roots(
         getattr(config.dataset, "root", []),
@@ -3498,7 +3639,7 @@ def create_split(config, batch_size, data_seed_offset=0):
     total_streams = _shuffle_total_streams(config.dataset)
     log_for_0(
         f"Shuffle buffer scaling: total_streams={total_streams} "
-        f"(processes={jax.process_count()} x workers={num_workers}), "
+        f"(processes={process_count()} x workers={num_workers}), "
         f"reference={_SHUFFLE_SIZE_REFERENCE_STREAMS}, "
         f"scale={'1.0 (no scaling)' if total_streams <= _SHUFFLE_SIZE_REFERENCE_STREAMS else f'{_SHUFFLE_SIZE_REFERENCE_STREAMS}/{total_streams}={_SHUFFLE_SIZE_REFERENCE_STREAMS/total_streams:.4f}'}"
     )
@@ -3589,7 +3730,12 @@ def create_split(config, batch_size, data_seed_offset=0):
     dl_kwargs = dict(
         dataset=dataset,
         batch_size=batch_size,
-        worker_init_fn=partial(worker_init_fn, rank=rank, data_seed_offset=data_seed_offset),
+        worker_init_fn=partial(
+            worker_init_fn,
+            rank=rank,
+            data_seed_offset=data_seed_offset,
+            topology=topology,
+        ),
         num_workers=config.dataset.num_workers,
         pin_memory=config.dataset.pin_memory,
         persistent_workers=True if config.dataset.num_workers > 0 else False,
@@ -3744,7 +3890,7 @@ if __name__ == "__main__":
     # print(f"  dataset base: {config.dataset.root}")
     # print(f"  batch_size:   {config.dataset.batch_size} (LDC={LDC}, per_device={config.dataset.batch_size // LDC})")
     # print(f"  num_workers:  {config.dataset.num_workers}")
-    # print(f"  process_index={jax.process_index()} process_count={jax.process_count()}")
+    # print(f"  process_index={process_index()} process_count={process_count()}")
 
     # # build loader
     # loader, tokenizer = create_split(config, batch_size=config.dataset.batch_size)
