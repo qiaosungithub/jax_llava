@@ -142,3 +142,25 @@ py_library(
         "//third_party/py/PIL:pil",
     ],
 )
+
+# Step 2 of the port: pull REAL batches from the REAL CNS shards, locally,
+# before paying for a Borg round trip. Shares main's dep list because it
+# imports main (which installs the webdataset shim) and then jax_llava's own
+# create_split -- what it proves is what training will do, not a lookalike.
+py_binary(
+    name = "g3_dataloader_probe",
+    srcs = ["tools/g3_dataloader_probe.py"],
+    data = glob(
+        [
+            "**/*.py",
+            "**/*.yml",
+            "**/*.yaml",
+            "**/*.json",
+        ],
+        exclude = ["tools/g3_dataloader_probe.py"],
+    ),
+    main = "tools/g3_dataloader_probe.py",
+    strict_deps = False,
+    tags = ["nostrictdeps"],
+    deps = [":main"],
+)

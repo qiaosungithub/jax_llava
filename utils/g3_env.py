@@ -202,6 +202,21 @@ def cns_dir_exists(path):
         return False
 
 
+def cns_file_size(path):
+    """Size of `path` in bytes, or None if it is absent or unreadable.
+
+    Existence is a weaker claim than it looks: a copy that is mid-flight or
+    that hit a quota wall leaves files that exist, are readable, and are the
+    wrong length. Callers that care whether a payload is COMPLETE must ask for
+    the size.
+    """
+    try:
+        from google3.pyglib import gfile
+        return int(gfile.Stat(path).length)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def infer_zone_from_environment():
     """The jax_llava `zone` string implied by where this task is running.
 

@@ -75,16 +75,48 @@ def resolve_clip_source(model_name: str = None) -> str:
         return override
     if not g3_env.in_google3():
         return CLIP_L14_336
+    tried = []
     for root in g3_env.cns_model_roots():
         candidate = f"{root}/clip-vit-large-patch14-336"
-        if g3_env.cns_dir_exists(candidate):
+        problem = _clip_snapshot_problem(candidate)
+        if problem is None:
             return candidate
+        tried.append(f"{candidate}: {problem}")
     raise FileNotFoundError(
-        "No CNS copy of clip-vit-large-patch14-336 found under "
-        f"{list(g3_env.cns_model_roots())}. Set JAX_LLAVA_CLIP_PATH to point "
-        "at one, or copy the snapshot (config.json + model.safetensors + "
-        "preprocessor_config.json is enough)."
+        "No usable CNS copy of clip-vit-large-patch14-336.\n  "
+        + "\n  ".join(tried)
+        + "\nSet JAX_LLAVA_CLIP_PATH to point at one, or copy the snapshot "
+        "(config.json + model.safetensors + preprocessor_config.json is "
+        "enough)."
     )
+
+
+# The published OpenAI snapshot's file sizes. A copy that is still in flight,
+# or that ran out of quota, leaves files that EXIST and are readable and are
+# the wrong length -- and both `gfile.Exists` and `g3lib.os.path.isfile`
+# happily say True for a 0-byte file. That was observed for real during this
+# port: eight files appeared at 0 bytes and vanished two minutes later.
+# transformers would have sailed through every check and died inside the Rust
+# safetensors loader, or worse, loaded something. Size is the cheapest
+# property that distinguishes a finished copy from a doomed one.
+_CLIP_REQUIRED_FILES = {
+    "config.json": 1000,
+    "model.safetensors": 1_700_000_000,
+}
+
+
+def _clip_snapshot_problem(directory):
+    """None if `directory` holds a complete snapshot, else why it does not."""
+    if not g3_env.cns_dir_exists(directory):
+        return "does not exist"
+    for name, min_bytes in _CLIP_REQUIRED_FILES.items():
+        size = g3_env.cns_file_size(f"{directory}/{name}")
+        if size is None:
+            return f"missing {name}"
+        if size < min_bytes:
+            return (f"{name} is {size} B, expected >= {min_bytes} B "
+                    "(incomplete or still in flight)")
+    return None
 
 
 _CLIP_L14_336_CONFIG = dict(

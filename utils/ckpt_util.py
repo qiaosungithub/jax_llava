@@ -183,10 +183,18 @@ def convert_to_gs(path: str, zone=None):
     return out
 
 def exist_general(path):
-    # `os.path.exists` on a /cns/ path silently answers False -- the stdlib has
-    # no idea the filesystem exists. Route every distributed path through the
-    # client that does.
-    if path.startswith(('gs://', '/cns/', '/bigstore/', '/placer/')):
+    # `os.path.exists` on a /cns/ path silently answers FALSE -- the stdlib has
+    # no idea the filesystem exists, and it does not raise, so a checkpoint
+    # that is right there reports as missing. Measured: for a file with
+    # gfile.Exists() True, os.path.exists() is False.
+    #
+    # Prefix-matching the scheme is not enough either: it is one more list to
+    # keep in sync, and getting it wrong fails the same silent way. gfile
+    # handles /cns/, /bigstore/, /placer/ AND ordinary POSIX paths, so in
+    # google3 it can answer every case.
+    if g3_env.in_google3():
+        return FS.exists(path)
+    if path.startswith('gs://'):
         return FS.exists(path)
     return os.path.exists(path)
 
