@@ -106,6 +106,18 @@ def infer_zone_card(config, workdir):
     env_zone = g3_env.infer_zone_from_environment()
     if env_zone:
         return env_zone
+    cell = g3_env.borg_cell()
+    if cell:
+        # On Borg with a cell we do not recognise. Falling through to parse the
+        # workdir would be worse than useless: a Borg workdir is task-local
+        # scratch with no zone in its name, so the parse fails with a message
+        # about workdirs that says nothing about the real problem.
+        raise ValueError(
+            f'Running in Borg cell {cell!r}, which utils/g3_env.py does not map '
+            'to a region. Add it to _CELL_TO_METRO (and give the metro a data '
+            'root) or set JAX_LLAVA_ZONE explicitly. Refusing to guess: the '
+            'zone decides which storage this job reads and writes.'
+        )
     matched_zones = [z for z in ['us-central1', 'us-east1', 'us-east5', 'us-central2', 'asia-northeast1-b', 'europe-west4'] if z in workdir]
     if not matched_zones:
         if not config.local_debug:

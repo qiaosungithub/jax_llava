@@ -52,11 +52,17 @@ _IN_GOOGLE3 = None
 # Only metros we actually have data in are listed. An unlisted cell is an
 # ERROR, not a default: silently guessing a region is exactly how a job ends up
 # streaming 200 GiB across a continent.
+# Verified with `mach_locality -k metro <cell>`, not from memory.
 _CELL_TO_METRO = {
     "go": "cmh",
     "yucmhcg": "cmh",
     "yucmhfq": "cmh",
     "yucmhqa": "cmh",
+    # TPU cells in the same metro. `go` itself has no TPU capacity for our
+    # allocation, so an accelerator job lands in one of these -- still cmh,
+    # still us-east5, still co-located with the data on yucmhcg-d.
+    "yucmhps": "cmh",
+    "yucmhty": "cmh",
 }
 
 # //production/borg/cloud_iam/slicer_regions/slicer_metros.pi
