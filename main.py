@@ -40,6 +40,27 @@ if os.path.isdir(SHARED_CODE_ROOT) and SHARED_CODE_ROOT not in sys.path:
 # is launched from a staged snapshot; `import train` must still work.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Caches that default to $HOME. A Borg task's home is not writable, and the
+# resulting failure happens deep inside a third-party library at model-load
+# time, minutes in. Setting them is free and only touches os.environ -- no
+# filesystem access, so this is safe at module scope (unlike anything reading
+# /cns/, which must wait for InitGoogle()).
+os.environ.setdefault("TMPDIR", "/tmp")
+for _cache_var, _default in (
+    ("HF_HOME", "/tmp/hf"),
+    ("HF_HUB_CACHE", "/tmp/hf/hub"),
+    ("TRANSFORMERS_CACHE", "/tmp/hf/transformers"),
+    ("XDG_CACHE_HOME", "/tmp/cache"),
+    ("MPLCONFIGDIR", "/tmp/mpl"),
+    ("TORCH_HOME", "/tmp/torch"),
+):
+    os.environ.setdefault(_cache_var, _default)
+# No network is reachable from a Borg task, and huggingface_hub's default is to
+# try anyway and then fail with a confusing connection error rather than saying
+# "this file is not local". Offline mode turns that into a clear message.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
 
 def _boot_log(message, *args):
     """Log during startup without touching JAX.
@@ -285,9 +306,20 @@ def main(argv):
   if len(argv) > 1:
     raise app.UsageError('Too many command-line arguments.')
 
-  # Mirror logs FIRST: TPU/topology bring-up is one of the most common places
-  # to die, and a task that dies there leaves no retrievable log otherwise.
+  # A startup marker BEFORE anything else, including before the log mirror.
+  # A task that dies in startup leaves no work-unit detail, no task log (it is
+  # garbage-collected in minutes) and no mirror -- installing the mirror is
+  # itself one of the things that can fail, so its absence cannot distinguish
+  # "died before main()" from "died setting up logging". One tiny file removes
+  # that ambiguity and simultaneously proves the job identity can write the
+  # bucket at all.
   bucket = os.environ.get("CHECKPOINT_BUCKET", "").strip()
+  if bucket:
+      marker = g3_logmirror.write_startup_marker(bucket)
+      _boot_log("[startup-marker] %s", marker or f"FAILED to write under {bucket}")
+
+  # Then mirror logs, still before JAX: TPU/topology bring-up is one of the
+  # most common places to die, and a task that dies there is otherwise silent.
   if bucket:
       mirrored = g3_logmirror.mirror_logs(bucket)
       if mirrored:
@@ -297,8 +329,12 @@ def main(argv):
 
   _log_available_memory()
   _boot_log("webdataset provider: %s", _WDS_SOURCE)
-  _boot_log("Borg cell=%r zone=%r", g3_env.borg_cell(),
-            g3_env.infer_zone_from_environment())
+  # Say where we think we are BEFORE anything depends on it. When zone
+  # inference is wrong the failure surfaces much later, in a message about
+  # workdirs or buckets that names neither the cell nor the reason.
+  _boot_log("placement: cell=%r zone=%r data_roots=%r",
+            g3_env.borg_cell(), g3_env.infer_zone_from_environment(),
+            g3_env.describe_placement())
   _init_distributed()
 
   _apply_env_config_overrides(FLAGS.config)

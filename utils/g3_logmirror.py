@@ -199,6 +199,53 @@ def _next_attempt_slot(logs_dir, rank):
     return highest + 1
 
 
+def write_startup_marker(bucket, rank=None):
+    """Record that `main()` was entered, as the very first thing it does.
+
+    A Borg task that dies during startup leaves NOTHING: the work-unit message
+    says only "terminated in state FAILURE", the task log is garbage-collected
+    within minutes, and the log mirror does not exist yet because installing it
+    is itself one of the things that can fail. Absence of evidence is then the
+    only evidence, and it cannot distinguish "died before main()" from "died
+    while setting up logging" from "never scheduled".
+
+    One small file, written before anything else can fail, splits that
+    ambiguity in half for the cost of a single CNS open. It also proves the
+    job's identity can write the bucket at all -- which is the other thing you
+    cannot otherwise tell from silence.
+
+    Returns the path, or None. Never raises.
+    """
+    if not bucket:
+        return None
+    if rank is None:
+        rank = detect_task_rank()
+    path = f"{bucket.rstrip('/')}/logs/_startup_rank{rank}.txt"
+    try:
+        gfile = _gfile()
+        parent = f"{bucket.rstrip('/')}/logs"
+        if not gfile.Exists(parent):
+            gfile.MakeDirs(parent)
+        fields = {
+            "time": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            "rank": rank,
+            "pid": os.getpid(),
+            "argv": " ".join(sys.argv[:6]),
+        }
+        for key in ("BORG_TASK_HANDLE", "BORG_CELL", "BORG_PHYSICAL_CELL",
+                    "BORG_JOB_SIZE", "XM_XID", "XM_WID", "CHECKPOINT_BUCKET",
+                    "TMPDIR", "HOSTNAME"):
+            value = os.environ.get(key)
+            if value:
+                fields[key] = value
+        body = "".join(f"{k}={v}\n" for k, v in fields.items())
+        with gfile.Open(path, "w") as handle:
+            handle.write(body)
+        return path
+    except Exception:  # noqa: BLE001 - a marker must never block startup
+        return None
+
+
 def mirror_logs(bucket, rank=None):
     """Tee stdout+stderr into `<bucket>/logs/rank_<n>_attempt<k>.log`.
 

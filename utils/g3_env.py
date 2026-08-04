@@ -108,11 +108,27 @@ _CNS_MODEL_ROOTS = {
 
 
 def borg_cell():
-    """The Borg cell this task runs in, or None off Borg."""
+    """The Borg cell this task runs in, or None off Borg.
+
+    `BORG_CELL` / `BORG_PHYSICAL_CELL` are the documented sources
+    (`borg/borgletlib/python/pyborgletinfo.py` reads exactly these), but they
+    are not guaranteed to be exported into every container, and a job that
+    depends on them dies at startup with no log when they are missing. So this
+    also parses the task handle, whose shape is
+    `<task>.<job>.<user>.<cell>.<uid>` -- the cell is in there even when the
+    convenience variable is not.
+    """
     for name in ("BORG_PHYSICAL_CELL", "BORG_CELL"):
         value = (os.environ.get(name) or "").strip()
         if value:
             return value
+    # e.g. "0.qiaos_group_276839294.1.main.qiaos.yucmhps.42"; take the last
+    # field we recognise rather than a fixed index, since the job-name segment
+    # itself contains dots.
+    handle = (os.environ.get("BORG_TASK_HANDLE") or "").strip()
+    for part in reversed(handle.split(".")):
+        if part in _CELL_TO_METRO:
+            return part
     return None
 
 
@@ -192,18 +208,24 @@ def cns_data_roots(cell=None):
             )
         return (root,)
     cell = cell or borg_cell()
-    if not cell:
-        raise ValueError(
-            "No Borg cell in the environment ($BORG_CELL / "
-            "$BORG_PHYSICAL_CELL); cannot choose a co-located data root. "
-            "Set JAX_LLAVA_CNS_CELL or JAX_LLAVA_DATA_ROOT for a local run."
-        )
-    metro = metro_of_cell(cell)
+    metro = metro_of_cell(cell) if cell else None
     if metro is None:
-        raise ValueError(
-            f"Unknown Borg cell {cell!r}: refusing to guess which CNS cell is "
-            f"local to it. Known cells: {sorted(_CELL_TO_METRO)}."
-        )
+        # No legible cell. Fall back to the zone, which can also be derived
+        # from $CHECKPOINT_BUCKET -- see infer_zone_from_environment(). This is
+        # still fail-closed: an unknown zone raises, and whichever root we pick
+        # is re-checked against the zone by the dataset locality guard before a
+        # single byte is read.
+        zone = infer_zone_from_environment()
+        metro = next((m for m, r in _METRO_TO_REGION.items() if r == zone), None)
+        if metro is None:
+            raise ValueError(
+                f"Cannot determine where this task is running (cell={cell!r}, "
+                f"zone={zone!r}, handle="
+                f"{os.environ.get('BORG_TASK_HANDLE', '')!r}), so it is not "
+                "possible to choose a co-located data root. Known cells: "
+                f"{sorted(_CELL_TO_METRO)}. Set JAX_LLAVA_CNS_CELL or "
+                "JAX_LLAVA_DATA_ROOT to be explicit."
+            )
     roots = tuple(_CNS_DATA_ROOTS[c] for c in _METRO_TO_CNS_CELLS.get(metro, ())
                   if c in _CNS_DATA_ROOTS)
     if not roots:
@@ -274,6 +296,27 @@ def cns_file_size(path):
         return None
 
 
+def describe_placement():
+    """A short, never-raising summary of where this process thinks it is.
+
+    Logged at startup. Placement errors otherwise surface much later as a
+    message about workdirs or buckets that names neither the cell nor the
+    reason, which is the hardest kind of failure to read from a Borg job whose
+    logs you cannot fetch.
+    """
+    try:
+        roots = cns_data_roots()
+    except Exception as exc:  # noqa: BLE001
+        roots = f"<unresolved: {exc}>"
+    return {
+        "cell": borg_cell(),
+        "metro": metro_of_cell(borg_cell()),
+        "zone": infer_zone_from_environment(),
+        "data_roots": roots,
+        "handle": os.environ.get("BORG_TASK_HANDLE", ""),
+    }
+
+
 def infer_zone_from_environment():
     """The jax_llava `zone` string implied by where this task is running.
 
@@ -283,4 +326,21 @@ def infer_zone_from_environment():
     override = (os.environ.get("JAX_LLAVA_ZONE") or "").strip()
     if override:
         return override
-    return region_of_cell(borg_cell())
+    zone = region_of_cell(borg_cell())
+    if zone:
+        return zone
+    # Last resort: the durable root the launcher handed us. $CHECKPOINT_BUCKET
+    # is a /cns/<cell>-d/... path chosen at submit time and is present in every
+    # launched job, so it pins the region even when the cell is not legible
+    # from the environment. It is a weaker claim than the cell -- it says where
+    # our STORAGE is, and co-location is then an assumption rather than a
+    # measurement -- but the alternative is dying at startup with a message
+    # about workdirs, which helps nobody. The mismatch is caught anyway: the
+    # dataset locality guard compares the resolved roots against this zone.
+    bucket_cell = cns_cell_of_path(
+        (os.environ.get("CHECKPOINT_BUCKET") or "").strip())
+    if bucket_cell:
+        for metro, cells in _METRO_TO_CNS_CELLS.items():
+            if bucket_cell in cells:
+                return _METRO_TO_REGION.get(metro)
+    return None
