@@ -393,6 +393,35 @@ def topology_values():
     return {"LDC": ldc, "PRC": prc, "GDC": gdc, "PRI": int(jax.process_index())}
 
 
+def _declared_topology_names(module):
+    """The marker tuple a module declares, or () -- via `__dict__`, on purpose.
+
+    `getattr`/`hasattr` are the wrong probes for a scan over `sys.modules`.
+    Some module-like objects answer *every* attribute name from a custom
+    `__getattr__`: `torch.classes` is a `_ClassNamespace` that hands back
+    another namespace for anything you ask, so `hasattr(m, MARKER)` is True
+    for it and the scan then tried to iterate a namespace --
+
+      TypeError: '_ClassNamespace' object is not iterable
+
+    Reading `__dict__` asks the only question that is actually meaningful
+    here -- "did this module really assign that name at module level?" -- and
+    is immune to descriptor and PEP 562 magic. The type check then keeps a
+    coincidental same-named attribute from turning into a silent no-op.
+    """
+    namespace = getattr(module, "__dict__", None)
+    if not isinstance(namespace, dict):
+        return ()
+    names = namespace.get(DEFERRED_TOPOLOGY_MARKER)
+    if not isinstance(names, (tuple, list)):
+        return ()
+    if not all(isinstance(name, str) for name in names):
+        raise ValueError(
+            f"Module {namespace.get('__name__', module)!r} declares a "
+            f"{DEFERRED_TOPOLOGY_MARKER} that is not a tuple of str: {names!r}")
+    return tuple(names)
+
+
 def bind_topology_constants(modules=None):
     """Bind the deferred topology constants into every opted-in module.
 
@@ -410,11 +439,11 @@ def bind_topology_constants(modules=None):
     if modules is None:
         modules = [
             module for module in list(_sys.modules.values())
-            if module is not None and hasattr(module, DEFERRED_TOPOLOGY_MARKER)
+            if _declared_topology_names(module)
         ]
     bound = []
     for module in modules:
-        names = getattr(module, DEFERRED_TOPOLOGY_MARKER, ())
+        names = _declared_topology_names(module)
         unknown = [name for name in names if name not in values]
         if unknown:
             raise ValueError(
