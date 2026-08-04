@@ -29,6 +29,7 @@ the rest of the codebase stays environment-agnostic:
 
 import os
 import sys
+import time
 
 # The shared NFS checkout the GCP path imports `big_vision` and `gemma` from.
 # Absent under Bazel, where those come from BUILD deps instead.
@@ -131,18 +132,117 @@ def _install_webdataset_shim():
 
 _WDS_SOURCE = _install_webdataset_shim()
 
-import jax  # noqa: E402
+# ---------------------------------------------------------------------------
+# Import-time crash reporting.
+#
+# On a restricted-LOAS workstation there is NO way to read a Borg task's log:
+# `borg tasklog` SIGABRTs on a PERMISSION_DENIED to logmanagerd, `analog
+# --remote` is refused by the RDL engine, and the Coroner CLI is not even
+# readable. A task that dies during the imports below therefore leaves
+# literally nothing behind: the work-unit status message is the empty string,
+# and the job is garbage-collected from the borgmaster within minutes.
+#
+# XIDs 276839294 and 276859816 both died exactly that way -- FAILURE, empty
+# message, no startup marker, peak RSS ~400 MiB, dead <40 s after RUN. The
+# imports below are 3.5 GB of binary and take ~5 min cold, so "dead in 40 s"
+# means they died HERE, in the one window that had no reporting.
+#
+# The mirror cannot be installed before InitGoogle() (it writes to CNS), so
+# the next best thing is to catch the exception, and write it to the one place
+# that survives: $CHECKPOINT_BUCKET. That turns the invisible class of failure
+# into a file with a traceback in it.
+# ---------------------------------------------------------------------------
 
-from absl import app, flags  # noqa: E402
-from ml_collections import config_flags  # noqa: E402
 
-import train  # noqa: E402
-from utils import g3_env  # noqa: E402
-from utils import g3_logmirror  # noqa: E402
-from utils import logging_util  # noqa: E402
-from utils.logging_util import log_for_0  # noqa: E402
+def _report_import_crash(exc):
+    """Persist an import-time traceback to CNS, best effort, never raising.
 
-logging_util.supress_checkpt_info()
+    Runs with InitGoogle() NOT yet called, so this cannot use the normal file
+    API -- touching /cns/ that early CHECK-fails. It re-execs a tiny helper
+    instead: `fileutil` is a separate process with its own InitGoogle().
+    """
+    import traceback
+
+    text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    banner = (
+        "=== IMPORT-TIME CRASH (before main(), before InitGoogle) ===\n"
+        f"argv={sys.argv!r}\n"
+    )
+    for key in ("BORG_TASK_HANDLE", "BORG_CELL", "XM_XID", "XM_WID",
+                "CHECKPOINT_BUCKET", "PYTHONPATH", "TMPDIR"):
+        value = os.environ.get(key)
+        if value:
+            banner += f"{key}={value}\n"
+    body = banner + text
+    # Always to stderr: on a machine where logs ARE readable this is enough.
+    _boot_log("%s", body)
+
+    bucket = os.environ.get("CHECKPOINT_BUCKET", "").strip()
+    if not bucket:
+        return
+    rank = (os.environ.get("BORG_TASK_HANDLE", "").split(".", 1)[0] or "x")
+    remote = f"{bucket.rstrip('/')}/logs/_import_crash_rank{rank}.txt"
+    try:
+        import subprocess
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False,
+                                         dir=os.environ.get("TMPDIR", "/tmp")) as tmp:
+            tmp.write(body)
+            local = tmp.name
+        subprocess.run(["fileutil", "mkdir", "-p", f"{bucket.rstrip('/')}/logs"],
+                       capture_output=True, timeout=120, check=False)
+        done = subprocess.run(["fileutil", "cp", "-f", local, remote],
+                              capture_output=True, timeout=180, check=False)
+        _boot_log("[import-crash] wrote %s (rc=%d)", remote, done.returncode)
+    except Exception as nested:  # noqa: BLE001 - reporting must never mask
+        _boot_log("[import-crash] could NOT persist to %s: %r", remote, nested)
+
+
+try:
+    import jax  # noqa: E402
+    from absl import app, flags  # noqa: E402
+    from ml_collections import config_flags  # noqa: E402
+
+    # NOTE: `train` is deliberately NOT imported here -- see _import_train().
+    from utils import g3_env  # noqa: E402
+    from utils import g3_logmirror  # noqa: E402
+    from utils import logging_util  # noqa: E402
+    from utils.logging_util import log_for_0  # noqa: E402
+
+    logging_util.supress_checkpt_info()
+except BaseException as _import_exc:  # noqa: BLE001 - includes SystemExit
+    _report_import_crash(_import_exc)
+    raise
+
+train = None  # bound by _import_train(), called from main()
+
+
+def _import_train():
+    """Import `train` from inside main(), not at module scope.
+
+    `import train` pulls in the whole world -- torch, torchvision,
+    transformers, gemma, PIL, the eval suite -- and takes about five minutes
+    cold on a 3.5 GB Blaze binary. Doing that at module scope puts the single
+    longest and most failure-prone phase of startup in the ONE window where
+    this job has no way to report anything: before `main()`, hence before the
+    CNS log mirror exists, on a workstation where every Borg log-reading path
+    is closed by restricted LOAS.
+
+    Deferring it by one function call moves those five minutes AFTER
+    `mirror_logs()`, so an ImportError, a missing dep or a CHECK-fail inside a
+    third-party module lands in `<bucket>/logs/rank_N_attemptK.log` with a
+    full traceback instead of vanishing into an empty status message.
+
+    Nothing depends on `train` being present at import time: it defines no
+    flags (verified: no `flags.DEFINE` anywhere under train.py, input_pipeline
+    .py, utils/, models/ or evals/), so flag registration below is unaffected.
+    """
+    global train
+    if train is None:
+        import train as _train  # noqa: PLC0415 - intentionally deferred
+        train = _train
+    return train
 
 import warnings  # noqa: E402
 
@@ -327,6 +427,15 @@ def main(argv):
       else:
           _boot_log("[log-mirror] could not open a mirror under %s", bucket)
 
+  # NOW pull in torch/transformers/gemma/the eval suite (~5 min cold). This
+  # is the longest and most fragile stretch of startup, and it runs here --
+  # after the mirror above -- precisely so that a failure inside it produces a
+  # traceback in the mirror rather than a silent task death. See
+  # _import_train() for why it is not a module-scope import.
+  _boot_log("[import] importing train (torch/transformers/gemma) ...")
+  _t_import = time.time()
+  _import_train()
+  _boot_log("[import] train imported in %.1f s", time.time() - _t_import)
   _log_available_memory()
   _boot_log("webdataset provider: %s", _WDS_SOURCE)
   # Say where we think we are BEFORE anything depends on it. When zone
