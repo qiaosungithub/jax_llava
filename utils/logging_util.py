@@ -590,12 +590,26 @@ class _RemoteLogWriter:
         """True once a native append has succeeded, False if degraded to RMW."""
         return self._append_ok
 
-    def write(self, text: str) -> None:
+    def write(self, text: str, *, allow_inline_flush: bool = True) -> None:
+        """Buffer `text`, flushing inline if it is urgent, due, or oversized.
+
+        `allow_inline_flush=False` buffers and returns without ever touching
+        CNS. Required for any caller that can run on a thread it does not own
+        -- see `_MirrorLogHandler.emit`, where an inline flush would issue a
+        blocking CNS op from inside CNS's own fiber-coloured callback and
+        CHECK-fail the process. The background flusher still ships the bytes.
+        """
         if self._broken or not text:
             return
         with self._lock:
             self._buf.append(text)
             self._buf_chars += len(text)
+            if not allow_inline_flush:
+                # Bound the buffer even so: a mirror must not become an OOM.
+                if self._buf_chars >= _MIRROR_MAX_BUFFER_CHARS:
+                    del self._buf[: len(self._buf) // 2]
+                    self._buf_chars = sum(len(chunk) for chunk in self._buf)
+                return
             urgent = any(token in text for token in _URGENT_TOKENS)
             due = (time.time() - self._last_flush) >= self._flush_seconds
             if urgent or due or self._buf_chars >= _MIRROR_MAX_BUFFER_CHARS:
@@ -805,15 +819,30 @@ class _MirrorLogHandler(_logging.Handler):
         try:
             if not self._should_emit():
                 return
-            self._writer.write(self.format(record) + "\n")
+            # NEVER flush inline from here. A logging handler runs on whatever
+            # thread called `logging.info`, and in this binary that includes
+            # threads owned by the CNS client itself -- `gdm_access_logger.py`
+            # logs from inside the Orbax/tfhub read path. Issuing a blocking
+            # CNS write from such a thread re-enters CNS on a fiber-coloured
+            # stack and trips
+            #     selectables.cc:131] Must not select on fiber cancellation
+            #     from functions of other colors
+            # which is a CHECK, i.e. SIGABRT and an 8.9 GB core, from a
+            # LOGGING call. Buffer only; the background flusher owns a plain
+            # Python thread with no colour and ships the bytes within
+            # _MIRROR_FLUSH_SECONDS.
+            self._writer.write(self.format(record) + "\n",
+                               allow_inline_flush=False)
         except Exception:  # noqa: BLE001
             pass
 
     def flush(self) -> None:
-        try:
-            self._writer.flush()
-        except Exception:  # noqa: BLE001
-            pass
+        # Deliberately a NO-OP. `logging.shutdown()` and `logging.Handler`
+        # call this from arbitrary threads, and the whole point of `emit`
+        # buffering is that this class never issues a CNS op itself. The
+        # background flusher and main.py's explicit `flush_logs()` (main
+        # thread, uncoloured) are what actually write.
+        return
 
 
 def _install_record_handler(writer: "_RemoteLogWriter") -> None:
