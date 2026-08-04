@@ -468,7 +468,30 @@ def shard_cpu_tree_to_mesh(cpu_tree, mesh, partition_specs):
 
     def to_global_array(leaf, sharding):
         if isinstance(leaf, jax.Array) and leaf.is_fully_addressable is False:
-            return leaf
+            # Already a global array. It may nevertheless live on a DIFFERENT
+            # mesh than ours, and then it cannot be passed to our jit.
+            #
+            # `gm.ckpts.load_params` returns exactly that on multi-host: the
+            # Gemma loader builds its own mesh, named `devices`, so the
+            # embedding table arrives as
+            #   NamedSharding(mesh=Mesh('devices': 64), spec=P())
+            # while `p_train_step` was compiled for
+            #   NamedSharding(mesh=Mesh('AXIS_0': 64), spec=P(None,'AXIS_0'))
+            # and jit rejects the argument:
+            #   "Sharding passed to jit does not match the sharding on the
+            #    respective arg ... for arg type: float32[262144,1152]"
+            # -- the 262144x1152 Gemma vocab embedding. Seen on XID 277039172
+            # at the first training step, after the model was fully built.
+            #
+            # Returning it unchanged was right for the single-host case this
+            # was written for (where our mesh is the only mesh) and silently
+            # wrong as soon as a second mesh exists. Reshard onto OUR mesh
+            # instead; `jax.device_put` with a NamedSharding is a
+            # cross-mesh-safe relayout, and it is a no-op when the sharding
+            # already matches.
+            if leaf.sharding == sharding:
+                return leaf
+            return jax.device_put(leaf, sharding)
         return jax.make_array_from_callback(
             np.shape(leaf),
             sharding,
