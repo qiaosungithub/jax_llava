@@ -504,8 +504,39 @@ def _assert_accelerator_backend():
 
 
 def main(argv):
+  # DO NOT reinstate `if len(argv) > 1: raise app.UsageError(...)`.
+  #
+  # That upstream check is what killed every Borg run of this binary. The
+  # launcher passes `--tier=PROD` to the job (tpu_cmd/xm_launcher.py:302 reads
+  # it to pick xm.ServiceTier and forwards the argv through), and this binary
+  # does not declare a `tier` flag. `flags_parser=lambda a: flags.FLAGS(a,
+  # known_only=True)` -- which exists because XManager also injects
+  # jax_controller_address/jax_num_tasks/jax_task_id/jax_port -- does not drop
+  # an unknown flag, it RETURNS it as a positional argument. So argv arrives
+  # as [prog, "--tier=PROD"], len(argv) == 2, and main() raises UsageError on
+  # its first line: absl prints the module docstring as usage and exits.
+  #
+  # From outside that is invisible in the worst way. It happens inside
+  # app.run(), before InitGoogle, before the CNS mirror, before the startup
+  # marker -- FAILURE, empty status message, ~400 MiB peak, no bucket
+  # directory. Five XIDs died this way (276859816, 277010873, 277019460,
+  # 277024519, 277028776) across three cells, two TPU generations and two
+  # allocations. EqR-jax runs the same launcher on the same cells and is
+  # unaffected for one reason only: its main() has no such check.
+  #
+  # Localised by bracketing app.run() with two subprocess markers -- all eight
+  # tasks of XID 277028776 wrote _before_app_run_rank{0..7}.txt and none wrote
+  # _entered_main -- and then reproduced locally by replaying the exact argv
+  # those markers recorded, one flag at a time. --tier=PROD alone reproduces
+  # it; the jax_* and deepsea_* flags do not.
+  #
+  # Unrecognised argv is therefore EXPECTED here, not an error. Log it instead,
+  # so a genuine typo is still visible.
   if len(argv) > 1:
-    raise app.UsageError('Too many command-line arguments.')
+    _boot_log("[flags] ignoring %d unrecognised argument(s): %r. Expected on "
+              "Borg: the launcher forwards --tier and XManager injects "
+              "coordination flags this binary does not declare.",
+              len(argv) - 1, argv[1:])
 
   # Second subprocess marker: `main()` was ENTERED. Together with the
   # pre-run marker this brackets `app.run()` itself -- the InitGoogle,
