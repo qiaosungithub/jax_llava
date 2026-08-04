@@ -125,6 +125,17 @@ def log_metrics(metrics, step):
     if writer is None:
         return
     scalars = _flatten_scalars(dict(metrics))
+    # `step` is passed to write_scalars POSITIONALLY, and CLU's Datatables
+    # writer then builds its row as `dict(step=step, timestamp=..., **scalars)`
+    # (clu/metric_writers/google/datatable_writer.py:149). A `step` key inside
+    # `scalars` therefore collides with the keyword and every write dies with
+    #     TypeError: dict() got multiple values for keyword argument 'step'
+    # in CLU's async producer thread -- which is caught and logged there, so
+    # training continues and NO metrics are stored, silently. Seen once per
+    # write on XID 277043477; the run was fine, the Datatable was empty.
+    # Reserved column names are the writer's to set, so drop ours.
+    for reserved in ("step", "timestamp"):
+        scalars.pop(reserved, None)
     if not scalars:
         return
     try:
