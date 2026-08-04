@@ -341,6 +341,14 @@ def main(argv):
   log_for_0('JAX process: %d / %d', jax.process_index(), jax.process_count())
   log_for_0('JAX local devices: %r', jax.local_devices())
   _assert_accelerator_backend()
+
+  # `train` and the kNN eval declare LDC/PRC/PRI/GDC but leave them UNBOUND at
+  # import, because computing them calls JAX and importing happens before
+  # InitGoogle(). Bind them now -- after the backend is up, so the counts are
+  # the real TPU counts and not a CPU stand-in, and before the first use.
+  _topology = g3_env.bind_topology_constants()
+  log_for_0('topology constants bound: %r', _topology)
+
   log_for_0('FLAGS.config: \n{}'.format(FLAGS.config))
 
   try:

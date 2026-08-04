@@ -81,29 +81,18 @@ from utils.pjit_util import MeshMode, prepare_pjit_funcs
 # main() and before any logging exists -- on Borg that surfaces only as an
 # empty status message and no log at all.
 #
-# PEP 562 module `__getattr__` keeps every existing `LDC` / `PRI` / `PRC` /
-# `GDC` reference in this file working untouched, while deferring the actual
-# JAX call to the first one that runs -- by which time we are inside main().
-# The values are cached after the first resolution, so this stays a
-# module-level constant in every way that matters.
-_TOPOLOGY_CACHE = {}
-
-
-def _topology(name):
-    if name not in _TOPOLOGY_CACHE:
-        ldc = int(jax.local_device_count())
-        prc = int(jax.process_count())
-        gdc = int(jax.device_count())
-        assert gdc == ldc * prc, f"{gdc} != {ldc} * {prc}"
-        _TOPOLOGY_CACHE.update(
-            LDC=ldc, PRC=prc, PRI=int(jax.process_index()), GDC=gdc)
-    return _TOPOLOGY_CACHE[name]
-
-
-def __getattr__(name):
-    if name in ("LDC", "PRC", "PRI", "GDC"):
-        return _topology(name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+# So the names are left genuinely UNBOUND at import and are bound once, from
+# inside main(), by `g3_env.bind_topology_constants()`, which finds this
+# module through the marker below. Every existing bare-name use in this file
+# then works unchanged.
+#
+# A PEP 562 module `__getattr__` was tried here first and is the wrong tool:
+# it is consulted only for attribute access on the module object, while a
+# bare name inside a function compiles to LOAD_GLOBAL and never consults it.
+# The result was `NameError: name 'GDC' is not defined` at the first training
+# step -- late enough to look like an unrelated bug. See the long note in
+# `utils/g3_env.py`.
+_DEFERRED_TOPOLOGY_NAMES = ("LDC", "PRC", "PRI", "GDC")
 
 
 

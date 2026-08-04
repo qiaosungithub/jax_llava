@@ -344,3 +344,86 @@ def infer_zone_from_environment():
             if bucket_cell in cells:
                 return _METRO_TO_REGION.get(metro)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Deferred topology constants
+# ---------------------------------------------------------------------------
+#
+# `train.py` and `evals/eval_imagenet_knn.py` each define four module-level
+# constants -- LDC / PRC / PRI / GDC -- by calling `jax.local_device_count()`
+# and friends at import time. Under google3 that is fatal: JAX refuses to
+# answer before `absl.app.run()` has run InitGoogle(), so the binary dies
+# during `import`, before main() and before any logging exists. On Borg that
+# surfaces as an empty status message and no log at all.
+#
+# The obvious repair -- a PEP 562 module `__getattr__` -- DOES NOT WORK here,
+# and the way it fails is worth recording. `__getattr__` is consulted only for
+# *attribute* access on the module object (`train.GDC`). A bare name inside a
+# function in that same module compiles to LOAD_GLOBAL, which looks in the
+# module dict and then in builtins and then raises NameError -- it never
+# consults `__getattr__`. So `train.GDC` from outside resolved fine while the
+# 50 in-module uses all raised
+#
+#   NameError: name 'GDC' is not defined
+#
+# ...at the first real training step, i.e. deep enough to look like a
+# different bug. The lesson: PEP 562 defers a module's EXPORTS, not its
+# INTERNALS.
+#
+# What does work is to leave the names genuinely absent during import and
+# BIND them, once, from inside main(), when JAX is legal. Modules opt in with
+# a `_DEFERRED_TOPOLOGY_NAMES` marker so this stays a declaration by the
+# module rather than a list maintained at a distance.
+
+DEFERRED_TOPOLOGY_MARKER = "_DEFERRED_TOPOLOGY_NAMES"
+
+
+def topology_values():
+    """{LDC, PRC, PRI, GDC} from JAX. Only legal after InitGoogle()."""
+    import jax  # local: importing jax is fine, CALLING it early is not.
+
+    ldc = int(jax.local_device_count())
+    prc = int(jax.process_count())
+    gdc = int(jax.device_count())
+    if gdc != ldc * prc:
+        raise ValueError(
+            f"Inconsistent JAX topology: device_count={gdc} != "
+            f"local_device_count={ldc} * process_count={prc}")
+    return {"LDC": ldc, "PRC": prc, "GDC": gdc, "PRI": int(jax.process_index())}
+
+
+def bind_topology_constants(modules=None):
+    """Bind the deferred topology constants into every opted-in module.
+
+    Call once from `main()`, after `handle_main` has run InitGoogle() and
+    after any distributed initialisation, but BEFORE the first use. Returns
+    the values it bound, for logging.
+
+    Idempotent, and deliberately NOT silent about a module that asks for a
+    name this does not know -- a typo in the marker would otherwise reproduce
+    exactly the NameError this exists to prevent.
+    """
+    import sys as _sys
+
+    values = topology_values()
+    if modules is None:
+        modules = [
+            module for module in list(_sys.modules.values())
+            if module is not None and hasattr(module, DEFERRED_TOPOLOGY_MARKER)
+        ]
+    bound = []
+    for module in modules:
+        names = getattr(module, DEFERRED_TOPOLOGY_MARKER, ())
+        unknown = [name for name in names if name not in values]
+        if unknown:
+            raise ValueError(
+                f"Module {getattr(module, '__name__', module)!r} declares "
+                f"unknown deferred topology names {unknown}; "
+                f"known names are {sorted(values)}")
+        for name in names:
+            setattr(module, name, values[name])
+        if names:
+            bound.append(getattr(module, "__name__", str(module)))
+    values["_bound_in"] = bound
+    return values
