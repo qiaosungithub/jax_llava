@@ -6,6 +6,7 @@ from utils.logging_util import log_for_0, print0, Emoji
 import os
 import re
 import contextlib
+import json
 import orbax.checkpoint as ocp
 
 
@@ -43,6 +44,22 @@ class _GfileFS:
     def exists(self, path):
         return bool(self._gfile().Exists(path))
 
+    def listdir(self, path):
+        """Entry basenames under `path`; () when it does not exist or cannot be read.
+
+        Never raises. An auto-resume probe runs before any training has
+        happened, so a failure here must degrade to "cold start", never to a
+        dead job -- see engineering.md, "do not let a diagnostic kill the thing
+        it watches".
+        """
+        try:
+            gfile = self._gfile()
+            if not gfile.Exists(path):
+                return ()
+            return tuple(gfile.ListDir(path))
+        except Exception:  # noqa: BLE001 - a probe must never block startup
+            return ()
+
     def copy(self, src, dst, recursive=False):
         gfile = self._gfile()
         src, dst = str(src).rstrip('/'), str(dst).rstrip('/')
@@ -58,6 +75,37 @@ class _GfileFS:
             gfile.Snapshot(src, dst)
         else:
             gfile.RecursivelyCopyDir(src, dst, overwrite=True)
+
+
+def _open_text(path):
+    """Read-mode file object for a small text file, on CNS or on a local disk.
+
+    `open()` cannot see `/cns/`, and in google3 `gfile.Open` reaches both, so
+    this is only a two-way switch rather than a scheme table.
+    """
+    if g3_env.in_google3():
+        from google3.pyglib import gfile
+        return gfile.Open(path, 'r')
+    if str(path).startswith('gs://'):
+        return FS.open(path, 'r')
+    return open(path, 'r')
+
+
+def _listdir(path):
+    """Entry basenames under `path`; () if absent or unreadable. Never raises.
+
+    `_GfileFS` answers for google3; gcsfs spells the same thing `ls()` and
+    returns full paths, so the basenames are taken here. An auto-resume probe
+    runs before any training has happened, so a failure must degrade to "cold
+    start", never to a dead job.
+    """
+    try:
+        if hasattr(FS, 'listdir'):
+            return FS.listdir(path)
+        return tuple(str(entry).rstrip('/').rsplit('/', 1)[-1]
+                     for entry in FS.ls(path))
+    except Exception:  # noqa: BLE001 - a probe must never block startup
+        return ()
 
 
 def _make_fs():
@@ -227,6 +275,134 @@ def convert_to_pretrained_gs(path: str, zone=None):
         f'cannot convert checkpoint path to pretrained-ckpts path: {gs_path}'
     )
     return gs_path.replace(_NORMAL_CKPT_PREFIX, _PRETRAINED_CKPT_PREFIX, 1)
+
+# ---------------------------------------------------------------------------
+# Auto-resume: rediscovering this run's own progress at startup.
+# ---------------------------------------------------------------------------
+# A Borg task restart replays the SAME argv and environment on a fresh machine.
+# There is no process state and `workdir` (task-local /tmp) starts empty, so
+# anything the previous attempt learned survives only if it was persisted --
+# and only if this process goes looking for it. That lookup is what
+# `latest_complete_checkpoint()` does.
+#
+# $CHECKPOINT_BUCKET is derived from the XManager experiment id, so every
+# restart of a given XID -- and every work unit appended by `--resume_xid` --
+# resolves to the same prefix. That stability is precisely what makes
+# in-process rediscovery well defined.
+#
+# Enumerating the prefix beats parsing logs: a rotated or lost log would
+# otherwise silently restart from step 0 and throw away real progress.
+
+# The file orbax writes LAST. `finalize()` updates _CHECKPOINT_METADATA with
+# `commit_timestamp_nsecs` and only THEN renames the tmp directory into place
+# (third_party/py/orbax/checkpoint/_src/path/atomicity.py::finalize, and the
+# CNS2 variant in google/path/cns2_atomicity.py -- both docstrings read
+# "Updates checkpoint metadata with commit_timestamp_nsecs"). A step directory
+# whose metadata lacks that key was still being written when the task died.
+#
+# This is jax_llava's equivalent of EqR-jax's `extra.json` rule. It is NOT the
+# same filename, because the two projects use different checkpoint writers;
+# copying the name across would have rejected every checkpoint instead.
+_CHECKPOINT_COMMIT_KEY = 'commit_timestamp_nsecs'
+_CHECKPOINT_METADATA_FILE = '_CHECKPOINT_METADATA'
+
+
+def _checkpoint_is_complete(step_dir):
+    """(True, '') when orbax finished writing `step_dir`, else (False, reason).
+
+    Two witnesses, both required:
+
+    1. `_CHECKPOINT_METADATA` parses as JSON and carries a non-null
+       `commit_timestamp_nsecs` -- orbax's own atomic-commit marker.
+    2. If this checkpoint has a `dataloader_state/` directory at all, it is
+       non-empty. `train.py::_save_training_checkpoint` publishes that
+       directory by rename AFTER orbax returns, so witness (1) alone is
+       satisfied during the window in between -- and a resume there would then
+       hard-fail inside `restore_dataloader_state` under
+       `stateful_dataloader_strict`. Absent entirely is fine: a checkpoint from
+       a non-stateful run is still resumable.
+
+    Never raises: an unreadable candidate counts as incomplete.
+    """
+    step_dir = str(step_dir).rstrip('/')
+    meta_path = f'{step_dir}/{_CHECKPOINT_METADATA_FILE}'
+    try:
+        if not FS.exists(meta_path):
+            return False, f'no {_CHECKPOINT_METADATA_FILE}'
+        with _open_text(meta_path) as handle:
+            meta = json.loads(handle.read())
+    except Exception as exc:  # noqa: BLE001 - unreadable == incomplete
+        return False, f'{_CHECKPOINT_METADATA_FILE} unreadable ({exc!r})'
+    if not isinstance(meta, dict) or meta.get(_CHECKPOINT_COMMIT_KEY) is None:
+        return False, f'{_CHECKPOINT_METADATA_FILE} has no {_CHECKPOINT_COMMIT_KEY}'
+
+    state_dir = f'{step_dir}/dataloader_state'
+    if FS.exists(state_dir) and not _listdir(state_dir):
+        return False, 'dataloader_state/ present but empty'
+    return True, ''
+
+
+def latest_complete_checkpoint(checkpoint_root):
+    """Highest-step COMPLETE `checkpoint_N` under `checkpoint_root`, or None.
+
+    Torn writes are skipped, loudly. Returns None -- never raises -- when the
+    prefix is absent or holds nothing complete: that is a cold start, a
+    legitimate outcome that must not kill the job.
+    """
+    if not checkpoint_root:
+        return None
+    checkpoint_root = str(checkpoint_root).rstrip('/')
+    best_step, best_dir = -1, None
+    for name in _listdir(checkpoint_root):
+        match = _CHECKPOINT_RE.match(str(name))
+        if not match:
+            continue
+        step = int(match.group(1))
+        if step <= best_step:
+            continue
+        candidate = f'{checkpoint_root}/{name}'
+        complete, why = _checkpoint_is_complete(candidate)
+        if not complete:
+            log_for_0('Auto-resume: ignoring incomplete checkpoint %s (%s)',
+                      candidate, why)
+            continue
+        best_step, best_dir = step, candidate
+    return best_dir
+
+
+def resolve_borg_autoresume(config):
+    """The checkpoint this attempt should continue from, or None to start cold.
+
+    Pure: reads the environment and the filesystem, mutates nothing. The caller
+    (main.py) applies the answer to the config, so the decision and its effect
+    are separately testable.
+
+    An explicit `load_from` ALWAYS wins and disables the probe. That is the
+    user asking for a specific checkpoint -- an eval target, or a warm start
+    from someone else's run -- and a restart must not silently redirect it.
+    The launcher relies on this: `~/work/tpu_cmd/xm_launcher.py` deliberately
+    does NOT set $LOAD_FROM for `--resume_xid`, because doing so would both
+    supply a path it cannot know and disable the mechanism below.
+    """
+    bucket = checkpoint_bucket()
+    if not bucket:
+        return None, 'no $CHECKPOINT_BUCKET'
+
+    existing = str(config.get('load_from', '') or '').strip()
+    if existing:
+        return None, f'load_from already set to {existing!r} (explicit request wins)'
+    if config.get('eval_only', False):
+        return None, 'eval_only run has no progress of its own to resume'
+
+    checkpoint_root = f'{bucket}/{CNS_CKPT_SUBDIR}'
+    try:
+        resume_from = latest_complete_checkpoint(checkpoint_root)
+    except Exception as exc:  # noqa: BLE001 - never block a cold start
+        return None, f'probe of {checkpoint_root} failed ({exc!r})'
+    if not resume_from:
+        return None, f'no complete checkpoint under {checkpoint_root}'
+    return resume_from, ''
+
 
 def _latest_checkpoint_or_none(path):
     path = path.rstrip('/')

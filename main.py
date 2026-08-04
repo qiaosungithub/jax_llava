@@ -418,6 +418,42 @@ def _apply_env_config_overrides(config):
         log_for_0("Applied config.%s from environment %s=%r", key, env_name, shown_value)
 
 
+def _apply_borg_autoresume(config):
+    """Continue this experiment from its own newest complete checkpoint.
+
+    A Borg task restart -- and a work unit appended by `--resume_xid` -- replays
+    the SAME argv and environment. Nothing carries over except what was written
+    to $CHECKPOINT_BUCKET, which is derived from the XManager experiment id and
+    is therefore identical across every attempt of a given XID. So the job has
+    to rediscover its own progress here, in-process, at startup.
+
+    Without this, `--resume_xid` lands on the right prefix and then trains from
+    step 0 on top of it: the checkpoints are found by nobody, the run silently
+    repeats itself, and every attempt still exits 0. `jobs.md` is explicit that
+    a resume is verified by STEP PROGRESS, never by exit status, and this is
+    the function that has to make that progress happen.
+
+    The decision itself lives in `ckpt_util.resolve_borg_autoresume`, which
+    reads but never writes; this applies it and says out loud what it did.
+    """
+    from utils import ckpt_util
+
+    try:
+        resume_from, why_not = ckpt_util.resolve_borg_autoresume(config)
+    except Exception as exc:  # noqa: BLE001 - never block a cold start
+        log_for_0('Auto-resume probe raised (%r); starting fresh', exc)
+        return None
+
+    if not resume_from:
+        log_for_0('Auto-resume: starting fresh (%s)', why_not)
+        return None
+
+    with config.unlocked():
+        config.load_from = resume_from
+    log_for_0('Auto-resume: continuing from %s', resume_from)
+    return resume_from
+
+
 def get_available_bytes():
     with open("/proc/meminfo") as f:
         for line in f:
@@ -597,6 +633,7 @@ def main(argv):
   _init_distributed()
 
   _apply_env_config_overrides(FLAGS.config)
+  _apply_borg_autoresume(FLAGS.config)
   log_for_0('JAX process: %d / %d', jax.process_index(), jax.process_count())
   log_for_0('JAX local devices: %r', jax.local_devices())
   # Persist the backend/device list to CNS BEFORE asserting on it, so the
