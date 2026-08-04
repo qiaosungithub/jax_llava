@@ -173,3 +173,25 @@ py_binary(
     tags = ["nostrictdeps"],
     deps = [":main"],
 )
+
+# Dry-runs everything that happens BEFORE the first training step: config
+# merge, curriculum stage expansion, dataset-root resolution, the locality
+# guard, and where the weights and checkpoints would come from and go to.
+# Seconds, versus finding a bad config after packaging and scheduling.
+py_binary(
+    name = "g3_config_probe",
+    srcs = ["tools/g3_config_probe.py"],
+    data = glob(
+        [
+            "**/*.py",
+            "**/*.yml",
+            "**/*.yaml",
+            "**/*.json",
+        ],
+        exclude = ["tools/g3_config_probe.py"],
+    ),
+    main = "tools/g3_config_probe.py",
+    strict_deps = False,
+    tags = ["nostrictdeps"],
+    deps = [":main"],
+)
