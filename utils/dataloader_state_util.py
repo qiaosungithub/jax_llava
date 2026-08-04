@@ -84,9 +84,14 @@ STATE_VERSION = 1
 # -- and they do not, which is the correct answer: the shard COUNT differs
 # (1097 on GCS, 150 on CNS), so that state is genuinely incompatible and the
 # strict check should reject it rather than silently replay a different corpus.
+# `go-d` and `yucmhcg-d` are both metro cmh and hold byte-identical copies of
+# cc12m (same 150 shards, same sizes, verified by the copy job's `_SUCCESS`
+# manifest), so a resume that moves between them is the SAME corpus and must
+# not be rejected. Adding go-d here is what lets a run checkpointed before the
+# storage move resume after it.
 _REPLICA_DATA_BUCKET_RE = re.compile(
     r"^(gs://kmh-gcp-(?:us-central1|us-east5|asia-northeast1-b)/data"
-    r"|/cns/yucmhcg-d/home/qiaos/data)(/.*)?$"
+    r"|/cns/(?:yucmhcg-d|go-d)/home/qiaos/data)(/.*)?$"
 )
 _LOGICAL_DATA_BUCKET_PREFIX = "gs://kmh-gcp-<replica>/data"
 

@@ -49,67 +49,131 @@ _IN_GOOGLE3 = None
 # ---------------------------------------------------------------------------
 # cell -> metro -> region
 # ---------------------------------------------------------------------------
-# Only metros we actually have data in are listed. An unlisted cell is an
-# ERROR, not a default: silently guessing a region is exactly how a job ends up
+# Only cells we can actually name are listed. An unlisted cell is an ERROR,
+# not a default: silently guessing a region is exactly how a job ends up
 # streaming 200 GiB across a continent.
 # Verified with `mach_locality -k metro <cell>`, not from memory.
 _CELL_TO_METRO = {
+    # --- cmh: where the data lives, and where compute now goes -------------
+    # `go` is the compute cell this project pins (`tpu queue --cell=go`), and
+    # `go-d` is the Colossus cell it reads and checkpoints to. Same metro, and
+    # `mach_locality -k campus` says nby vs clb for go-d and yucmhcg-d -- two
+    # campuses of one metro, which storage.md's boundary treats as neighbours.
     "go": "cmh",
     "yucmhcg": "cmh",
     "yucmhfq": "cmh",
     "yucmhqa": "cmh",
-    # TPU cells in the same metro. `go` itself has no TPU capacity for our
-    # allocation, so an accelerator job lands in one of these -- still cmh,
-    # still us-east5, still co-located with the data on yucmhcg-d.
     "yucmhps": "cmh",
     "yucmhty": "cmh",
-    # NOT a data metro. Registered so a job that lands here gets a legible
-    # "the data is in another metro" failure instead of the much vaguer
-    # "Cannot determine where this task is running". `ske` has TPU capacity
-    # our allocation can actually obtain (v7-32 via group 9) while every
-    # v5p-16 request in cmh is refused, so smoke runs land here; there is no
-    # cc12m replica in ske, so `_METRO_TO_CNS_CELLS` deliberately omits it and
-    # such a run must pass JAX_LLAVA_CNS_CELL / JAX_LLAVA_DATA_ROOT to say
-    # out loud that it is reading across metros.
+    # --- other metros where the GROUP has Colossus headroom ----------------
+    # Registered so a job that lands in one gets a legible "no dataset replica
+    # in this metro" failure naming the metro, instead of the far vaguer
+    # "Cannot determine where this task is running".
+    "oe": "tul",
+    "nz": "cbf",
+    "rs": "dfw",
+    "ej": "grq",
+    "yuphxrp": "phx",
+    # NOT a data metro, and not a quota metro either: `yuskedq-d` has no group
+    # registration, so it is capped at the personal 500 GiB per-cell ceiling.
+    # It has TPU capacity our allocation can obtain, which is why the smoke
+    # runs landed here and read cc12m across the Atlantic. `ske` is therefore
+    # absent from `_METRO_TO_CNS_CELLS` on purpose, and a long run must not
+    # come back here.
     "yuskedq": "ske",
 }
 
-# //production/borg/cloud_iam/slicer_regions/slicer_metros.pi
+# //production/borg/cloud_iam/slicer_regions/slicer_metros.pi, read from the
+# depot rather than from memory:
+#   "CMH": "us-east5"   "CBF": "us-central1"   "TUL": "us-central2"
+#   "DFW": "us-south1"  "GRQ": "europe-west4"  "PHX": "us-west8"
 #
 # `ske` is absent ON PURPOSE even though `_CELL_TO_METRO` knows the cell. This
 # map is what `infer_zone_from_environment()` and the dataset locality guard
-# compare against, and there is no jax_llava data or GCP region mapping we have
-# verified for ske. Adding a guessed entry here would let a cross-metro read
-# pass the guard silently, which is the one thing the guard exists to prevent.
+# compare against, and there is no jax_llava data or verified GCP region
+# mapping for ske. A guessed entry would let a cross-metro read pass the guard
+# silently, which is the one thing the guard exists to prevent.
+#
+# SECOND GATE, and it is not in this file: `train.py::_init_run` asserts the
+# resolved zone is one of us-central1 / us-east5 / asia-northeast1-b. So a job
+# in tul, dfw, grq or phx resolves a region here and then stops there, with a
+# message naming what is supported. That is fail-closed and legible, but it
+# means group Colossus headroom in a metro is necessary and NOT sufficient --
+# a new training metro needs that assert widened and a dataset replica placed,
+# in that order.
 _METRO_TO_REGION = {
     "cmh": "us-east5",
+    "cbf": "us-central1",
+    "tul": "us-central2",
+    "dfw": "us-south1",
+    "grq": "europe-west4",
+    "phx": "us-west8",
 }
 
-# The CNS cell to write/read from, per metro. `<cell>-d` is the durable root.
+# The metros this project may run in, and the CNS cell it reads/writes there.
+#
+# THE ENTRY CRITERION IS GROUP QUOTA, NOT PROXIMITY. Every cell listed here is
+# registered to `deepmind-resources-colossus` in the flex registry, which is
+# the only authoritative source -- `fileutil quota <group> <cell>` reports a
+# plausible-looking 500.00G for an UNREGISTERED group because that is the
+# default bucket it falls through to, and writing against that reply dies with
+# "Group <g> has no quota (partition=hdd)" plus a poisoned file handle, which
+# is strictly worse than not setting the accounting at all.
+#
+# Verified group headroom per metro, with
+#   flex.par list_ceiling -s colossus -g deepmind-resources-colossus -l <cell>
+#   fileutil quota deepmind-resources-colossus <cell>
+#
+#   cmh  go-d 5.40 PiB, yucmhty-d 5.16 PiB    tul  oe-d       3.87 PiB
+#   cbf  nz-d 6.06 PiB                        dfw  rs-d       9.51 PiB
+#   grq  ej-d 4.50 PiB                        phx  yuphxrp-d  94 TiB
+#
+# DELIBERATELY EXCLUDED, and these are the load-bearing omissions:
+#
+#   ske / yuskedq-d -- no group registration, so it is capped at the PERSONAL
+#     500 GiB per-cell ceiling. cc12m alone is 289 GiB at rs=9.4 and the group
+#     is at 0 B there, so a replica would fit exactly once and leave no room
+#     for checkpoints. This is why the smoke runs read cross-metro and why
+#     compute moved to cmh rather than the data moving to ske.
+#   yucmhcg-d, yucbfpv-d, yuchspe-d -- likewise no group registration. Note
+#     yucmhcg-d is where the data lives TODAY: it is readable and stays
+#     readable, it is simply not somewhere to keep growing (measured 398 GiB
+#     of a 500 GiB personal ceiling, shared with every run's checkpoints).
+#
+# An unlisted metro raises. That is the whole point: silently guessing a
+# region is how a job ends up streaming 200 GiB across a continent.
 _METRO_TO_CNS_CELLS = {
-    "cmh": ("yucmhcg-d",),
+    "cmh": ("go-d", "yucmhcg-d"),
+    "tul": ("oe-d",),
+    "cbf": ("nz-d",),
+    "dfw": ("rs-d",),
+    "grq": ("ej-d",),
+    "phx": ("yuphxrp-d",),
 }
 
-# Where the datasets live. Keyed by CNS cell root so a job in another cell of
-# the same metro picks its own replica rather than reaching across the metro.
+# Where the datasets live, keyed by CNS cell root, so a job in one cell of a
+# metro picks ITS OWN replica rather than reaching across the metro.
 #
-# There is deliberately ONE cmh replica. A second copy existed on `go-d` and
-# was deleted, and the reason is worth keeping: Colossus quota is charged on
-# POST-REPLICATION disk bytes. That copy was written with the default `r=3.2`
-# (3-way replication, 3.0166x), so 199 GiB of cc12m occupied 598.7 GiB against
-# a 500 GiB per-user-per-cell disk limit -- the cell went over quota and every
-# write to it failed with "Poisoned file handle ... over Colossus bytes HDD
-# quota". The surviving replica is written `rs=9.4` (Reed-Solomon, 1.4505x =
-# 289 GiB) and fits comfortably. Same bytes, same shard count, 2.08x less disk.
+# A root appears here only when its payload is verified present. A fallback
+# that resolves to an empty directory is worse than no fallback, because it
+# looks like a valid root and then yields a partial stream -- so
+# `cns_dataset_path()` additionally requires a `_SUCCESS` marker before using
+# one, and the order below is a preference, not a promise.
 #
-# Do NOT add a root back as a "read-only fallback" unless its payload is
-# verified present: a fallback that resolves to an empty directory is worse
-# than no fallback, because it looks like a valid root and then yields a
-# partial stream. `cns_dataset_path()` additionally requires a _SUCCESS marker
-# for exactly this reason.
+# `go-d` is FIRST for cmh: same metro as `yucmhcg-d` (both cmh, campuses nby
+# and clb, so cross-cell reads there are effectively free), but charged to the
+# group instead of to a 500 GiB personal ceiling, and holding
+# throughput_spindles=50 -- an actual performance floor. A default quota circle
+# carries ZERO spindle commitment, which is the documented condition behind a
+# 12-hour throughput collapse to 0.04 MiB/s.
 #
-# Check with `fileutil quota qiaos <cell>` and `fileutil ls -le <path>`.
+# Colossus quota is charged on POST-REPLICATION disk bytes, so the encoding
+# decides whether 199 GiB of cc12m costs 289 GiB (`rs=9.4`, 1.4505x) or
+# 601 GiB (`r=3.2`, 3.0166x). Against a group ceiling that is an efficiency
+# question; against the personal one it is feasibility, and getting it wrong
+# once already poisoned a cell.
 _CNS_DATA_ROOTS = {
+    "go-d": "/cns/go-d/home/qiaos/data",
     "yucmhcg-d": "/cns/yucmhcg-d/home/qiaos/data",
 }
 
@@ -117,8 +181,14 @@ _CNS_DATA_ROOTS = {
 # read once at startup, so the list is tried in order and a same-metro read is
 # acceptable. Gemma is absent on purpose: it comes from /tfhub/, which is
 # globally addressable and needs no replica choice.
+# `go-d` first for the same reason as the dataset -- group quota and a real
+# spindle commitment -- with `yucmhcg-d` kept as a second entry because a model
+# read is small, once, at startup, and having a working fallback beats
+# refusing to start. That is deliberately the opposite of the dataset rule,
+# where a wrong choice means streaming 200 GiB for hours.
 _CNS_MODEL_ROOTS = {
-    "cmh": ("/cns/yucmhcg-d/home/qiaos/models",),
+    "cmh": ("/cns/go-d/home/qiaos/models",
+            "/cns/yucmhcg-d/home/qiaos/models"),
 }
 
 
