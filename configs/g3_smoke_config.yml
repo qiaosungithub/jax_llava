@@ -87,9 +87,22 @@ training:
         dataset_items:
             - cc12m
         mix_weights: [1]
-        # 16 = one per chip on a v5p-32 (16 chips), the smallest batch that
-        # keeps every device busy without a reshape.
-        batch_size: 16
+        # ONE EXAMPLE PER JAX DEVICE, and "device" is not "chip".
+        #
+        # `_validate_and_get_local_batch_size` requires
+        # `batch_size % jax.device_count() == 0`, and on a v7-32 that count is
+        # 64, not 32: the slice is 8 processes x 8 local devices, because these
+        # chips expose TWO cores each (measured on XID 276999058 --
+        # `JAX process: 0 / 8`, and its local device list runs id=0..7 with
+        # core_on_chip alternating 0/1 over four coords). A chip count is not a
+        # device count and neither is a mesh size; the only trustworthy source
+        # is `jax.device_count()` on the actual slice.
+        #
+        # 16 was one-per-chip on a v5p-16 and would raise here
+        # ("Global batch size 16 must be divisible by device_count=64") before
+        # the first step -- a config error that costs a full schedule + 5 min
+        # of imports to discover.
+        batch_size: 64
         freeze_lm: True
         freeze_image_encoder: True
         optimizer: adam
@@ -122,7 +135,8 @@ training:
         dataset_items:
             - cc12m
         mix_weights: [1.0]
-        batch_size: 16
+        # Same divisibility rule as stage 1; see the note there.
+        batch_size: 64
         freeze_lm: False
         freeze_lm_embed: False
         freeze_lm_late: False

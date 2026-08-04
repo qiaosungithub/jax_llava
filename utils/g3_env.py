@@ -63,9 +63,24 @@ _CELL_TO_METRO = {
     # still us-east5, still co-located with the data on yucmhcg-d.
     "yucmhps": "cmh",
     "yucmhty": "cmh",
+    # NOT a data metro. Registered so a job that lands here gets a legible
+    # "the data is in another metro" failure instead of the much vaguer
+    # "Cannot determine where this task is running". `ske` has TPU capacity
+    # our allocation can actually obtain (v7-32 via group 9) while every
+    # v5p-16 request in cmh is refused, so smoke runs land here; there is no
+    # cc12m replica in ske, so `_METRO_TO_CNS_CELLS` deliberately omits it and
+    # such a run must pass JAX_LLAVA_CNS_CELL / JAX_LLAVA_DATA_ROOT to say
+    # out loud that it is reading across metros.
+    "yuskedq": "ske",
 }
 
 # //production/borg/cloud_iam/slicer_regions/slicer_metros.pi
+#
+# `ske` is absent ON PURPOSE even though `_CELL_TO_METRO` knows the cell. This
+# map is what `infer_zone_from_environment()` and the dataset locality guard
+# compare against, and there is no jax_llava data or GCP region mapping we have
+# verified for ske. Adding a guessed entry here would let a cross-metro read
+# pass the guard silently, which is the one thing the guard exists to prevent.
 _METRO_TO_REGION = {
     "cmh": "us-east5",
 }
@@ -229,7 +244,63 @@ def cns_data_roots(cell=None):
     roots = tuple(_CNS_DATA_ROOTS[c] for c in _METRO_TO_CNS_CELLS.get(metro, ())
                   if c in _CNS_DATA_ROOTS)
     if not roots:
-        raise ValueError(f"No CNS data root registered for metro {metro!r}.")
+        # LAST RESORT, and only because the alternative is worse. A job in a
+        # compute-only metro (ske, today) is a legitimate situation -- it is
+        # where the chips our allocation can actually obtain are -- and the
+        # launcher offers no way to pass JAX_LLAVA_CNS_CELL into the job
+        # (`~/work/tpu_cmd/xm_launcher.py` builds `job_env_vars` from a fixed
+        # list, and it is shared with other projects, so it is not ours to
+        # edit).
+        #
+        # $CHECKPOINT_BUCKET, however, IS passed, and it is chosen explicitly
+        # at submit time (`--bucket=/cns/yucmhcg-d/...`). A human naming a
+        # durable root in cmh while scheduling compute in ske has already made
+        # the cross-metro decision; honouring it is reporting that decision,
+        # not guessing. Anything else -- an unset bucket, a bucket in a metro
+        # with no registered data -- still raises.
+        #
+        # It is deliberately LOUD: co-location is the thing this module exists
+        # to protect, and a cross-metro read must never be silent. See
+        # storage.md for the incident where compute and checkpoints on
+        # different continents cost 4-5x throughput and got the job pruned.
+        bucket_cell = cns_cell_of_path(
+            (os.environ.get("CHECKPOINT_BUCKET") or "").strip())
+        if bucket_cell and bucket_cell in _CNS_DATA_ROOTS:
+            bucket_metro = next(
+                (m for m, cells in _METRO_TO_CNS_CELLS.items()
+                 if bucket_cell in cells), None)
+            message = (
+                f"CROSS-METRO DATA READ: compute is in metro {metro!r} "
+                f"(cell={cell!r}), which has no dataset replica, so falling "
+                f"back to {_CNS_DATA_ROOTS[bucket_cell]} in metro "
+                f"{bucket_metro!r} -- taken from $CHECKPOINT_BUCKET, i.e. from "
+                "an explicit --bucket at submit time. Acceptable for a short "
+                "smoke; for a long run replicate the data into the compute "
+                "metro or move the compute, or throughput drops several-fold "
+                "and the utilisation pruner eventually kills the job."
+            )
+            # NOT `warnings.warn`: warnings are deduplicated, are silenced by
+            # whatever filter the process last installed, and did not appear
+            # at all in a Blaze binary when this was tested. A message that
+            # can be swallowed is not a warning. absl logging reaches both the
+            # console and -- via the record-level handler in
+            # `utils/logging_util.py` -- the durable CNS mirror, which on Borg
+            # is the only log anyone can read.
+            try:
+                from absl import logging as _absl_logging
+                _absl_logging.warning("%s", message)
+            except Exception:  # noqa: BLE001 - never block on reporting
+                pass
+            print(f"[locality] {message}", flush=True)
+            return (_CNS_DATA_ROOTS[bucket_cell],)
+        raise ValueError(
+            f"No CNS data root registered for metro {metro!r} (cell={cell!r}). "
+            f"Metros with data: {sorted(_METRO_TO_CNS_CELLS)}. Either replicate "
+            "the dataset into this metro, or set JAX_LLAVA_CNS_CELL="
+            "<cell>-d / JAX_LLAVA_DATA_ROOT=<path> to read across metros "
+            "deliberately -- which costs throughput and, on a long run, gets "
+            "the job killed by the utilisation pruner."
+        )
     return roots
 
 
