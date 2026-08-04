@@ -420,10 +420,19 @@ def main(argv):
 
   # Then mirror logs, still before JAX: TPU/topology bring-up is one of the
   # most common places to die, and a task that dies there is otherwise silent.
+  #
+  # This is EqR-jax's `mirror_logs_to_bucket`, grafted into
+  # `utils/logging_util.py` -- same call, same `<bucket>/logs/
+  # rank_<n>_attempt<k>.log` path, same attempt-slot semantics, so the two
+  # projects are debugged identically. `detect_task_rank` reads the
+  # unambiguous integer sources before parsing BORG_TASK_HANDLE, because the
+  # naive parse gave every task rank 0 and all four mirrored into one file.
   if bucket:
-      mirrored = g3_logmirror.mirror_logs(bucket)
+      rank_hint = logging_util.detect_task_rank()
+      mirrored = logging_util.mirror_logs_to_bucket(bucket, rank=rank_hint)
       if mirrored:
-          _boot_log("[log-mirror] stdout/stderr -> %s", mirrored)
+          _boot_log("[log-mirror] task rank %d: stdout/stderr -> %s",
+                    rank_hint, mirrored)
       else:
           _boot_log("[log-mirror] could not open a mirror under %s", bucket)
 
@@ -485,6 +494,12 @@ def main(argv):
       # The mirror flushes on a timer and on error tokens, but a clean exit or
       # an exception on the way out should not lose the last few lines.
       g3_logmirror.flush_logs()
+      # Footer here, forward pointer into the previous attempt's log: a reader
+      # who lands on an old attempt is told where the run continued instead of
+      # concluding it died there. Best effort -- a preempted task is SIGKILLed
+      # and never reaches this, which is why the header's backward link is the
+      # load-bearing half of the chain.
+      g3_logmirror.close_attempt_log()
 
 
 if __name__ == '__main__':

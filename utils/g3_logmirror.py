@@ -1,75 +1,38 @@
-"""Tee stdout/stderr to durable storage, for a job whose logs you cannot read.
+"""Early-boot evidence for a job whose Borg logs you cannot read.
 
-On this workstation `borg tasklog` and `analog --remote` fail with
-PERMISSION_DENIED (restricted LOAS), and the Borg task itself is garbage
-collected within minutes of finishing. So the application's own mirror is
-usually the ONLY log that survives long enough to read. It is written from the
-first line of `main()`, before JAX or the TPU backend is touched, because those
-are among the most common places to die.
+Three files, written to `$CHECKPOINT_BUCKET/logs/`, covering the windows the
+normal log mirror cannot:
 
-Design constraints, all learned the expensive way (see EqR-jax's
-`utils/logging_util.py`, which this is a compact sibling of):
+* `_startup_rank<N>.txt`  -- proof `main()` was entered at all, written before
+  the mirror exists, because installing the mirror is itself one of the things
+  that can fail.
+* `_import_crash_rank<N>.txt` -- written by `main.py` (not here) for a crash in
+  the module-scope imports, i.e. before `InitGoogle()` and therefore before any
+  `/cns/` API is legal.
+* `_backend_rank<N>.txt` -- the JAX backend and device list, written BEFORE the
+  assertion that would kill the task for being on CPU, so the evidence outlives
+  the assertion.
 
-* **One writer per file.** stdout and stderr share a single writer so the file
-  is a faithful interleave rather than two streams clobbering each other.
-* **One file per attempt.** A Borg restart re-runs the same work unit, so
-  anything keyed on the work-unit id appends a second life onto the first file
-  and a stale traceback then reads as the current failure.
-* **Never raise.** A mirror is a diagnostic. If the backend misbehaves it
-  disables itself and the job carries on.
-* **Flush eagerly on error lines and on a wall clock**, so a HUNG job has still
-  shipped its last words.
+WHY THIS IS NOT THE LOG MIRROR. Tee-ing stdout/stderr into
+`<bucket>/logs/rank_<n>_attempt<k>.log` lives in `utils/logging_util.py`,
+grafted verbatim from EqR-jax so the two projects are debugged identically --
+same paths, same attempt-slot semantics, same background flusher. This module
+used to carry a second, parallel implementation of that; it was deleted rather
+than maintained, and `mirror_logs`/`flush_logs` below are thin aliases so
+existing call sites keep working.
+
+What remains here is genuinely absent from EqR-jax: it never had to report from
+before `InitGoogle()`, because it never died there. jax_llava did, twice (XIDs
+276839294 and 276859816: FAILURE, empty status message, peak RSS ~400 MiB, dead
+<40 s after RUN, against imports that take ~5 min and 11 GB to complete).
+
+Everything here is best effort and never raises. Evidence that can kill the
+thing it is evidence about is worse than no evidence.
 """
 
 import os
-import re
 import sys
-import threading
 import time
-
-_FLUSH_SECONDS = 20.0
-_MAX_BUFFER_CHARS = 1 << 20
-_URGENT_TOKENS = (
-    "Traceback", "Error", "ERROR", "error:", "Exception",
-    "FATAL", "Fatal", "CRITICAL", "Refusing",
-)
-
-_ATTEMPT_LOG_PATH = None
-
-
-def attempt_log_path():
-    """The file this process is mirroring into, or None."""
-    return _ATTEMPT_LOG_PATH
-
-
-def detect_task_rank(default: int = 0) -> int:
-    """This task's index among the job's tasks, without touching JAX.
-
-    Called before `jax.process_index()` is legal, so every source is an
-    environment variable or an already-parsed absl flag. Unambiguous integer
-    sources first; `BORG_TASK_HANDLE` is parsed last and with Borg's own regex,
-    because the handle carries an optional `logs.` prefix that makes the naive
-    `split(".")[0]` return the string "logs" -- which then silently becomes
-    rank 0 for every task, and all of them mirror into one file.
-    """
-    for key in ("BORG_TASK_INDEX", "JAX_TASK_ID", "JAX_PROCESS_ID", "TASK_ID", "RANK"):
-        value = os.environ.get(key)
-        if value is None or not str(value).strip():
-            continue
-        try:
-            return int(str(value).strip())
-        except ValueError:
-            continue
-    try:
-        from absl import flags as _flags
-        if "jax_task_id" in _flags.FLAGS:
-            value = _flags.FLAGS["jax_task_id"].value
-            if value is not None:
-                return int(value)
-    except Exception:  # noqa: BLE001 - a flag lookup must never break startup
-        pass
-    match = re.match(r"^(?:logs\.)?(\d+)\.", os.environ.get("BORG_TASK_HANDLE", "") or "")
-    return int(match.group(1)) if match else default
 
 
 def _gfile():
@@ -77,126 +40,21 @@ def _gfile():
     return gfile
 
 
-class _RemoteLogWriter:
-    """The single owner of one remote log file. Thread-safe; never raises."""
+def detect_task_rank(default: int = 0) -> int:
+    """This task's index among the job's tasks, without touching JAX.
 
-    def __init__(self, remote_path, flush_seconds=_FLUSH_SECONDS):
-        self._path = remote_path
-        self._buf = []
-        self._chars = 0
-        self._flush_seconds = flush_seconds
-        self._last_flush = time.time()
-        self._lock = threading.Lock()
-        self._broken = False
-        self._stop = threading.Event()
-        self._flusher = None
+    Delegates to the grafted EqR-jax implementation so both projects derive the
+    rank the same way (unambiguous integer env vars first, then the absl
+    `jax_task_id` flag, then `BORG_TASK_HANDLE` parsed with Borg's own regex --
+    the naive `split(".")[0]` returns the literal "logs" for a handle carrying
+    the optional `logs.` prefix, which silently made every task rank 0).
 
-    @property
-    def remote_path(self):
-        return self._path
-
-    def write(self, text):
-        if self._broken or not text:
-            return
-        with self._lock:
-            self._buf.append(text)
-            self._chars += len(text)
-            urgent = any(tok in text for tok in _URGENT_TOKENS)
-            due = (time.time() - self._last_flush) >= self._flush_seconds
-            if urgent or due or self._chars >= _MAX_BUFFER_CHARS:
-                self._flush_locked()
-
-    def flush(self):
-        if self._broken:
-            return
-        with self._lock:
-            self._flush_locked()
-
-    def start_background_flusher(self):
-        if self._flusher is not None:
-            return
-
-        def _loop():
-            while not self._stop.wait(self._flush_seconds):
-                if self._broken:
-                    return
-                try:
-                    self.flush()
-                except Exception:  # noqa: BLE001 - never kill the job
-                    return
-
-        self._flusher = threading.Thread(
-            target=_loop, name="llava-log-mirror-flush", daemon=True)
-        self._flusher.start()
-
-    def stop(self):
-        self._stop.set()
-
-    def _flush_locked(self):
-        if not self._buf:
-            return
-        payload = "".join(self._buf)
-        try:
-            with _gfile().Open(self._path, "a") as handle:
-                handle.write(payload)
-            self._buf.clear()
-            self._chars = 0
-            self._last_flush = time.time()
-        except Exception:  # noqa: BLE001 - mirroring must never kill the job
-            # Drop rather than grow without bound; the local stream still has
-            # everything, and a broken mirror must not become an OOM.
-            self._buf.clear()
-            self._chars = 0
-            self._broken = True
-
-
-class _Tee:
-    """File-like proxy: writes through to `stream` AND into the shared writer."""
-
-    def __init__(self, stream, writer):
-        self._stream = stream
-        self._writer = writer
-
-    @property
-    def writer(self):
-        return self._writer
-
-    def write(self, text):
-        written = self._stream.write(text)
-        self._writer.write(text)
-        return written
-
-    def flush(self):
-        self._stream.flush()
-        self._writer.flush()
-
-    def isatty(self):
-        return False
-
-    def close(self):
-        # Flush, but NEVER close the underlying stream: absl's
-        # logging.shutdown() closes every handler at exit and only recognises
-        # the four objects sys.stdout/stderr/__stdout__/__stderr__ currently
-        # name. A tee that has been swapped out is not one of them, so absl
-        # would close the real stdout under us.
-        self.flush()
-
-    def __getattr__(self, name):
-        return getattr(self._stream, name)
-
-
-def _next_attempt_slot(logs_dir, rank):
-    """One past the highest attempt already present. Never reuses a name."""
-    try:
-        existing = _gfile().Glob(f"{logs_dir}/rank_{rank}_attempt*.log")
-    except Exception:  # noqa: BLE001
-        return 1
-    highest = 0
-    for path in existing:
-        m = re.search(r"_attempt(\d+)\.log$", str(path))
-        if m:
-            highest = max(highest, int(m.group(1)))
-    return highest + 1
+    Kept as a re-export rather than a second copy: this module is imported from
+    `main()` before `logging_util` is safe to touch in some paths, and callers
+    already say `g3_logmirror.detect_task_rank()`.
+    """
+    from utils.logging_util import detect_task_rank as _detect
+    return _detect(default)
 
 
 def write_startup_marker(bucket, rank=None):
@@ -299,66 +157,57 @@ def write_backend_marker(bucket, rank=None):
         return None
 
 
+# --------------------------------------------------------------------------- #
+# Aliases onto the grafted EqR-jax mirror.
+#
+# The implementation moved to `utils/logging_util.py`; these keep `main.py` and
+# `utils/g3_metrics.py` reading naturally and give one place to look when
+# asking "which mirror is this project using?". The answer is: EqR-jax's.
+# --------------------------------------------------------------------------- #
+
+
 def mirror_logs(bucket, rank=None):
     """Tee stdout+stderr into `<bucket>/logs/rank_<n>_attempt<k>.log`.
 
-    Returns the path, or None if mirroring could not be set up (which is never
-    fatal). MUST be called from inside `main()`: it touches CNS.
+    Returns the path, or None if a mirror could not be opened (never fatal).
+    MUST be called from inside `main()`: it touches CNS.
     """
-    global _ATTEMPT_LOG_PATH
-    if not bucket:
-        return None
-    if rank is None:
-        rank = detect_task_rank()
-    logs_dir = bucket.rstrip("/") + "/logs"
-    try:
-        gfile = _gfile()
-        if not gfile.Exists(logs_dir):
-            gfile.MakeDirs(logs_dir)
-        slot = _next_attempt_slot(logs_dir, rank)
-        remote = f"{logs_dir}/rank_{rank}_attempt{slot}.log"
-        writer = _RemoteLogWriter(remote)
-        handle = os.environ.get("BORG_TASK_HANDLE", "")
-        writer.write(
-            f"=== attempt {slot} (rank {rank}) begins"
-            f"{f' [task {handle}]' if handle else ''} ===\n")
-        writer.flush()
-        if writer._broken:  # pylint: disable=protected-access
-            return None
-    except Exception:  # noqa: BLE001 - a mirror must never block startup
-        return None
-    sys.stdout = _Tee(sys.stdout, writer)
-    sys.stderr = _Tee(sys.stderr, writer)
-    writer.start_background_flusher()
-    _reattach_absl_handler()
-    _ATTEMPT_LOG_PATH = remote
-    return remote
+    from utils.logging_util import mirror_logs_to_bucket
+    return mirror_logs_to_bucket(bucket, rank=rank)
 
 
-def _reattach_absl_handler():
-    """Point absl's logging handler at the NEW sys.stderr.
-
-    absl captures the stream object when its handler is constructed, which
-    normally happens at import time -- i.e. before the tee exists. Without
-    this, `logging.info(...)` keeps writing to the original stderr and the
-    mirror contains only bare prints, which is the majority of a training log
-    missing.
-    """
-    try:
-        from absl import logging as absl_logging
-        handler = absl_logging.get_absl_handler()
-        stream_handler = getattr(handler, "python_handler", None) or handler
-        if hasattr(stream_handler, "stream"):
-            stream_handler.stream = sys.stderr
-    except Exception:  # noqa: BLE001
-        pass
+def attempt_log_path():
+    """The file this process is mirroring into, or None."""
+    from utils import logging_util
+    return logging_util._ATTEMPT_LOG_PATH  # pylint: disable=protected-access
 
 
 def flush_logs():
     """Flush the mirror, if any. Safe to call from an exception handler."""
+    from utils.logging_util import _GcsTee
     for stream in (sys.stdout, sys.stderr):
         try:
-            if isinstance(stream, _Tee):
+            if isinstance(stream, _GcsTee):
                 stream.flush()
         except Exception:  # noqa: BLE001
             pass
+
+
+def close_attempt_log(summary: str = ""):
+    """Footer for this attempt's log plus a forward link into the previous one."""
+    try:
+        from utils.logging_util import close_attempt_log as _close
+        _close(summary)
+    except Exception:  # noqa: BLE001 - shutdown bookkeeping must not fail a run
+        pass
+
+
+def _reattach_absl_handler():
+    """Point absl's console handlers back at the (tee'd) `sys.stderr`.
+
+    Anything that rebuilds logging handlers -- `clu.metric_writers`, most
+    notably -- steals the streams back and every subsequent line bypasses the
+    mirror. Re-invoke after constructing such a thing.
+    """
+    from utils.logging_util import reattach_absl_handlers
+    reattach_absl_handlers()

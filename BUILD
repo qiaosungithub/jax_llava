@@ -195,3 +195,46 @@ py_binary(
     tags = ["nostrictdeps"],
     deps = [":main"],
 )
+
+# The CNS log mirror, tested directly and in SECONDS.
+#
+# On this workstation the mirror is the only readable log a Borg task leaves
+# (`borg tasklog` SIGABRTs on PERMISSION_DENIED, `analog --remote` is refused,
+# Coroner's binary is unreadable, and the task is GC'd from the borgmaster in
+# minutes). A bug in it does not lose one log, it makes every LATER failure
+# undiagnosable -- so it gets its own proof rather than being inferred from a
+# training run that must also survive TPU bring-up and 5 min of imports.
+#
+# Deliberately does NOT depend on `:main`: the point is a build-and-run cycle
+# measured in seconds, and the mirror needs pyglib.gfile, etils and absl and
+# nothing else. Pulling torch in would make this as slow as the thing it is
+# meant to de-risk.
+py_binary(
+    name = "g3_mirror_probe",
+    srcs = ["tools/g3_mirror_probe.py"],
+    # `data`, not `srcs`, and the same glob shape the other targets use. The
+    # rest of this project is imported BY PATH (`from utils import ...`, with
+    # the package dir on sys.path) rather than as Bazel targets, so a module
+    # listed in `srcs` lands at its google3-relative path and `import utils`
+    # then fails with ModuleNotFoundError at runtime despite a green build.
+    data = glob(
+        [
+            "utils/*.py",
+            "**/*.yml",
+        ],
+        exclude = ["tools/g3_mirror_probe.py"],
+    ),
+    main = "tools/g3_mirror_probe.py",
+    strict_deps = False,
+    tags = ["nostrictdeps"],
+    deps = [
+        "//third_party/py/PIL:pil",
+        "//third_party/py/absl:app",
+        "//third_party/py/absl/flags",
+        "//third_party/py/etils/epath",
+        "//third_party/py/jax",
+        "//third_party/py/numpy",
+        "//third_party/py/scamper:wandb_mock",
+        "//pyglib:gfile",
+    ],
+)
