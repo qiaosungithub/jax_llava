@@ -1,5 +1,6 @@
 from absl import logging as absl_logging
 from functools import partial
+import os
 import copy
 import warnings
 from hashlib import md5
@@ -628,12 +629,55 @@ def _prepare_knn_if_needed(config, zone, tasks):
     return None
 
 
+# The fixed visualisation batch reads a dozen COCO val2014 JPEGs from the GCP
+# cluster's NFS mount. That mount does not exist under google3, and the images
+# are not on CNS -- so on Borg this raises
+#
+#   FileNotFoundError: /kmh-nfs-ssd-us-mount/.../COCO_val2014_000000391895.jpg
+#
+# ...from a call that ran UNCONDITIONALLY at phase start even though all three
+# of its consumers (log_vis_per_step, sample_per_step, the eval tasks) were
+# switched off. A run that asked for none of them still died for want of a
+# picture.
+#
+# Two changes. It is now built only when something will actually use it, and
+# it is built LAZILY, so the cost and the failure both land at the first real
+# use. And when the images are missing it returns None rather than raising --
+# but only after checking that no consumer is enabled, so a run that DOES ask
+# for visualisations still fails loudly instead of silently skipping them.
+COCO_VIS_ROOT = "/kmh-nfs-ssd-us-mount/code/hanhong/shared/COCO/val2014"
+
+
+def _vis_batch_is_needed(config):
+    """Whether any consumer of the fixed visualisation batch is enabled."""
+    training = config.training
+    if int(training.get("log_vis_per_step", -1)) > 0:
+        return True
+    if int(training.get("sample_per_step", -1)) > 0:
+        return True
+    if list(training.get("online_eval_tasks", []) or []):
+        return True
+    if list(training.get("final_eval_tasks", []) or []):
+        return True
+    return False
+
+
+def _coco_vis_available():
+    try:
+        return all(
+            os.path.exists(os.path.join(COCO_VIS_ROOT, name))
+            for name in FIXED_PAIRS
+        )
+    except OSError:
+        return False
+
+
 def _prepare_fixed_vis_batch(config, tokenizer):
     log_for_0('Preparing sample pairs for sampling...')
     vis_pairs = [
         input_pipeline.preprocess_fn(
             {
-                'jpg': Image.open(f'/kmh-nfs-ssd-us-mount/code/hanhong/shared/COCO/val2014/{k}'),
+                'jpg': Image.open(os.path.join(COCO_VIS_ROOT, k)),
                 'aux': {'gt': v},
             },
             transform=input_pipeline.get_transforms(
@@ -920,7 +964,33 @@ def _run_train_phase(
     )
     del state_spec
 
-    vis_pairs, vis_batch = _prepare_fixed_vis_batch(config, tokenizer)
+    # Built on demand -- see the note above `_prepare_fixed_vis_batch`. The
+    # cache is a one-element list so the closure can fill it without `nonlocal`
+    # leaking into the several nested scopes below.
+    _vis_cache = []
+
+    def get_vis_batch():
+        """(vis_pairs, vis_batch), or (None, None) if the images are absent."""
+        if not _vis_cache:
+            if _coco_vis_available():
+                _vis_cache.append(_prepare_fixed_vis_batch(config, tokenizer))
+            else:
+                _vis_cache.append((None, None))
+        return _vis_cache[0]
+
+    if _vis_batch_is_needed(config) and not _coco_vis_available():
+        raise FileNotFoundError(
+            f"This run enables visualisation/sampling/eval, which need the "
+            f"fixed COCO images under {COCO_VIS_ROOT}, but they are not "
+            f"readable here (they live on the GCP cluster's NFS mount and are "
+            f"not on CNS). Either copy them to a reachable path and update "
+            f"COCO_VIS_ROOT, or set log_vis_per_step/sample_per_step to -1 "
+            f"and leave online_eval_tasks/final_eval_tasks empty.")
+    if not _vis_batch_is_needed(config):
+        log_for_0(
+            "Fixed visualisation batch not needed by this config "
+            "(log_vis_per_step/sample_per_step off, no eval tasks); skipping.")
+
     metrics_tracker = MetricsTracker()
     timer = Timer()
     timer.reset()
@@ -985,15 +1055,16 @@ def _run_train_phase(
             step == int(current_step) or (step + 1) % sample_per_step == 0
         ):
             with timer.skip():
+                _vis_pairs, _vis_batch = get_vis_batch()
                 out_strs = run_p_sample_step(
                     p_sample_steps['default'],
                     model,
                     tokenizer,
                     state.params,
-                    vis_batch['pixel_values'],
-                    vis_batch['input_ids'],
-                    vis_batch['prefix_len'],
-                )[:len(vis_pairs)]
+                    _vis_batch['pixel_values'],
+                    _vis_batch['input_ids'],
+                    _vis_batch['prefix_len'],
+                )[:len(_vis_pairs)]
                 log_for_0(f'[{stage_name}] sample outputs: {out_strs}')
                 writer.write_texts(step + 1, f'{stage_key}_vis_samples', out_strs)
 
@@ -1044,7 +1115,7 @@ def _run_train_phase(
                         'knn_imagenet_data_dir': knn_data_dir,
                         'knn_imagenet_root': knn_data_dir,
                         'p_recon_steps': {},
-                        'vis_batch': vis_batch,
+                        'vis_batch': get_vis_batch()[1],
                         'patch_size': _model_patch_size(config),
                         'image_size': config.dataset.image_size,
                         'run_eval_recon_psnr': run_eval_recon_psnr,
@@ -1072,7 +1143,7 @@ def _run_train_phase(
                 'knn_imagenet_data_dir': knn_data_dir,
                 'knn_imagenet_root': knn_data_dir,
                 'p_recon_steps': {},
-                'vis_batch': vis_batch,
+                'vis_batch': get_vis_batch()[1],
                 'patch_size': _model_patch_size(config),
                 'image_size': config.dataset.image_size,
                 'run_eval_recon_psnr': run_eval_recon_psnr,
