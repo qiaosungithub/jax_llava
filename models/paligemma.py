@@ -225,10 +225,28 @@ def token_xent_loss_from_hidden(
         _sizes = dict(zip(_mesh.axis_names, _mesh.devices.shape))
         for _ax in _data_axes:
             _n_data *= int(_sizes[_ax])
+    # A MODEL AXIS IS REQUIRED, not merely a data axis. The manual region
+    # below calls `jax.lax.axis_index`, `pmax` and `psum` over `_model_ax`, so
+    # it cannot run without one -- and `_model_axis_names` returns an EMPTY
+    # tuple for any mode outside {"hsdp", "fsdp"}. This config's sharding is
+    # `hsdp_legacy_data`, which is not in that set, so the old guard admitted
+    # the shard_map path and line 245 then died on
+    #     _model_axis_names(...)[0]  ->  IndexError: tuple index out of range
+    # inside jit, i.e. at the first training step, after the whole model had
+    # been built and the first batch fetched. Observed on XID 277036027 (8
+    # processes, 64 TpuDevices); it cannot reproduce on a 1-device local run,
+    # because there `_n_data > 1` is already False and the path is skipped.
+    #
+    # The non-shard_map branch below computes the same cross entropy without
+    # any collectives, so falling back is a performance choice, not a
+    # correctness one.
+    _model_axes = (_pjit_util._model_axis_names(_mesh, _pjit_util._mode)
+                   if _mesh is not None else ())
     use_shard_map = (
         _mesh is not None
         and len(_data_axes) > 0
         and _n_data > 1
+        and len(_model_axes) > 0
         and chunk % _n_data == 0
         # Escape hatch for A/B and audits; the shard_map path is the default.
         and os.environ.get("PALIGEMMA_CE_SHARDMAP", "1") != "0"
@@ -242,7 +260,7 @@ def token_xent_loss_from_hidden(
         # PER-RANK STRIDED chunks via a metadata-only reshape along the
         # sharding. Which tokens share a chunk is irrelevant (CE is per-token;
         # chunking only bounds peak memory).
-        _model_ax = _pjit_util._model_axis_names(_mesh, _pjit_util._mode)[0]
+        _model_ax = _model_axes[0]
         _row_spec = _P(tuple(_data_axes), _model_ax)
         _vec_spec = _P(tuple(_data_axes))
         chunk_loc = chunk // _n_data
