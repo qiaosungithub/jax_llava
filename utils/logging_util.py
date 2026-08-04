@@ -331,6 +331,14 @@ class Writer:
                 f'log scalars at step {step}',
                 lambda: self.wandb.log(scalar_dict, step=step),
             )
+        # In google3 `wandb` is a mock whose log() stores nothing, so this is
+        # the only durable record of the curve. No-op outside google3, and
+        # best-effort inside it (see utils/g3_metrics.py).
+        try:
+            from utils import g3_metrics
+            g3_metrics.log_metrics(scalar_dict, step)
+        except Exception:  # noqa: BLE001 - telemetry must never kill training
+            logging.exception("Datatables metric write failed (non-fatal)")
         if self.use_tb:
             self.writer.write_scalars(step, scalar_dict)
             

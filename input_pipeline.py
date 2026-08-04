@@ -3509,6 +3509,50 @@ def custom_collate_fn(batch):
     return collated
 
 
+def _worker_mp_context(num_workers):
+    """The multiprocessing context DataLoader workers must be started with.
+
+    None outside google3 (keep the platform default), `'absl_spawn'` inside it,
+    and this is NOT cosmetic:
+
+    * google3 patches **torch's** DataLoader to default to `absl_spawn`
+      (torch/utils/data/dataloader.py: "Default for g3 should be either
+      absl_forkserver or absl_spawn"), because `absl_spawn`'s Process subclass
+      wraps the worker body in its own `app.run` -- which is what gives the
+      child an InitGoogle(), and therefore a working `gfile`.
+    * **torchdata's `StatefulDataLoader` did not get that patch.** Its
+      `stateful_dataloader.py` still reads
+      `multiprocessing_context = multiprocessing` (the stdlib module) when the
+      caller passes none. The child then never runs `app.run`, and the first
+      `/cns/` open inside it CHECK-fails the worker:
+
+          F init_google.cc:1327] /cns/.../00099.tar: InitGoogle() has not
+          finished yet. See go/no_file_or_rpc_during_init
+
+      followed by "DataLoader worker (pid N) is killed by signal: Aborted".
+
+    jax_llava uses StatefulDataLoader whenever exact resume is on, i.e. in
+    every real training config, so without this the entire multi-worker data
+    path is dead on Borg -- and it dies as an abort inside a child, which reads
+    like a data corruption rather than a start-method problem.
+
+    `fork` is not an alternative: torch's google3 multiprocessing asserts on it
+    (go/python-tips/018) and forking after JAX has started deadlocks.
+    """
+    if num_workers <= 0 or not g3_env.in_google3():
+        return None
+    import torch.multiprocessing as torch_mp
+    try:
+        return torch_mp.get_context("absl_spawn")
+    except (ValueError, AssertionError) as exc:
+        # Better a clear message here than an abort in a child ten minutes in.
+        raise RuntimeError(
+            "num_workers>0 in google3 requires the 'absl_spawn' start method, "
+            f"which is unavailable ({exc}). The binary's entry point must be "
+            "g3_multiprocessing.handle_main(main), not app.run(main)."
+        ) from exc
+
+
 def worker_init_fn(worker_id, rank, data_seed_offset=0, topology=None):
     # FIRST, before anything can ask who this process is: install the topology
     # the parent captured. Under absl_spawn this worker is a re-exec with a
@@ -3757,6 +3801,9 @@ def create_split(config, batch_size, data_seed_offset=0):
         )
 
     loader_cls = StatefulDataLoader if stateful_loader else DataLoader
+    mp_context = _worker_mp_context(config.dataset.num_workers)
+    if mp_context is not None:
+        dl_kwargs["multiprocessing_context"] = mp_context
     loader = loader_cls(**dl_kwargs)
     return loader, tokenizer
 

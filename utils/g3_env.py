@@ -5,7 +5,7 @@ jax_llava was written for TPU VMs in GCP: compute sits in a zone like
 kept together by the `💣` placeholder in `utils/data_util.py`.
 
 Under google3 the same job runs on Borg. Compute sits in a *cell* (`go`),
-storage is Colossus (`/cns/go-d/...`), and the placeholder machinery has
+storage is Colossus (`/cns/<cell>-d/...`), and the placeholder machinery has
 nothing to substitute. This module is the translation layer, and it is
 deliberately the ONLY place that knows the mapping:
 
@@ -66,13 +66,29 @@ _METRO_TO_REGION = {
 
 # The CNS cell to write/read from, per metro. `<cell>-d` is the durable root.
 _METRO_TO_CNS_CELLS = {
-    "cmh": ("go-d", "yucmhcg-d"),
+    "cmh": ("yucmhcg-d",),
 }
 
-# Where the datasets were copied. Keyed by CNS cell root so a job in another
-# cmh cell picks its own replica rather than reaching across the metro.
+# Where the datasets live. Keyed by CNS cell root so a job in another cell of
+# the same metro picks its own replica rather than reaching across the metro.
+#
+# There is deliberately ONE cmh replica. A second copy existed on `go-d` and
+# was deleted, and the reason is worth keeping: Colossus quota is charged on
+# POST-REPLICATION disk bytes. That copy was written with the default `r=3.2`
+# (3-way replication, 3.0166x), so 199 GiB of cc12m occupied 598.7 GiB against
+# a 500 GiB per-user-per-cell disk limit -- the cell went over quota and every
+# write to it failed with "Poisoned file handle ... over Colossus bytes HDD
+# quota". The surviving replica is written `rs=9.4` (Reed-Solomon, 1.4505x =
+# 289 GiB) and fits comfortably. Same bytes, same shard count, 2.08x less disk.
+#
+# Do NOT add a root back as a "read-only fallback" unless its payload is
+# verified present: a fallback that resolves to an empty directory is worse
+# than no fallback, because it looks like a valid root and then yields a
+# partial stream. `cns_dataset_path()` additionally requires a _SUCCESS marker
+# for exactly this reason.
+#
+# Check with `fileutil quota qiaos <cell>` and `fileutil ls -le <path>`.
 _CNS_DATA_ROOTS = {
-    "go-d": "/cns/go-d/home/qiaos/data",
     "yucmhcg-d": "/cns/yucmhcg-d/home/qiaos/data",
 }
 
@@ -81,10 +97,7 @@ _CNS_DATA_ROOTS = {
 # acceptable. Gemma is absent on purpose: it comes from /tfhub/, which is
 # globally addressable and needs no replica choice.
 _CNS_MODEL_ROOTS = {
-    "cmh": (
-        "/cns/yucmhcg-d/home/qiaos/models",
-        "/cns/go-d/home/qiaos/models",
-    ),
+    "cmh": ("/cns/yucmhcg-d/home/qiaos/models",),
 }
 
 
@@ -112,7 +125,7 @@ def region_of_cell(cell):
 
 
 def cns_cells_for_zone(zone):
-    """The CNS cell roots (e.g. 'go-d') that are local to a jax_llava zone."""
+    """The CNS cell roots (e.g. 'yucmhcg-d') local to a jax_llava zone."""
     for metro, region in _METRO_TO_REGION.items():
         if region == zone:
             return _METRO_TO_CNS_CELLS.get(metro, ())
@@ -120,7 +133,7 @@ def cns_cells_for_zone(zone):
 
 
 def cns_cell_of_path(path):
-    """'/cns/go-d/home/...' -> 'go-d'. None for anything else."""
+    """'/cns/yucmhcg-d/home/...' -> 'yucmhcg-d'. None for anything else."""
     if not isinstance(path, str) or not path.startswith("/cns/"):
         return None
     rest = path[len("/cns/"):]
@@ -147,11 +160,49 @@ def cns_data_root(cell=None):
             f"local to it. Known cells: {sorted(_CELL_TO_METRO)}."
         )
     candidates = _METRO_TO_CNS_CELLS.get(metro, ())
-    for cns_cell in candidates:
-        root = _CNS_DATA_ROOTS.get(cns_cell)
-        if root:
-            return root
-    raise ValueError(f"No CNS data root registered for metro {metro!r}.")
+    roots = [_CNS_DATA_ROOTS[c] for c in candidates if c in _CNS_DATA_ROOTS]
+    if not roots:
+        raise ValueError(f"No CNS data root registered for metro {metro!r}.")
+    return roots[0]
+
+
+def cns_data_roots(cell=None):
+    """Every dataset root local to `cell`, in preference order.
+
+    A list rather than a single answer because completeness is a property of
+    the replica, not of the cell: the caller picks the first one that carries
+    its completion marker.
+    """
+    explicit = (os.environ.get("JAX_LLAVA_DATA_ROOT") or "").strip()
+    if explicit:
+        return (explicit.rstrip("/"),)
+    cell_override = (os.environ.get("JAX_LLAVA_CNS_CELL") or "").strip()
+    if cell_override:
+        root = _CNS_DATA_ROOTS.get(cell_override)
+        if root is None:
+            raise ValueError(
+                f"JAX_LLAVA_CNS_CELL={cell_override!r} has no registered data "
+                f"root. Known: {sorted(_CNS_DATA_ROOTS)}."
+            )
+        return (root,)
+    cell = cell or borg_cell()
+    if not cell:
+        raise ValueError(
+            "No Borg cell in the environment ($BORG_CELL / "
+            "$BORG_PHYSICAL_CELL); cannot choose a co-located data root. "
+            "Set JAX_LLAVA_CNS_CELL or JAX_LLAVA_DATA_ROOT for a local run."
+        )
+    metro = metro_of_cell(cell)
+    if metro is None:
+        raise ValueError(
+            f"Unknown Borg cell {cell!r}: refusing to guess which CNS cell is "
+            f"local to it. Known cells: {sorted(_CELL_TO_METRO)}."
+        )
+    roots = tuple(_CNS_DATA_ROOTS[c] for c in _METRO_TO_CNS_CELLS.get(metro, ())
+                  if c in _CNS_DATA_ROOTS)
+    if not roots:
+        raise ValueError(f"No CNS data root registered for metro {metro!r}.")
+    return roots
 
 
 def resolve_data_root():
@@ -159,7 +210,7 @@ def resolve_data_root():
 
     Order: `$JAX_LLAVA_DATA_ROOT` (a full path, for local debugging and for
     pointing a run at a replica), then `$JAX_LLAVA_CNS_CELL` (a cell root such
-    as `go-d`), then the Borg cell.
+    as `yucmhcg-d`), then the Borg cell.
     """
     explicit = (os.environ.get("JAX_LLAVA_DATA_ROOT") or "").strip()
     if explicit:

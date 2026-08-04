@@ -129,6 +129,15 @@ py_binary(
         # use_wandb defaults False, so it degrades safely -- but do not build
         # a metrics story on it.
         "//third_party/py/scamper:wandb_mock",
+        # The metric sink that actually stores anything. google3's wandb is a
+        # no-op mock, so utils/g3_metrics.py mirrors every write_scalars() into
+        # DeepMind Datatables through CLU, which backs
+        # http://datatable/xid/<XID>/data and http://flatboard/xid/<XID>.
+        # The `:notf` variant avoids pulling in TensorFlow *for CLU*; note the
+        # binary still contains TF, because flax.io runs on tensorflow.io.gfile
+        # and that is precisely why flax's latest_checkpoint reaches /cns/.
+        # CLU is //visibility:public, unlike the datatables client itself.
+        "//third_party/py/clu/metric_writers:notf",
     ],
 )
 

@@ -86,7 +86,7 @@ STATE_VERSION = 1
 # strict check should reject it rather than silently replay a different corpus.
 _REPLICA_DATA_BUCKET_RE = re.compile(
     r"^(gs://kmh-gcp-(?:us-central1|us-east5|asia-northeast1-b)/data"
-    r"|/cns/(?:go-d|yucmhcg-d)/home/qiaos/data)(/.*)?$"
+    r"|/cns/yucmhcg-d/home/qiaos/data)(/.*)?$"
 )
 _LOGICAL_DATA_BUCKET_PREFIX = "gs://kmh-gcp-<replica>/data"
 

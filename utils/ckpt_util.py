@@ -10,7 +10,7 @@ import orbax.checkpoint as ocp
 
 
 def _cns_cell(path):
-    """'/cns/go-d/home/x' -> 'go-d'. None for a non-CNS path."""
+    """'/cns/yucmhcg-d/home/x' -> 'yucmhcg-d'. None for a non-CNS path."""
     parts = str(path).split('/')
     return parts[2] if len(parts) > 3 and parts[1] == 'cns' else None
 

@@ -315,6 +315,13 @@ def main(argv):
       else:
         train.train_and_evaluate(FLAGS.config, FLAGS.workdir)
   finally:
+      # CLU's writer destructor CANCELS its background thread rather than
+      # draining it, so the last rows are lost unless we close it ourselves.
+      try:
+          from utils import g3_metrics
+          g3_metrics.close()
+      except Exception:  # noqa: BLE001
+          pass
       # The mirror flushes on a timer and on error tokens, but a clean exit or
       # an exception on the way out should not lose the last few lines.
       g3_logmirror.flush_logs()

@@ -216,7 +216,7 @@ dataset_name_to_type_dict = {
 # 150. Writing 01096 here would produce a shard list whose tail does not exist,
 # and a loader that resolves its list at startup treats that as data it will
 # never reach rather than as an error. Missing shards are configuration errors.
-# Verified with `fileutil ls /cns/go-d/home/qiaos/data/cc12m/`: 150 .tar,
+# Verified with `fileutil ls /cns/yucmhcg-d/home/qiaos/data/cc12m/`: 150 .tar,
 # 00000..00149, plus 150 _stats.json, manifest.jsonl and _SUCCESS.
 CNS_DATASET_RELPATHS = {
     'cc12m': 'cc12m/{00000..00149}.tar',
@@ -224,12 +224,35 @@ CNS_DATASET_RELPATHS = {
 
 
 def cns_dataset_path(name, data_root=None):
-    """CNS path for a dataset name, or None if it has no CNS replica."""
+    """CNS path for a dataset name, or None if it has no CNS replica.
+
+    Picks the first replica root that carries a `_SUCCESS` marker for this
+    dataset. Visible shards without the marker are PARTIAL data: a copy that
+    is still running, or one that hit a quota wall, leaves a directory that
+    lists fine and reads fine and is missing an unknown fraction of the
+    corpus. A loader resolves its shard list once at startup and will never
+    notice shards that appear later, so "looks present" is not good enough and
+    the answer cannot be cached from a previous run either.
+    """
     relpath = CNS_DATASET_RELPATHS.get(name)
     if relpath is None:
         return None
-    root = data_root if data_root else g3_env.resolve_data_root()
-    return f"{root.rstrip('/')}/{relpath}"
+    if data_root:
+        return f"{data_root.rstrip('/')}/{relpath}"
+
+    subdir = relpath.split('/', 1)[0]
+    tried = []
+    for root in g3_env.cns_data_roots():
+        marker = f"{root.rstrip('/')}/{subdir}/_SUCCESS"
+        if g3_env.cns_dir_exists(marker):
+            return f"{root.rstrip('/')}/{relpath}"
+        tried.append(marker)
+    raise FileNotFoundError(
+        f"No complete replica of {name!r}: no _SUCCESS marker at any of "
+        + ", ".join(tried)
+        + ". A directory of shards without its completion marker is partial "
+        "data. Set JAX_LLAVA_DATA_ROOT to override deliberately."
+    )
 
 
 def _resolve_one(name, zone: str):
