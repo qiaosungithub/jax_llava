@@ -246,6 +246,59 @@ def write_startup_marker(bucket, rank=None):
         return None
 
 
+def write_backend_marker(bucket, rank=None):
+    """Record the JAX backend and device list to CNS, as a durable file.
+
+    The expensive failure on a TPU job is not a crash, it is a SILENT CPU
+    fallback: `//third_party/py/jax` alone builds a CPU-only binary, and
+    google3 registers the TPU backend factory with `fail_quietly=True`, so a
+    missing `//learning/brain/research/jax:tpu_support` degrades to CPU with
+    nothing louder than a `logger.info`. XID 275525750 burned a v6p-16 for
+    2.5 h reporting `[CpuDevice(id=0)]` before the pruner reclaimed it for a
+    0.000 duty cycle.
+
+    `_assert_accelerator_backend()` already turns that into a loud early
+    death. This writes the same facts somewhere that survives the death, and
+    that is readable WITHOUT any Borg log access -- which on a restricted-LOAS
+    workstation is the only kind of evidence there is. Reading one small file
+    from CNS then answers "did it get real chips?" definitively.
+
+    Returns the path, or None. Never raises.
+    """
+    if not bucket:
+        return None
+    if rank is None:
+        rank = detect_task_rank()
+    path = f"{bucket.rstrip('/')}/logs/_backend_rank{rank}.txt"
+    try:
+        import jax  # local: this is only ever called after the backend is up
+
+        fields = {
+            "time": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            "rank": rank,
+            "default_backend": jax.default_backend(),
+            "process_index": jax.process_index(),
+            "process_count": jax.process_count(),
+            "device_count": jax.device_count(),
+            "local_device_count": jax.local_device_count(),
+            "local_devices": repr(jax.local_devices()),
+        }
+        for key in ("BORG_TASK_HANDLE", "BORG_CELL", "XM_XID"):
+            value = os.environ.get(key)
+            if value:
+                fields[key] = value
+        body = "".join(f"{k}={v}\n" for k, v in fields.items())
+        gfile = _gfile()
+        parent = f"{bucket.rstrip('/')}/logs"
+        if not gfile.Exists(parent):
+            gfile.MakeDirs(parent)
+        with gfile.Open(path, "w") as handle:
+            handle.write(body)
+        return path
+    except Exception:  # noqa: BLE001 - evidence must never block startup
+        return None
+
+
 def mirror_logs(bucket, rank=None):
     """Tee stdout+stderr into `<bucket>/logs/rank_<n>_attempt<k>.log`.
 

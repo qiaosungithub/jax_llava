@@ -449,6 +449,13 @@ def main(argv):
   _apply_env_config_overrides(FLAGS.config)
   log_for_0('JAX process: %d / %d', jax.process_index(), jax.process_count())
   log_for_0('JAX local devices: %r', jax.local_devices())
+  # Persist the backend/device list to CNS BEFORE asserting on it, so the
+  # evidence survives the assertion killing the task. A silent CPU fallback on
+  # a v5p-16 is the expensive failure here (see write_backend_marker), and on
+  # this workstation a file in the bucket is the only readable evidence.
+  if bucket:
+      backend_marker = g3_logmirror.write_backend_marker(bucket)
+      _boot_log("[backend-marker] %s", backend_marker or "FAILED to write")
   _assert_accelerator_backend()
 
   # `train` and the kNN eval declare LDC/PRC/PRI/GDC but leave them UNBOUND at
