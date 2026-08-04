@@ -154,6 +154,30 @@ _WDS_SOURCE = _install_webdataset_shim()
 # ---------------------------------------------------------------------------
 
 
+def _early_rank():
+    """Task index from $BORG_TASK_HANDLE, before absl/JAX are usable.
+
+    Borg's handle carries an OPTIONAL `logs.` prefix
+    (`logs.<task>.<job>.<user>.<uid>`, borg/borgletlib/go/borgletlib.go
+    `taskHandleRegexp`), so the naive `split(".")[0]` returns the literal
+    string "logs" -- which is how XID 277024519 wrote its marker to
+    `_prerun_ranklogs.txt`, and how all eight tasks would have written to ONE
+    file. Same bug `logging_util.detect_task_rank` already fixes; that
+    function is not importable this early, so the regex is repeated here
+    rather than the mistake.
+    """
+    import re as _re
+    handle = os.environ.get("BORG_TASK_HANDLE", "")
+    m = _re.match(r"^(?:logs\.)?(\d+)\.", handle or "")
+    if m:
+        return m.group(1)
+    for key in ("BORG_TASK_INDEX", "TASK_ID", "RANK"):
+        value = (os.environ.get(key) or "").strip()
+        if value.isdigit():
+            return value
+    return "x"
+
+
 def _report_import_crash(exc):
     """Persist an import-time traceback to CNS, best effort, never raising.
 
@@ -180,7 +204,7 @@ def _report_import_crash(exc):
     bucket = os.environ.get("CHECKPOINT_BUCKET", "").strip()
     if not bucket:
         return
-    rank = (os.environ.get("BORG_TASK_HANDLE", "").split(".", 1)[0] or "x")
+    rank = _early_rank()
     remote = f"{bucket.rstrip('/')}/logs/_import_crash_rank{rank}.txt"
     try:
         import subprocess
@@ -213,8 +237,8 @@ def _report_import_crash(exc):
         _boot_log("[import-crash] could NOT persist to %s: %r", remote, nested)
 
 
-def _pre_run_marker():
-    """Write `<bucket>/logs/_prerun_rank<N>.txt`, by subprocess. Never raises.
+def _pre_run_marker(stage="before_app_run"):
+    """Write `<bucket>/logs/_<stage>_rank<N>.txt`, by subprocess. Never raises.
 
     Deliberately shells out: this runs before `app.run()` and therefore before
     InitGoogle(), where touching /cns/ from in-process CHECK-fails and core
@@ -227,8 +251,9 @@ def _pre_run_marker():
     bucket = os.environ.get("CHECKPOINT_BUCKET", "").strip()
     if not bucket:
         return
-    rank = os.environ.get("BORG_TASK_HANDLE", "").split(".", 1)[0] or "x"
-    body = f"argv={sys.argv!r}\n"
+    rank = _early_rank()
+    body = f"stage={stage}\ntime={time.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
+    body += f"argv={sys.argv!r}\n"
     for key in ("BORG_TASK_HANDLE", "BORG_CELL", "XM_XID", "XM_WID",
                 "GOOGLEBASE", "TMPDIR", "PYTHONPATH", "HOSTNAME"):
         value = os.environ.get(key)
@@ -263,7 +288,7 @@ def _pre_run_marker():
                             env=child_env)
         cp = subprocess.run(
             ["fileutil", "cp", "-f", local,
-             f"{logs_dir}/_prerun_rank{rank}.txt"],
+             f"{logs_dir}/_{stage}_rank{rank}.txt"],
             capture_output=True, timeout=180, check=False, env=child_env)
         if cp.returncode:
             _boot_log("[pre-run marker] mkdir rc=%d %s | cp rc=%d %s",
@@ -482,6 +507,15 @@ def main(argv):
   if len(argv) > 1:
     raise app.UsageError('Too many command-line arguments.')
 
+  # Second subprocess marker: `main()` was ENTERED. Together with the
+  # pre-run marker this brackets `app.run()` itself -- the InitGoogle,
+  # flag-parsing and absl setup that happen between them, and which no
+  # in-process reporting can survive because a death there is often a SIGNAL
+  # (OOM kill, CHECK abort) that raises no Python exception at all. XID
+  # 277024519 left a prerun marker and no startup marker, which located the
+  # death in exactly this gap but could not say more.
+  _pre_run_marker(stage="entered_main")
+
   # A startup marker BEFORE anything else, including before the log mirror.
   # A task that dies in startup leaves no work-unit detail, no task log (it is
   # garbage-collected in minutes) and no mirror -- installing the mirror is
@@ -634,10 +668,21 @@ if __name__ == '__main__':
         # silently costs the whole run and tells nobody why.
         try:
             g3_multiprocessing.handle_main(main, **_run_kwargs)
-        except RuntimeError as exc:
-            if "binary path" not in str(exc):
-                raise
+        except SystemExit:
+            # app.run's normal exit path (including flag errors, which absl
+            # turns into SystemExit after printing usage). Let it through, but
+            # record it: a nonzero exit with no other trace is otherwise
+            # indistinguishable from a crash.
+            raise
+        except BaseException as exc:  # noqa: BLE001 - last chance to speak
+            # EVERY failure from here is reported, not just the one we suspect.
+            # The window between _pre_run_marker() and main()'s first line is
+            # pre-InitGoogle and has no mirror, and guessing which exception
+            # would show up is what left XID 277024519 with a prerun marker,
+            # no startup marker, and no explanation. Report first, then narrow.
             _report_import_crash(exc)
+            if not isinstance(exc, RuntimeError) or "binary path" not in str(exc):
+                raise
             _boot_log(
                 "[g3_mp] set_spawn_exe_path() could not find this binary "
                 "(argv[0]=%r, GOOGLEBASE=%r). Falling back to plain app.run; "
