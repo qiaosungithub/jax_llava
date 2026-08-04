@@ -196,6 +196,31 @@ py_binary(
     deps = [":main"],
 )
 
+# Auto-resume, proven against the REAL checkpoints before a launch.
+#
+# The workstation can only test the decision logic over a stubbed filesystem:
+# outside a Blaze binary `ckpt_util.FS` is not the gfile-backed one that runs
+# on Borg, and /cns/ is unreachable in-process. This target closes that gap --
+# same binary shape, same `_GfileFS`, same real checkpoint bytes -- and it
+# answers in seconds instead of a package + schedule + 5 min of imports.
+py_binary(
+    name = "g3_autoresume_probe",
+    srcs = ["tools/g3_autoresume_probe.py"],
+    data = glob(
+        [
+            "**/*.py",
+            "**/*.yml",
+            "**/*.yaml",
+            "**/*.json",
+        ],
+        exclude = ["tools/g3_autoresume_probe.py"],
+    ),
+    main = "tools/g3_autoresume_probe.py",
+    strict_deps = False,
+    tags = ["nostrictdeps"],
+    deps = [":main"],
+)
+
 # The CNS log mirror, tested directly and in SECONDS.
 #
 # On this workstation the mirror is the only readable log a Borg task leaves
