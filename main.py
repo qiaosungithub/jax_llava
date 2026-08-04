@@ -190,13 +190,89 @@ def _report_import_crash(exc):
                                          dir=os.environ.get("TMPDIR", "/tmp")) as tmp:
             tmp.write(body)
             local = tmp.name
+        # Sanitised env, same reason as _pre_run_marker: inheriting ours makes
+        # fileutil fail with "not monitor CDD state: cell='' and
+        # client='rpcacl_qiaos_main'" because the parent exports RPC/ACL and
+        # Colossus variables naming THIS process. That silently defeated the
+        # whole point of shelling out, and is why no _import_crash file ever
+        # appeared for XIDs 276859816 / 277010873 / 277019460.
+        child_env = {
+            k: v for k, v in os.environ.items()
+            if k in ("HOME", "USER", "PATH", "TMPDIR", "LANG", "LOGNAME")
+        }
         subprocess.run(["fileutil", "mkdir", "-p", f"{bucket.rstrip('/')}/logs"],
-                       capture_output=True, timeout=120, check=False)
+                       capture_output=True, timeout=120, check=False,
+                       env=child_env)
         done = subprocess.run(["fileutil", "cp", "-f", local, remote],
-                              capture_output=True, timeout=180, check=False)
-        _boot_log("[import-crash] wrote %s (rc=%d)", remote, done.returncode)
+                              capture_output=True, timeout=180, check=False,
+                              env=child_env)
+        _boot_log("[import-crash] wrote %s (rc=%d) %s", remote, done.returncode,
+                  (done.stderr or b"")[-300:].decode("utf-8", "replace")
+                  if done.returncode else "")
     except Exception as nested:  # noqa: BLE001 - reporting must never mask
         _boot_log("[import-crash] could NOT persist to %s: %r", remote, nested)
+
+
+def _pre_run_marker():
+    """Write `<bucket>/logs/_prerun_rank<N>.txt`, by subprocess. Never raises.
+
+    Deliberately shells out: this runs before `app.run()` and therefore before
+    InitGoogle(), where touching /cns/ from in-process CHECK-fails and core
+    dumps. `fileutil` is its own process with its own InitGoogle.
+
+    Costs one subprocess at startup and buys the difference between "the task
+    reached Python" and "the task never started", which on this workstation is
+    otherwise unknowable -- every Borg log path is closed by restricted LOAS.
+    """
+    bucket = os.environ.get("CHECKPOINT_BUCKET", "").strip()
+    if not bucket:
+        return
+    rank = os.environ.get("BORG_TASK_HANDLE", "").split(".", 1)[0] or "x"
+    body = f"argv={sys.argv!r}\n"
+    for key in ("BORG_TASK_HANDLE", "BORG_CELL", "XM_XID", "XM_WID",
+                "GOOGLEBASE", "TMPDIR", "PYTHONPATH", "HOSTNAME"):
+        value = os.environ.get(key)
+        if value:
+            body += f"{key}={value}\n"
+    try:
+        import subprocess
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(
+                "w", suffix=".txt", delete=False,
+                dir=os.environ.get("TMPDIR", "/tmp")) as tmp:
+            tmp.write(body)
+            local = tmp.name
+        logs_dir = f"{bucket.rstrip('/')}/logs"
+        # CNS has no implicit parent creation: `fileutil cp` into a missing
+        # directory fails with "no parent directory", so mkdir -p first. It is
+        # a no-op when the directory already exists.
+        # Run `fileutil` with a SANITISED environment. Inheriting ours makes
+        # it fail with
+        #   "not monitor CDD state: cell='' and client='rpcacl_qiaos_main'"
+        # -- the parent Blaze binary exports RPC/ACL and Colossus variables
+        # that name THIS process, and the child picks them up and tries to be
+        # us. Handing it a minimal env lets it do its own InitGoogle cleanly,
+        # which is the entire reason for shelling out in the first place.
+        child_env = {
+            k: v for k, v in os.environ.items()
+            if k in ("HOME", "USER", "PATH", "TMPDIR", "LANG", "LOGNAME")
+        }
+        mk = subprocess.run(["fileutil", "mkdir", "-p", logs_dir],
+                            capture_output=True, timeout=120, check=False,
+                            env=child_env)
+        cp = subprocess.run(
+            ["fileutil", "cp", "-f", local,
+             f"{logs_dir}/_prerun_rank{rank}.txt"],
+            capture_output=True, timeout=180, check=False, env=child_env)
+        if cp.returncode:
+            _boot_log("[pre-run marker] mkdir rc=%d %s | cp rc=%d %s",
+                      mk.returncode, (mk.stderr or b"")[-300:].decode(
+                          "utf-8", "replace"),
+                      cp.returncode, (cp.stderr or b"")[-300:].decode(
+                          "utf-8", "replace"))
+    except Exception:  # noqa: BLE001 - a marker must never block startup
+        pass
 
 
 try:
@@ -503,6 +579,19 @@ def main(argv):
 
 
 if __name__ == '__main__':
+    # A marker written BEFORE app.run, by subprocess, for the one window that
+    # has no other reporting.
+    #
+    # Everything between the module's last import and `main()`'s first line is
+    # pre-InitGoogle: the /cns/ API CHECK-fails if touched, so the in-process
+    # mirror cannot exist yet. Three XIDs (276859816, 277010873, 277019460)
+    # died in exactly this window -- FAILURE, empty status message, ~400 MiB
+    # peak, no bucket directory -- and left nothing at all to read. `fileutil`
+    # is a separate process with its own InitGoogle, so it can write where we
+    # cannot, and the presence or absence of this one file splits "died before
+    # app.run" from "died after" without any Borg log access.
+    _pre_run_marker()
+
     flags.mark_flags_as_required(['config', 'workdir'])
     # `known_only=True`: XManager passes JAX coordination flags this binary
     # does not declare, and an undeclared flag is otherwise fatal at startup.
@@ -517,4 +606,42 @@ if __name__ == '__main__':
         # then calls app.run itself. `fork` is not an option: torch's google3
         # multiprocessing asserts on it (go/python-tips/018) and forking after
         # JAX has started deadlocks.
-        g3_multiprocessing.handle_main(main, **_run_kwargs)
+        #
+        # WRAPPED, because this is the LAST unreported window. handle_main
+        # runs `set_spawn_exe_path()` BEFORE app.run, and that function ends
+        # in a bare `raise RuntimeError('Cannot determine binary path')` when
+        # none of its five heuristics finds the executable
+        # (pyglib/contrib/g3_multiprocessing/internal/g3_mp_lib.py:237). Every
+        # heuristic is a guess about argv[0] / $GOOGLEBASE / /proc/cmdline,
+        # and an MPM deployment on Borg does not have to look like a CitC
+        # blaze-bin run -- which is the difference between the local runs that
+        # work and the Borg runs that do not.
+        #
+        # Failing here is invisible in the worst way: it is before app.run, so
+        # before InitGoogle, before main(), before the CNS mirror, and before
+        # the startup marker. The task dies with an empty status message and
+        # is GC'd from the borgmaster in minutes. That is the exact signature
+        # observed on XIDs 276859816 (396 MiB), 277010873 (368 MiB) and
+        # 277019460 (408 MiB) -- three cells, two TPU generations, two
+        # allocations, no bucket directory ever created, and sibling EqR-jax
+        # jobs on the same cell running fine at 6-14 GB. EqR-jax is the
+        # control: it calls app.run directly and does not have this line.
+        #
+        # So: report it the only way available that early -- the subprocess
+        # `fileutil` path, which gets its own InitGoogle -- and then FALL BACK
+        # to plain app.run. The fallback costs only DataLoader workers
+        # (num_workers must then be 0); it does not cost the run. Dying
+        # silently costs the whole run and tells nobody why.
+        try:
+            g3_multiprocessing.handle_main(main, **_run_kwargs)
+        except RuntimeError as exc:
+            if "binary path" not in str(exc):
+                raise
+            _report_import_crash(exc)
+            _boot_log(
+                "[g3_mp] set_spawn_exe_path() could not find this binary "
+                "(argv[0]=%r, GOOGLEBASE=%r). Falling back to plain app.run; "
+                "DataLoader workers are unavailable in this process, so the "
+                "config must use num_workers=0.",
+                sys.argv[0], os.environ.get("GOOGLEBASE", ""))
+            app.run(main, **_run_kwargs)
