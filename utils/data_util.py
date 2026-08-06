@@ -225,6 +225,10 @@ dataset_name_to_type_dict = {
 # missing, zero size mismatch.
 CNS_DATASET_RELPATHS = {
     'cc12m': 'cc12m/{00000..01096}.tar',
+    # stage-2. 57 wds shards, verified per object against the go-d source in
+    # all three metros. The region_descriptions.json sidecar this loader also
+    # reads lives beside them under visual_genome/annotations/.
+    'visual-genome-det': 'visual_genome/wds/shard-{000000..000056}.tar',
 }
 
 

@@ -61,13 +61,22 @@ _ALLOWED_ZONE_BUCKETS = {
 
 
 def _region_desc_gcs_from_root(root_url: str) -> str:
-    """Derive the region_descriptions.json GCS path from the shard root URL.
+    """Derive the region_descriptions.json path from the shard root.
 
-    Real GCS layout:
-      gs://kmh-gcp-<zone>/data/visual_genome/wds/shard-000000.tar
-      gs://kmh-gcp-<zone>/data/visual_genome/annotations/region_descriptions.json
+    The sidecar always sits beside the shards, so it is derived from whatever
+    root the loader was actually given rather than from a hard-coded scheme:
+
+      <root>/wds/shard-000000.tar
+      <root>/annotations/region_descriptions.json
+
+    That holds for both layouts we use -- `gs://kmh-gcp-<zone>/data/visual_genome`
+    off Borg, and `/cns/<cell>/home/<user>/data/visual_genome` on it. Deriving
+    a `gs://` path while running on Borg is what made this fail: gfile has no
+    `gs://` scheme (that is `/bigstore/`), so the read died with NOT_FOUND on a
+    path that only ever existed off-cluster.
     """
-    base = root_url.split("/wds/")[0]   # "gs://bucket/data/visual_genome"
+    root = root_url[0] if isinstance(root_url, (list, tuple)) and root_url else root_url
+    base = str(root).split("/wds/")[0]
     return f"{base}/annotations/region_descriptions.json"
 
 
