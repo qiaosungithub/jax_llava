@@ -1028,6 +1028,16 @@ def _run_train_phase(
                 summary['curriculum_stage'] = int(config.training.curriculum_stage_index)
                 summary['stage_step'] = local_step + 1
             writer.write_scalars(step + 1, summary)
+            # Also emit the scalars to stdout. write_scalars reaches only the
+            # datatable, which is not readable once the job ends: the Borg task
+            # log is GC'd within minutes and is blocked by a corp credential
+            # from a workstation anyway, so a finished run leaves NO recoverable
+            # loss curve. stdout is mirrored to the checkpoint bucket and
+            # outlives the task, which is what makes a 15-hour stage-2 run
+            # comparable against the reference afterwards.
+            log_for_0('[metrics] ' + ' '.join(
+                f'{k}={v:.6g}' if isinstance(v, (int, float)) else f'{k}={v}'
+                for k, v in sorted(summary.items())))
             mu.sync_global_devices('log')
 
         log_vis_per_step = int(config.training.get('log_vis_per_step', -1))
