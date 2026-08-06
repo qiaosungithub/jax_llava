@@ -212,14 +212,19 @@ dataset_name_to_type_dict = {
 # (utils/g3_env.py owns the cell -> metro -> region -> root mapping).
 #
 # The shard RANGE is part of the entry, and it is the range that actually
-# exists on CNS -- not the GCS range. cc12m upstream has 1097 shards; we copied
-# 150. Writing 01096 here would produce a shard list whose tail does not exist,
-# and a loader that resolves its list at startup treats that as data it will
-# never reach rather than as an error. Missing shards are configuration errors.
-# Verified with `fileutil ls /cns/yucmhcg-d/home/qiaos/data/cc12m/`: 150 .tar,
-# 00000..00149, plus 150 _stats.json, manifest.jsonl and _SUCCESS.
+# exists on CNS -- not the GCS range. Writing a tail that is not there produces
+# a shard list a loader resolves once at startup and then never reaches, which
+# reads as data loss rather than as an error. Missing shards are configuration
+# errors.
+#
+# The full 1097-shard cc12m is now replicated in all three metros we schedule
+# in, every replica byte-identical to the single us-east5 crawl on go-d and
+# carrying its own _SUCCESS:
+#   is-d (cbf), nm-d (tul), li-d (lpp), plus the go-d (cmh) source.
+# Verified per object against go-d: 1097 .tar + 1097 _stats.json, zero
+# missing, zero size mismatch.
 CNS_DATASET_RELPATHS = {
-    'cc12m': 'cc12m/{00000..00149}.tar',
+    'cc12m': 'cc12m/{00000..01096}.tar',
 }
 
 

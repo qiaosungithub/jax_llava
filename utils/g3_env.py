@@ -71,6 +71,11 @@ _CELL_TO_METRO = {
     # "Cannot determine where this task is running".
     "oe": "tul",
     "nz": "cbf",
+    # v7 compute cells in the three metros the placement survey settled on.
+    # Without these a v7 task cannot resolve its own metro and refuses to run.
+    "yutulpz": "tul",
+    "yucbfiv": "cbf", "yucbful": "cbf", "yucbfwv": "cbf", "je": "cbf",
+    "yulpptr": "lpp",
     "rs": "dfw",
     "ej": "grq",
     "yuphxrp": "phx",
@@ -144,8 +149,12 @@ _METRO_TO_REGION = {
 # region is how a job ends up streaming 200 GiB across a continent.
 _METRO_TO_CNS_CELLS = {
     "cmh": ("go-d", "yucmhcg-d"),
-    "tul": ("oe-d",),
-    "cbf": ("nz-d",),
+    # is-d / nm-d / li-d hold the verified full replicas and come FIRST; the
+    # older cells stay as fallbacks because cns_dataset_path() requires a
+    # _SUCCESS marker anyway, so an empty one is skipped rather than used.
+    "tul": ("nm-d", "oe-d"),
+    "cbf": ("is-d", "nz-d"),
+    "lpp": ("li-d",),
     "dfw": ("rs-d",),
     "grq": ("ej-d",),
     "phx": ("yuphxrp-d",),
@@ -172,9 +181,19 @@ _METRO_TO_CNS_CELLS = {
 # 601 GiB (`r=3.2`, 3.0166x). Against a group ceiling that is an efficiency
 # question; against the personal one it is feasibility, and getting it wrong
 # once already poisoned a cell.
+#
+# cbf/tul/lpp were added once the full 1097-shard cc12m and the eval bundle
+# were replicated into each, every replica byte-identical to the single
+# us-east5 crawl staged on go-d and carrying its own _SUCCESS. These are the
+# three metros the v7 placement survey settled on
+# (wiki_agents/research/v7_storage_placement.md); cmh stays because the source
+# copy lives there and it still schedules.
 _CNS_DATA_ROOTS = {
     "go-d": "/cns/go-d/home/qiaos/data",
     "yucmhcg-d": "/cns/yucmhcg-d/home/qiaos/data",
+    "is-d": "/cns/is-d/home/qiaos/data",      # cbf, 69.1 PiB group, sp50
+    "nm-d": "/cns/nm-d/home/qiaos/data",      # tul, 44.0 PiB group, sp50
+    "li-d": "/cns/li-d/home/qiaos/data",      # lpp, 85.2 PiB group, sp50
 }
 
 # Pretrained third-party weights (CLIP). Unlike the dataset these are small and
@@ -189,6 +208,9 @@ _CNS_DATA_ROOTS = {
 _CNS_MODEL_ROOTS = {
     "cmh": ("/cns/go-d/home/qiaos/models",
             "/cns/yucmhcg-d/home/qiaos/models"),
+    "cbf": ("/cns/is-d/home/qiaos/models",),
+    "tul": ("/cns/nm-d/home/qiaos/models",),
+    "lpp": ("/cns/li-d/home/qiaos/models",),
 }
 
 
