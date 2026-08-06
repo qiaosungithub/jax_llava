@@ -72,7 +72,23 @@ def _region_desc_gcs_from_root(root_url: str) -> str:
 
 
 def _load_region_lookup(gcs_path: str, local_path: str = _REGION_DESC_LOCAL) -> dict:
-    """Download region_descriptions.json from GCS (once) and return {image_id: regions}."""
+    """Read region_descriptions.json (once) and return {image_id: regions}.
+
+    Under google3 this is read with `gfile`, for the same reason `_glob` uses
+    it: there is no `gcloud` binary on a Borg task -- shelling out to it fails
+    with `/bin/sh: gcloud: command not found` -- and the path may be `/cns/`,
+    which no gcloud-based route can reach at all. Outside google3 the original
+    shell-out still applies.
+    """
+    if g3_env.in_google3():
+        from google3.pyglib import gfile
+        log_for_0(f"[genome_gcap] Reading {gcs_path} via gfile ...")
+        with gfile.Open(gcs_path, "r") as f:
+            data = json.load(f)
+        lookup = {entry["id"]: entry["regions"] for entry in data}
+        log_for_0(
+            f"[genome_gcap] Loaded {len(lookup)} images with region annotations.")
+        return lookup
     if not os.path.exists(local_path):
         log_for_0(f"[genome_gcap] Downloading {gcs_path} -> {local_path} ...")
         r = subprocess.run(
