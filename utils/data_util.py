@@ -331,17 +331,22 @@ def _rewrite_bucket_to_cns(path: str):
     if not path.startswith('gs://') or i < 0:
         return None
     rel = path[i + len(marker):]
-    top = rel.split('/', 1)[0]
-    # Two layouts exist side by side: datasets we copied per-name sit directly
+    # Two layouts exist side by side: datasets copied per-name sit directly
     # under the data root, while the eval bundle was staged as one tree and
-    # kept the bucket's own 'data/' level (…/eval_bundle/data/mme/…). Try both
-    # rather than assuming, so a root resolves wherever its payload landed.
+    # kept the bucket's own 'data/' level (…/eval_bundle/data/mme/…).
+    #
+    # Probe the FULL relative path, not just its first component. The same
+    # dataset name can exist in both layouts holding different splits --
+    # data/vqav2 has train2014 while eval_bundle/data/vqav2 has val2014 -- so
+    # matching on the top-level directory picks the first tree that merely has
+    # the right name and then resolves to a split that is not there.
+    prefix = rel.split('*', 1)[0].split('{', 1)[0].rstrip('/')
+    probe = prefix if '.' not in prefix.rsplit('/', 1)[-1] else prefix.rsplit('/', 1)[0]
     for root in g3_env.cns_data_roots():
         for base_root in (root.rstrip('/'), f"{root.rstrip('/')}/eval_bundle/data"):
-            base = f"{base_root}/{top}"
             try:
                 from google3.pyglib import gfile
-                if gfile.Exists(base):
+                if gfile.Exists(f"{base_root}/{probe}"):
                     return f"{base_root}/{rel}"
             except Exception:  # pylint: disable=broad-except
                 continue
