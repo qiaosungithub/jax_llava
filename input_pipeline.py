@@ -2538,7 +2538,13 @@ def _expand_gcs_glob_if_needed(root):
             else:
                 urls.append(expanded)
         return urls
-    if not (isinstance(root, str) and root.startswith("gs://") and "*" in root):
+    # A glob has to be expanded on CNS too. The reader takes a concrete shard
+    # list, and a '/cns/.../shard-*.tar' handed through verbatim reaches the
+    # filesystem as a literal name -- "unexpected '*' at p 6". Only gs:// was
+    # expanded here because CNS replicas did not exist when this was written.
+    is_glob = isinstance(root, str) and "*" in root and (
+        root.startswith("gs://") or root.startswith("/cns/"))
+    if not is_glob:
         if isinstance(root, str) and "{" in root and "}" in root:
             return list(wds.shardlists.expand_urls(root))
         return root
@@ -2547,8 +2553,11 @@ def _expand_gcs_glob_if_needed(root):
         return list(_GCS_GLOB_CACHE[root])
 
     matches = sorted(_glob(root))
-    assert len(matches) > 0, f"No GCS files matched dataset glob: {root}"
-    urls = [m if str(m).startswith("gs://") else f"gs://{m}" for m in matches]
+    assert len(matches) > 0, f"No files matched dataset glob: {root}"
+    if root.startswith("/cns/"):
+        urls = [str(m) for m in matches]
+    else:
+        urls = [m if str(m).startswith("gs://") else f"gs://{m}" for m in matches]
     _GCS_GLOB_CACHE[root] = tuple(urls)
     log_for_0(f"Expanded GCS glob to {len(urls)} shards: {root}")
     return urls
