@@ -332,14 +332,19 @@ def _rewrite_bucket_to_cns(path: str):
         return None
     rel = path[i + len(marker):]
     top = rel.split('/', 1)[0]
+    # Two layouts exist side by side: datasets we copied per-name sit directly
+    # under the data root, while the eval bundle was staged as one tree and
+    # kept the bucket's own 'data/' level (…/eval_bundle/data/mme/…). Try both
+    # rather than assuming, so a root resolves wherever its payload landed.
     for root in g3_env.cns_data_roots():
-        base = f"{root.rstrip('/')}/{top}"
-        try:
-            from google3.pyglib import gfile
-            if gfile.Exists(base):
-                return f"{root.rstrip('/')}/{rel}"
-        except Exception:  # pylint: disable=broad-except
-            continue
+        for base_root in (root.rstrip('/'), f"{root.rstrip('/')}/eval_bundle/data"):
+            base = f"{base_root}/{top}"
+            try:
+                from google3.pyglib import gfile
+                if gfile.Exists(base):
+                    return f"{base_root}/{rel}"
+            except Exception:  # pylint: disable=broad-except
+                continue
     return None
 
 
@@ -587,3 +592,21 @@ def resolve_dataset_roots(config, zone):
     for _eval_root_key in ['mmvp_root', 'vstar_root', 'ocrbench_root', 'countbenchqa_root']:
         if config.eval.get(_eval_root_key, False) and '💣' in config.eval[_eval_root_key]:
             config.eval[_eval_root_key] = config.eval[_eval_root_key].replace('💣', zone)
+
+    # Point every eval root at the co-located CNS replica. The substitutions
+    # above only fill in the zone, leaving a gs:// URL, and on Borg that is
+    # opened through fsspec -- which needs gcsfs, absent in google3, so the
+    # first online eval kills the run with "Please install gcsfs". Done here in
+    # one sweep rather than per key: the list above is already fifteen
+    # near-identical branches and a new benchmark should not have to remember
+    # to add a sixteenth.
+    if g3_env.in_google3():
+        for _k in list(config.eval.keys()):
+            if not _k.endswith('_root'):
+                continue
+            _v = config.eval.get(_k, None)
+            if not isinstance(_v, str) or not _v.startswith('gs://'):
+                continue
+            _cns = _rewrite_bucket_to_cns(_v)
+            if _cns is not None:
+                config.eval[_k] = _cns
