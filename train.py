@@ -604,14 +604,16 @@ def run_p_sample_step(p_sample_step, model, tokenizer, params, images, prompt_id
     global_prefix_len = _local_array_to_global(prefix_len, mesh, batch_spec['prefix_len'])
 
     output = p_sample_step(params, global_images, global_prompt_ids, global_prefix_len)
-    # Fetch the GLOBAL array directly instead of reduce-scattering it to a
-    # host-local one. `global_array_to_host_local_array` requires each host's
-    # devices to form a contiguous subcube of the mesh, which a v7-32 (8 hosts
-    # x 4 chips over a 2x4x4 torus) does not satisfy -- it raises rather than
-    # falling back. These are a handful of token ids destined for a log line,
-    # so materialising them on every host is free; the sharded round-trip only
-    # ever existed to avoid moving a large array.
-    output = np.asarray(jax.device_get(output)).reshape(-1, output.shape[-1])
+    # Gather the sharded output with process_allgather rather than
+    # reduce-scattering it to a host-local array: that conversion requires each
+    # host's devices to form a contiguous subcube of the mesh, which a v7-32
+    # (8 hosts x 4 chips over a 2x4x4 torus) does not, and it raises rather
+    # than falling back. `device_get` is not an alternative -- it refuses an
+    # array spanning non-addressable devices. These are a few token ids bound
+    # for a log line, so gathering them on every host costs nothing.
+    output = np.asarray(
+        mu.process_allgather(output)
+    ).reshape(-1, output.shape[-1])
 
     def post_process(token_ids):
         indices = np.where(token_ids == tokenizer.special_tokens.EOS)[0]

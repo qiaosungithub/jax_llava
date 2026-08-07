@@ -563,14 +563,14 @@ def _extract_features_local(
             global_shape,
         )
         feats = p_encode(state_params, global_images)
-        # Pull the global array rather than reduce-scattering to host-local:
-        # that conversion requires each host's devices to form a contiguous
-        # subcube of the mesh, which a v7-32 does not, and it raises instead of
-        # falling back. Each host then keeps only its own slice, which is what
-        # the [:B] below already expressed.
+        # Gather with process_allgather, not reduce-scatter: the host-local
+        # conversion requires each host's devices to form a contiguous subcube
+        # of the mesh, which a v7-32 does not. `device_get` is not a substitute
+        # either -- it refuses an array spanning non-addressable devices. Each
+        # host then keeps its own slice, which is what the old [:B] expressed.
         D = feats.shape[-1]
         feature_dim = D
-        feats_all = np.array(jax.device_get(feats)).reshape(-1, D)
+        feats_all = np.asarray(mu.process_allgather(feats)).reshape(-1, D)
         start = jax.process_index() * B
         feats_np = feats_all[start:start + B]
 
