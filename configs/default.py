@@ -307,7 +307,9 @@ def get_config():
     eval.pope_prompt_template = "{question}\nPlease answer yes or no.\n"
     eval.mmbench_prompt_prefix = ""
     eval.pope_cache_dir = "/kmh-nfs-ssd-us-mount/data/cached/zhh/pope_eval"
-    eval.refcocog_root = "/kmh-nfs-ssd-us-mount/code/hanhong/shared/refcocog/val.json"
+    # Was an NFS path, unreadable on Borg. Stated as a bucket path so the
+    # gs:// -> CNS rewrite in data_util can resolve it to the replica.
+    eval.refcocog_root = "gs://kmh-gcp-💣/data/refcocog/val.json"
     eval.refcocog_image_root = "gs://kmh-gcp-💣/data/coco/train2014"
     eval.refcocog_cache_dir = "/kmh-nfs-ssd-us-mount/data/cached/zhh/refcocog_eval"
     eval.refcocog_iou_threshold = 0.5
