@@ -294,6 +294,20 @@ class LlavaGemma(nn.Module):
     def _cache_size(self, cache: PyTree) -> int:
         return cache[list(cache.keys())[0]]["k"].shape[1]
 
+    def _generation_cache_dtype(self, ref) -> jnp.dtype:
+        """dtype the KV cache must use, taken from the embeddings feeding it.
+
+        gemma writes the cache with `lax.dynamic_update_slice`, which demands
+        identical dtypes and raises instead of promoting. The projections
+        inherit their dtype from their input, so the token embeddings about to
+        be fed in are the honest reference -- a fixed bfloat16 was correct only
+        while params happened to be bfloat16.
+        """
+        dt = getattr(ref, "dtype", None)
+        if dt is not None and jnp.issubdtype(dt, jnp.floating):
+            return dt
+        return jnp.float32
+
     def _cache_dtype(self, cache: PyTree) -> jnp.dtype:
         return cache[list(cache.keys())[0]]["v"].dtype
 
@@ -670,9 +684,16 @@ class LlavaGemma(nn.Module):
         step_pos_init_txt = prefix_len[:, None]
         max_total_len = T_prompt + max_new_tokens + K
 
+        # The cache dtype must match what the attention projections actually
+        # produce, not a fixed choice: gemma updates the cache with
+        # `lax.dynamic_update_slice`, which requires identical dtypes and
+        # raises rather than promoting. Params load as float32 here, so
+        # hard-coding bfloat16 fails the moment generation runs -- which only
+        # happens once eval/sampling is enabled, i.e. in stage 2 and never in
+        # stage 1.
         cache = self.lm_backbone.init_cache(
             batch_size=B,
-            dtype=jnp.bfloat16,
+            dtype=self._generation_cache_dtype(token_embeds),
             cache_length=max_total_len,
         )
         cache_dtype = cache[list(cache.keys())[0]]["v"].dtype
@@ -1066,9 +1087,16 @@ class LlavaGemma(nn.Module):
         step_pos_init_txt = prefix_len[:, None]
         max_total_len = T_prompt + max_new_tokens + K
 
+        # The cache dtype must match what the attention projections actually
+        # produce, not a fixed choice: gemma updates the cache with
+        # `lax.dynamic_update_slice`, which requires identical dtypes and
+        # raises rather than promoting. Params load as float32 here, so
+        # hard-coding bfloat16 fails the moment generation runs -- which only
+        # happens once eval/sampling is enabled, i.e. in stage 2 and never in
+        # stage 1.
         cache = self.lm_backbone.init_cache(
             batch_size=B,
-            dtype=jnp.bfloat16,
+            dtype=self._generation_cache_dtype(token_embeds),
             cache_length=max_total_len,
         )
         cache_dtype = cache[list(cache.keys())[0]]["v"].dtype
