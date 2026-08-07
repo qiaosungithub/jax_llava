@@ -23,6 +23,7 @@ from evals.eval_mme import collate_fn
 from models.clip_vit import load_clip_vision_params
 from models.llava import LlavaGemma
 from models.paligemma_enc_dec import PaliGemmaEncDec
+from utils import g3_env
 from utils import vis_util
 from utils.ckpt_util import (
     checkpoint_step,
@@ -648,6 +649,44 @@ def _prepare_knn_if_needed(config, zone, tasks):
 COCO_VIS_ROOT = "/kmh-nfs-ssd-us-mount/code/hanhong/shared/COCO/val2014"
 
 
+def _coco_vis_root():
+    """Where the fixed COCO images are readable from, for this environment.
+
+    The NFS path above only exists on the GCP cluster. On Borg the images live
+    on the co-located CNS replica, and standard-library file APIs cannot see a
+    /cns/ path at all -- os.path.exists just answers False -- so both the
+    lookup and the read below have to go through gfile.
+    """
+    if not g3_env.in_google3():
+        return COCO_VIS_ROOT
+    for root in g3_env.cns_data_roots():
+        cand = f"{root.rstrip('/')}/COCO_val2014"
+        try:
+            from google3.pyglib import gfile
+            if gfile.Exists(cand):
+                return cand
+        except Exception:  # pylint: disable=broad-except
+            continue
+    return COCO_VIS_ROOT
+
+
+def _vis_open(path):
+    """Open an image path on whichever filesystem names it."""
+    if g3_env.in_google3() and path.startswith('/cns/'):
+        from google3.pyglib import gfile
+        import io as _io
+        with gfile.Open(path, 'rb') as f:
+            return Image.open(_io.BytesIO(f.read()))
+    return Image.open(path)
+
+
+def _vis_exists(path):
+    if g3_env.in_google3() and path.startswith('/cns/'):
+        from google3.pyglib import gfile
+        return gfile.Exists(path)
+    return os.path.exists(path)
+
+
 def _vis_batch_is_needed(config):
     """Whether any consumer of the fixed visualisation batch is enabled."""
     training = config.training
@@ -664,9 +703,9 @@ def _vis_batch_is_needed(config):
 
 def _coco_vis_available():
     try:
+        root = _coco_vis_root()
         return all(
-            os.path.exists(os.path.join(COCO_VIS_ROOT, name))
-            for name in FIXED_PAIRS
+            _vis_exists(os.path.join(root, name)) for name in FIXED_PAIRS
         )
     except OSError:
         return False
@@ -677,7 +716,7 @@ def _prepare_fixed_vis_batch(config, tokenizer):
     vis_pairs = [
         input_pipeline.preprocess_fn(
             {
-                'jpg': Image.open(os.path.join(COCO_VIS_ROOT, k)),
+                'jpg': _vis_open(os.path.join(_coco_vis_root(), k)),
                 'aux': {'gt': v},
             },
             transform=input_pipeline.get_transforms(
