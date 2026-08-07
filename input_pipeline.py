@@ -142,15 +142,23 @@ def register_gcsfs():
         gopen_module = importlib.import_module("webdataset.gopen")
 
         def gopen_gcsfs(url, mode="rb", bufsize=8192, **kwargs):
-            # Reaching here on Borg means some root escaped the gs:// -> CNS
-            # rewrite: fsspec would need gcsfs, which google3 does not ship, so
-            # the worker dies with a bare ModuleNotFoundError naming no path.
-            # Name the offending URL instead -- the traceback alone cost hours.
+            # On Borg a gs:// URL is unreadable: fsspec would need gcsfs, which
+            # google3 does not ship, and the failure is a bare
+            # ModuleNotFoundError naming no path. Redirect to the co-located
+            # replica here, at the last point every shard passes through --
+            # roots are assembled in several modules and not all of them go
+            # through data_util's resolution, so catching it earlier keeps
+            # missing one more caller.
             if g3_env.in_google3():
-                raise RuntimeError(
-                    f"webdataset asked to open a gs:// URL on Borg: {url!r}. "
-                    "Every shard root must resolve to /cns/ here; this one did "
-                    "not, so fix its resolution rather than installing gcsfs.")
+                from utils.data_util import _rewrite_bucket_to_cns
+                cns = _rewrite_bucket_to_cns(url)
+                if cns is None:
+                    raise RuntimeError(
+                        f"gs:// shard on Borg with no CNS replica: {url!r}. "
+                        "Copy it to the replica or fix its resolution; gcsfs "
+                        "is not installable here.")
+                from google3.pyglib import gfile
+                return gfile.Open(cns, mode)
             return fsspec.open(url, mode=mode).open()
 
         gopen_module.gopen_schemes["gs"] = gopen_gcsfs
