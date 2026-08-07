@@ -380,10 +380,23 @@ def restore_dataloader_state(train_loader, config, load_from, zone, expected_ste
     saved_compare = _topology_compare_payload(saved_topology)
     expected_compare = _topology_compare_payload(expected_topology)
     if saved_compare != expected_compare:
-        raise ValueError(
-            "Dataloader topology changed; exact stateful resume is not valid. "
-            f"saved={saved_topology}, current={expected_topology}"
+        # A changed topology means the saved sampler position describes a
+        # different stream, so it cannot be replayed. Under strict resume that
+        # is an error. But it is also the NORMAL case at a curriculum stage
+        # boundary -- stage 2 reads a different dataset mix than stage 1, so
+        # its state legitimately does not apply -- and there the right
+        # behaviour is to start the new stage's sampler fresh rather than
+        # refuse to run.
+        if stateful_dataloader_strict(config):
+            raise ValueError(
+                "Dataloader topology changed; exact stateful resume is not "
+                f"valid. saved={saved_topology}, current={expected_topology}"
+            )
+        log_for_0(
+            "Dataloader topology differs from the saved state (expected at a "
+            "stage boundary); continuing without exact loader resume."
         )
+        return False
     prefix_remap = _build_replica_prefix_remap(
         saved_topology.get("roots", []),
         expected_topology.get("roots", []),
