@@ -2558,6 +2558,18 @@ def _expand_gcs_glob_if_needed(root):
             return list(wds.shardlists.expand_urls(root))
         return root
 
+    # Last-resort rewrite: a gs:// root that reached here escaped the
+    # resolution in data_util (the OV1.5 grouped aliases build their paths in
+    # their own module and not every route passes through _resolve_one). On
+    # Borg the expansion below would then list a bucket we cannot read, so
+    # redirect to the co-located replica first and expand that instead.
+    if g3_env.in_google3() and root.startswith("gs://"):
+        from utils.data_util import _rewrite_bucket_to_cns
+        _cns = _rewrite_bucket_to_cns(root)
+        if _cns is not None:
+            log_for_0(f"Redirected shard root to the CNS replica: {root} -> {_cns}")
+            root = _cns
+
     if root in _GCS_GLOB_CACHE:
         return list(_GCS_GLOB_CACHE[root])
 
