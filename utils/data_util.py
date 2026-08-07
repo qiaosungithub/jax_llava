@@ -264,13 +264,26 @@ def cns_dataset_path(name, data_root=None):
     if data_root:
         return f"{data_root.rstrip('/')}/{relpath}"
 
-    subdir = relpath.split('/', 1)[0]
+    # Where the marker sits depends on who wrote it. Datasets we copied
+    # ourselves carry one at the dataset's top level (cc12m/_SUCCESS); the
+    # stage-2 sources carry the UPSTREAM marker beside their shards, several
+    # levels down (vqav2/vqav2_image_records_wds/train2014/_SUCCESS). Accept
+    # either: check the directory the shards actually live in first, then walk
+    # back up to the dataset root. Requiring one fixed level rejects a replica
+    # that is in fact complete.
+    shard_dir = relpath.rsplit('/', 1)[0] if '/' in relpath else relpath
+    candidates = []
+    parts = shard_dir.split('/')
+    while parts:
+        candidates.append('/'.join(parts))
+        parts.pop()
     tried = []
     for root in g3_env.cns_data_roots():
-        marker = f"{root.rstrip('/')}/{subdir}/_SUCCESS"
-        if g3_env.cns_dir_exists(marker):
-            return f"{root.rstrip('/')}/{relpath}"
-        tried.append(marker)
+        for sub in candidates:
+            marker = f"{root.rstrip('/')}/{sub}/_SUCCESS"
+            if g3_env.cns_dir_exists(marker):
+                return f"{root.rstrip('/')}/{relpath}"
+            tried.append(marker)
     raise FileNotFoundError(
         f"No complete replica of {name!r}: no _SUCCESS marker at any of "
         + ", ".join(tried)
