@@ -612,7 +612,7 @@ def run_p_sample_step(p_sample_step, model, tokenizer, params, images, prompt_id
     # array spanning non-addressable devices. These are a few token ids bound
     # for a log line, so gathering them on every host costs nothing.
     output = np.asarray(
-        mu.process_allgather(output)
+        mu.process_allgather(output, tiled=True)
     ).reshape(-1, output.shape[-1])
 
     def post_process(token_ids):

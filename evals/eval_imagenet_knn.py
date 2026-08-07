@@ -570,7 +570,8 @@ def _extract_features_local(
         # host then keeps its own slice, which is what the old [:B] expressed.
         D = feats.shape[-1]
         feature_dim = D
-        feats_all = np.asarray(mu.process_allgather(feats)).reshape(-1, D)
+        feats_all = np.asarray(
+            mu.process_allgather(feats, tiled=True)).reshape(-1, D)
         start = jax.process_index() * B
         feats_np = feats_all[start:start + B]
 
