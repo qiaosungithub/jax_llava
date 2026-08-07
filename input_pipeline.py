@@ -142,6 +142,15 @@ def register_gcsfs():
         gopen_module = importlib.import_module("webdataset.gopen")
 
         def gopen_gcsfs(url, mode="rb", bufsize=8192, **kwargs):
+            # Reaching here on Borg means some root escaped the gs:// -> CNS
+            # rewrite: fsspec would need gcsfs, which google3 does not ship, so
+            # the worker dies with a bare ModuleNotFoundError naming no path.
+            # Name the offending URL instead -- the traceback alone cost hours.
+            if g3_env.in_google3():
+                raise RuntimeError(
+                    f"webdataset asked to open a gs:// URL on Borg: {url!r}. "
+                    "Every shard root must resolve to /cns/ here; this one did "
+                    "not, so fix its resolution rather than installing gcsfs.")
             return fsspec.open(url, mode=mode).open()
 
         gopen_module.gopen_schemes["gs"] = gopen_gcsfs
