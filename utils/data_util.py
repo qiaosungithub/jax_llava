@@ -229,6 +229,21 @@ CNS_DATASET_RELPATHS = {
     # all three metros. The region_descriptions.json sidecar this loader also
     # reads lives beside them under visual_genome/annotations/.
     'visual-genome-det': 'visual_genome/wds/shard-{000000..000056}.tar',
+    # The rest of the stage-2 SFT mix. Ranges are the shards that actually
+    # exist on CNS, read off the replica -- a range whose tail is missing is
+    # resolved once at loader startup and then silently never reached.
+    'vqav2':          'vqav2/vqav2_image_records_wds/train2014/shard-{000000..000008}.tar',
+    'okvqa-train':    'okvqa/train/shard-{000000..000004}.tar',
+    'aokvqa-train':   'aokvqa/train/shard-{000000..000008}.tar',
+    'ocrvqa-train':   'ocrvqa/train/shard-{000000..000083}.tar',
+    'gqa-train':      'vlm_eval_benchmarks/gqa-balanced/train/shard-{000000..000036}.tar',
+    'refcoco-train':  'refcoco/train/shard-{000000..000008}.tar',
+    'refcocog-train': 'refcocog/image_records_wds/train/shard-{000000..000010}.tar',
+    'pixmo-cap-qa':   'pixmo-cap-qa/image_records_wds/train/shard-{000000..000093}.tar',
+    'pixmo-count':    'pixmo-count/image_records_wds/train/shard-{000000..000018}.tar',
+    # Irregular names (shard-<hex>-NNNNNN.tar), so a glob rather than a range.
+    'openimages-relationship-train':
+        'openimages-relationships/image_records_wds/train/shard-*.tar',
 }
 
 
@@ -276,8 +291,43 @@ def _resolve_one(name, zone: str):
     if name in dataset_name_to_path_dict:
         return _resolve_one(dataset_name_to_path_dict[name], zone)
     if '💣' in name:
-        return name.replace('💣', zone)
+        resolved = name.replace('💣', zone)
+        # Grouped aliases (OV1.5) reach here as already-expanded bucket paths
+        # rather than as dataset names, so the CNS_DATASET_RELPATHS lookup
+        # above never sees them. Rewrite the bucket prefix onto the co-located
+        # replica when one exists; on Borg a gs:// path is unreadable anyway
+        # (gfile has no gs:// scheme -- that is /bigstore/), so leaving it
+        # would fail at open time rather than here.
+        if g3_env.in_google3():
+            cns = _rewrite_bucket_to_cns(resolved)
+            if cns is not None:
+                return cns
+        return resolved
     return name
+
+
+def _rewrite_bucket_to_cns(path: str):
+    """`gs://kmh-gcp-<zone>/data/X/...` -> `<cns data root>/X/...`, or None.
+
+    Returns None when the payload is not present under any registered CNS data
+    root, so the caller can keep the original path and fail loudly at open
+    time instead of silently reading nothing.
+    """
+    marker = '/data/'
+    i = path.find(marker)
+    if not path.startswith('gs://') or i < 0:
+        return None
+    rel = path[i + len(marker):]
+    top = rel.split('/', 1)[0]
+    for root in g3_env.cns_data_roots():
+        base = f"{root.rstrip('/')}/{top}"
+        try:
+            from google3.pyglib import gfile
+            if gfile.Exists(base):
+                return f"{root.rstrip('/')}/{rel}"
+        except Exception:  # pylint: disable=broad-except
+            continue
+    return None
 
 
 def _item_name_and_type(item):
