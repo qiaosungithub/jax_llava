@@ -241,9 +241,29 @@ CNS_DATASET_RELPATHS = {
     'refcocog-train': 'refcocog/image_records_wds/train/shard-{000000..000010}.tar',
     'pixmo-cap-qa':   'pixmo-cap-qa/image_records_wds/train/shard-{000000..000093}.tar',
     'pixmo-count':    'pixmo-count/image_records_wds/train/shard-{000000..000018}.tar',
-    # Irregular names (shard-<hex>-NNNNNN.tar), so a glob rather than a range.
-    'openimages-relationship-train':
-        'openimages-relationships/image_records_wds/train/shard-*.tar',
+    # Irregular names (shard-<hex>-NNNNNN.tar). Stated as explicit ranges,
+    # NOT a glob: the dataloader's topology signature records the configured
+    # roots verbatim, so a glob that is expanded at load time changes the
+    # signature and invalidates every checkpoint written before the
+    # expansion existed. Ranges are stable across that change.
+    'openimages-relationship-train': [
+        'openimages-relationships/image_records_wds/train/shard-0-{000000..000008}.tar',
+        'openimages-relationships/image_records_wds/train/shard-1-{000000..000006}.tar',
+        'openimages-relationships/image_records_wds/train/shard-2-{000000..000006}.tar',
+        'openimages-relationships/image_records_wds/train/shard-3-{000000..000006}.tar',
+        'openimages-relationships/image_records_wds/train/shard-4-{000000..000006}.tar',
+        'openimages-relationships/image_records_wds/train/shard-5-{000000..000006}.tar',
+        'openimages-relationships/image_records_wds/train/shard-6-{000000..000006}.tar',
+        'openimages-relationships/image_records_wds/train/shard-7-{000000..000006}.tar',
+        'openimages-relationships/image_records_wds/train/shard-8-{000000..000007}.tar',
+        'openimages-relationships/image_records_wds/train/shard-9-{000000..000006}.tar',
+        'openimages-relationships/image_records_wds/train/shard-a-{000000..000006}.tar',
+        'openimages-relationships/image_records_wds/train/shard-b-{000000..000006}.tar',
+        'openimages-relationships/image_records_wds/train/shard-c-{000000..000006}.tar',
+        'openimages-relationships/image_records_wds/train/shard-d-{000000..000006}.tar',
+        'openimages-relationships/image_records_wds/train/shard-e-{000000..000006}.tar',
+        'openimages-relationships/image_records_wds/train/shard-f-{000000..000006}.tar'
+    ],
 }
 
 
@@ -261,6 +281,16 @@ def cns_dataset_path(name, data_root=None):
     relpath = CNS_DATASET_RELPATHS.get(name)
     if relpath is None:
         return None
+    # A dataset whose shards do not fit one range is listed as several. Resolve
+    # each against the same root so the caller sees one flat list of concrete
+    # paths, never a glob -- see the openimages entry for why that matters.
+    if isinstance(relpath, (list, tuple)):
+        return [cns_dataset_path_for_relpath(r, name, data_root) for r in relpath]
+    return cns_dataset_path_for_relpath(relpath, name, data_root)
+
+
+def cns_dataset_path_for_relpath(relpath, name, data_root=None):
+    """Resolve one relative shard spec against the first complete replica."""
     if data_root:
         return f"{data_root.rstrip('/')}/{relpath}"
 
