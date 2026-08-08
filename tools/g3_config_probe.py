@@ -18,6 +18,92 @@ _CONFIG = flags.DEFINE_string('config_mode', 'g3_smoke', 'configs/<mode>_config.
 _ZONE = flags.DEFINE_string('zone', 'us-east5', 'jax_llava zone.')
 
 
+def _exists(path) -> bool:
+    """True if `path` is really there, asked of whatever filesystem owns it."""
+    from utils import g3_env
+    if str(path).startswith(('/cns/', '/bigstore/')):
+        return g3_env.cns_dir_exists(str(path))
+    return os.path.exists(str(path))
+
+
+def _runtime_target(url):
+    """The path this shard will REALLY be opened from, or None if unreadable.
+
+    A gs:// root is not itself a failure on Borg: input_pipeline's webdataset
+    opener rewrites to the co-located replica at the last hop, deliberately,
+    because shard roots are assembled in several modules and not all of them
+    pass through data_util's resolution. So the honest check is the one the
+    opener performs -- rewrite, then confirm the target exists -- and NOT
+    "does this string start with gs://", which would condemn a path that works.
+    """
+    url = str(url)
+    if url.startswith('gs://'):
+        from utils.data_util import _rewrite_bucket_to_cns
+        url = _rewrite_bucket_to_cns(url) or ''
+        if not url:
+            return None
+    return url if _exists(url) else None
+
+
+def _probe_eval_roots(config, tasks):
+    """Every `*_root` the eval tasks will open, checked before a launch.
+
+    The final eval runs once, after 57 hours. A root that still says gs:// or
+    points at nothing is invisible until then, which is the most expensive
+    moment to discover it.
+
+    Only roots belonging to an ENABLED task are fatal. `default.py` declares
+    roots for benchmarks no config runs (scienceqa_img, vizwiz), whose data was
+    never copied because nothing asks for it -- failing on those would be the
+    probe inventing work rather than reporting risk.
+    """
+    print("\n--- eval roots ---")
+    # A root belongs to a task if the task name appears in the key, modulo the
+    # spelling drift between config keys and task names.
+    aliases = {'seed_bench': 'seed_bench', 'knn_full': 'imagenet',
+               'mmvp': 'pixelbench', 'vstar': 'pixelbench',
+               'ocrbench': 'pixelbench', 'countbenchqa': 'pixelbench'}
+    wanted = {aliases.get(t, t) for t in tasks}
+    n_bad = 0
+    for key in sorted(k for k in config.eval.keys() if k.endswith('_root')):
+        value = config.eval[key]
+        if not isinstance(value, str) or not value:
+            continue
+        stem = key[:-len('_root')].replace('_image', '').replace('_test', '')
+        used = any(stem.startswith(w) or w.startswith(stem) for w in wanted)
+        if not used:
+            print(f"  {'(unused)':<16} {key:<28} {value}")
+            continue
+        if value.startswith(('http://', 'https://')):
+            status, n_bad = 'HTTP(no egress)', n_bad + 1
+        elif value.startswith('gs://'):
+            status, n_bad = 'GS://', n_bad + 1
+        elif value.startswith('/kmh-nfs'):
+            status, n_bad = 'NFS(absent)', n_bad + 1
+        elif value.startswith('/cns/'):
+            probe = value.split('*', 1)[0].split('{', 1)[0].rstrip('/')
+            status = 'OK' if _exists(probe) else 'MISSING'
+            n_bad += status == 'MISSING'
+        else:
+            status = 'unused' if value == 'unused_for_image_records_wds' else '?'
+        print(f"  {status:<16} {key:<28} {value}")
+    return n_bad
+
+
+def _probe_knn(config):
+    """The TFDS ImageNet data_dir, resolved the way the eval will resolve it."""
+    print("\n--- knn ---")
+    from evals.eval_imagenet_knn import ensure_imagenet_available
+    try:
+        data_dir = ensure_imagenet_available('unused-on-borg',
+                                             local_debug=config.local_debug)
+        print(f"  OK               imagenet TFDS data_dir: {data_dir}")
+        return 0
+    except Exception as e:  # noqa: BLE001 -- reporting, not handling
+        print(f"  FAIL             {type(e).__name__}: {e}")
+        return 1
+
+
 def main(argv):
     del argv
     from configs import load_config
@@ -39,6 +125,7 @@ def main(argv):
     print(f"lm_backbone       : {config.model.lm_backbone_str} "
           f"({config.model.lm_checkpoint_variant})")
 
+    resolved_stage = None
     for stage_key in ('stage1', 'stage2'):
         stage = train._build_curriculum_stage_config(
             config, stage_key,
@@ -52,15 +139,37 @@ def main(argv):
         print(f"  num_workers  : {stage.dataset.num_workers}")
         print(f"  max_txt_len  : {stage.dataset.max_txt_len}")
         print(f"  freeze_lm    : {stage.training.get('freeze_lm')}")
-        print(f"  roots        : {list(stage.dataset.root)}")
         print(f"  types        : {list(stage.dataset.types)}")
         print(f"  mix_weights  : {list(stage.dataset.get('mix_weights', []))}")
         input_pipeline._assert_same_zone_roots(
             stage.dataset.root, _ZONE.value, local_debug=False)
         print("  locality guard: PASS")
-        urls = input_pipeline._expand_gcs_glob_if_needed(list(stage.dataset.root)[0])
-        urls = [urls] if isinstance(urls, str) else list(urls)
-        print(f"  shards       : {len(urls)}  [{urls[0]} .. {urls[-1]}]")
+
+        # EVERY root, expanded and existence-checked -- not just root[0].
+        # A 12-source mix resolves twelve different ways, and the previous
+        # version proved only the first one; the eleven behind it then failed
+        # one remote launch at a time. Each remote attempt costs ~10 minutes
+        # and this loop costs seconds.
+        n_bad = 0
+        for name, root in zip(stage.dataset.get('resolved_names', []),
+                              list(stage.dataset.root)):
+            urls = input_pipeline._expand_gcs_glob_if_needed(root)
+            urls = [urls] if isinstance(urls, str) else list(urls)
+            # Sample the ends, not the middle: a truncated copy loses its tail,
+            # and a wrong root loses its head.
+            sample = urls[:2] + urls[-2:]
+            bad = [u for u in sample if _runtime_target(u) is None]
+            n_gs = sum(1 for u in urls if str(u).startswith('gs://'))
+            status = 'OK' if not n_gs else f'OK(gs->cns {n_gs})'
+            if not urls:
+                status, n_bad = 'EMPTY', n_bad + 1
+            elif bad:
+                status, n_bad = f'UNREADABLE {bad[0]}', n_bad + 1
+            print(f"    {status:<18} {name:<34} {len(urls):>5} shards  "
+                  f"{_runtime_target(urls[0]) or urls[0] if urls else root}")
+        if n_bad:
+            raise SystemExit(f"{n_bad} unusable dataset root(s) in {stage_key}")
+        resolved_stage = stage
 
     print("\n--- weights ---")
     from models import clip_vit
@@ -75,6 +184,17 @@ def main(argv):
     if bucket:
         print(f"  convert_to_gs('/tmp/wd') -> {ckpt_util.convert_to_gs('/tmp/wd')}")
         print(f"  pretrained path          -> {ckpt_util.convert_to_pretrained_gs('/tmp/wd')}")
+
+    tasks = set()
+    for scope in (config.training, resolved_stage.training):
+        for key in ('online_eval_tasks', 'final_eval_tasks'):
+            tasks.update(scope.get(key, []) or [])
+    print(f"\neval tasks enabled: {sorted(tasks)}")
+    n_bad = _probe_eval_roots(resolved_stage, tasks)
+    if 'knn_full' in tasks or 'knn_partial' in tasks:
+        n_bad += _probe_knn(config)
+    if n_bad:
+        raise SystemExit(f"{n_bad} unusable eval root(s) / knn failure")
 
     print("\nCONFIG PROBE PASSED")
 

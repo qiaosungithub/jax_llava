@@ -13,6 +13,13 @@
 #   online_eval_tasks    -> exercises the eval shard listing on CNS
 #   final_eval_tasks     -> exercises the end-of-run eval path
 #
+# The eval lists and the stage-2 mix are the PRODUCTION ones from
+# remote_run_config, not a reduced set. A smoke whose surface is narrower than
+# the run it gates cannot gate it: the whole reason stage 2 failed one launch
+# at a time was that each attempt only reached the next unexercised path.
+# Every source and every benchmark is touched here, for 2 steps instead of
+# 75000.
+#
 # Verdict is not "exit 0": check that $CHECKPOINT_BUCKET holds viz/ with PNGs
 # and that the eval metrics appear in the log.
 # It is deliberately a CURRICULUM config with stage2 present, because the
@@ -83,11 +90,13 @@ training:
     checkpoint_per_step: 5
     log_vis_per_step: 5
     online_eval_per_step: 5
-    # Two cheap benchmarks: vqav2 reads a wds shard tree, mme reads parquet --
-    # different listing code, so both are worth covering. The heavyweight ones
-    # (knn_full, mmbench) are deliberately out; they add minutes, not coverage.
-    online_eval_tasks: [vqav2, mme]
-    final_eval_tasks: [vqav2, mme, pope]
+    # The production lists, verbatim from remote_run_config's stage2. knn_full
+    # and mmbench are IN: both were the reason a previous smoke passed while
+    # the real run would have died at its final eval -- knn reads TFDS
+    # ImageNet, mmbench a TSV that used to be fetched over HTTPS, and neither
+    # is reachable on Borg by the code paths the GCP cluster used.
+    online_eval_tasks: [vqav2, mme, textvqa, pope, refcocog, mmvp, vstar, ocrbench, countbenchqa]
+    final_eval_tasks: [vqav2, mme, textvqa, pope, mmbench, knn_full, refcocog, mmvp, vstar, ocrbench, countbenchqa, gqa, seed_bench, cambrian_cvbench, vlms_are_blind, docvqa, realworldqa]
     lr_schedule: cos
     seed: 42
 
@@ -143,14 +152,44 @@ training:
             cfg_loss_weight: 0.0
             alpha: 0.0
         dataset:
-            max_txt_len: 160
-            num_workers: 2
-        # Stage 2's real mix is 12 sources that are NOT on CNS yet. The smoke
-        # reuses cc12m so the boundary transition itself can be tested without
-        # blocking on a data copy; it is not a meaningful stage-2 recipe.
+            # 512, as production. Sequence length sets the compiled shapes and
+            # the memory high-water mark, so a smoke at 160 proves neither.
+            max_txt_len: 512
+            # Production uses 8. absl_spawn re-execs the ~2.4 GB binary per
+            # worker, and 12 sources at 8 workers is the slow part of a 2-step
+            # run -- 4 still fans out over the grouped loader.
+            num_workers: 4
+            # The grouped OV1.5 loader and its stationary mixture, verbatim
+            # from remote_run_config: it fans one dataset_item out to ~34
+            # sources, which is where the shard-root assembly that kept
+            # producing gs:// paths on Borg actually lives.
+            llava_ov15_min_shards_standalone: 64
+            expand_conversations_at_fill: True
+            llava_ov15_weight_basis: questions
+            weighted_item_shuffle_size:
+                enabled: True
+                include_types: [llava_ov15]
+                total: 131072
+                min: 1024
+                max: 262144
+        # The production 12-source SFT mix, all of it now on CNS. Reusing
+        # cc12m here (as this smoke first did) exercises the stage boundary but
+        # NOT the twelve loaders, which is where every stage-2 failure was.
         dataset_items:
-            - cc12m
-        mix_weights: [1.0]
+            - llava-ov-1.5-instruct-grouped
+            - vqav2
+            - okvqa-train
+            - aokvqa-train
+            - ocrvqa-train
+            - gqa-train
+            - visual-genome-det
+            - refcoco-train
+            - refcocog-train
+            - pixmo-cap-qa
+            - pixmo-count
+            - openimages-relationship-train
+        mix_weights: [1.0, 0.444, 0.009, 0.068, 0.802, 0.943, 0.86, 0.084, 0.084, 0.27, 0.036, 0.235245]
+        dataset_mix_weight_power: 0.5
         # Same divisibility rule as stage 1; see the note there.
         batch_size: 64
         freeze_lm: False
@@ -168,8 +207,8 @@ training:
         lr_schedule: cos
         sample_per_step: 1
         online_eval_per_step: 1
-        online_eval_tasks: [vqav2, mme]
-        final_eval_tasks: [vqav2, mme, pope]
+        online_eval_tasks: [vqav2, mme, textvqa, pope, refcocog, mmvp, vstar, ocrbench, countbenchqa]
+        final_eval_tasks: [vqav2, mme, textvqa, pope, mmbench, knn_full, refcocog, mmvp, vstar, ocrbench, countbenchqa, gqa, seed_bench, cambrian_cvbench, vlms_are_blind, docvqa, realworldqa]
 
 sampling:
     max_new_tokens: 16
@@ -177,10 +216,28 @@ sampling:
 
 eval:
     # A smoke wants the code path, not the number: cap every population.
-    max_eval_steps: 2
+    #
+    # `max_eval_steps` used to be the only thing here and NOTHING READS IT --
+    # so this block asked for a cap and got full benchmarks. Each key below was
+    # checked against its reader; the shared one is `debug_max_samples`, which
+    # eval_vqav2/textvqa/pixelbench/mme/pope/refcocog/mmbench and the whole
+    # eval_vlm_benchmarks family (gqa, seed_bench, cvbench, vlms-are-blind,
+    # docvqa, realworldqa) all consult.
+    debug_max_samples: 64
+    # Not covered by debug_max_samples: these have their own knobs.
+    pixelbench_num_samples_per_benchmark: 32
+    pope_num_samples_per_split: 32
+    mmbench_max_samples: 32
+    mme_num_samples: 64
+    refcocog_num_samples: 32
+    # KNN reads TFDS ImageNet, whose full pass is 1.28M train + 50k val. The
+    # smoke proves the data_dir resolves and the pipeline runs; 2 images per
+    # class over 1000 classes plus 512 val images does that in minutes.
+    knn_full_images_per_class: 2
+    knn_val_examples: 512
+    knn_batch_size: 64
     device_batch_size: 4
     eval_recon_tokens: []
-    device_batch_size: 4
 
 finetune: False
 sharding: hsdp_legacy_data

@@ -321,8 +321,13 @@ def get_config():
     # can beam-expand into a huge generation batch and OOM during decode.
     eval.pixelbench_device_batch_size = 4
     eval.pixelbench_num_workers = 0
-    eval.mmbench_root = "https://opencompass.openxlab.space/utils/VLMEval/MMBench_DEV_EN.tsv"
-    eval.mmbench_test_root = "https://opencompass.openxlab.space/utils/VLMEval/MMBench_TEST_EN.tsv"
+    # Stated as bucket paths, not as the upstream HTTPS URLs, so the one sweep
+    # that rewrites every `*_root` onto the co-located CNS replica picks them
+    # up like any other eval root. A Borg task has no public egress, and both
+    # TSVs were mirrored into the eval bundle from this workstation.
+    # eval_mmbench still accepts a URL, for a GCP-cluster run.
+    eval.mmbench_root = "gs://kmh-gcp-\U0001F4A3/data/mmbench/MMBench_DEV_EN.tsv"
+    eval.mmbench_test_root = "gs://kmh-gcp-\U0001F4A3/data/mmbench/MMBench_TEST_EN.tsv"
     eval.mmbench_cache_dir = "/kmh-nfs-ssd-us-mount/data/cached/zhh/mmbench_eval"
     eval.mmbench_data_cache_dir = "/kmh-nfs-ssd-us-mount/data/cached/zhh/mmbench_data"
     eval.mmbench_export_test = False

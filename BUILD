@@ -263,3 +263,26 @@ py_binary(
         "//pyglib:gfile",
     ],
 )
+
+# Can TFDS read ImageNet off Colossus? The `knn_full` eval runs ONCE, at the
+# very end of a 57-hour stage-2, so a wrong data_dir is discovered at the
+# most expensive possible moment. This answers it in seconds, without torch,
+# JAX or the model graph -- see the file's docstring for what it checks.
+py_binary(
+    name = "g3_knn_tfds_probe",
+    srcs = ["tools/g3_knn_tfds_probe.py"],
+    main = "tools/g3_knn_tfds_probe.py",
+    strict_deps = False,
+    tags = ["nostrictdeps"],
+    deps = [
+        # The CNS filesystem registration. TFDS reads through
+        # tensorflow.io.gfile, which only knows the /cns/ prefix if something
+        # in the binary registers it -- that is exactly what this probe is
+        # here to prove rather than assume.
+        "//file/colossus/public:cns",
+        "//third_party/py/absl:app",
+        "//third_party/py/absl/flags",
+        "//third_party/py/tensorflow",
+        "//third_party/py/tensorflow_datasets",
+    ],
+)

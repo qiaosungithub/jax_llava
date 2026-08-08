@@ -35,7 +35,9 @@ from evals.eval_dist_util import (
     DistributedEvalSampler,
     broadcast_merge_ok,
     collate_fn,
+    eval_open,
     gather_rank_json_results,
+    is_cns_path,
     write_rank_json_results,
 )
 
@@ -78,6 +80,18 @@ def _resolve_tsv_path(root, cache_dir, filename):
     if not _is_url(root):
         return root
 
+    # A Borg task has no public egress, so the download below cannot work
+    # there. Both TSVs are mirrored beside the rest of the eval bundle; say so
+    # here instead of failing inside urllib with a connection error that names
+    # a URL and not the fix.
+    from utils import g3_env  # noqa: PLC0415
+    if g3_env.in_google3():
+        raise ValueError(
+            f"[MMBench] Cannot download {root} on Borg: no public egress. "
+            "Point config.eval.mmbench_root / mmbench_test_root at the CNS "
+            "mirror (…/eval_bundle/data/mmbench/<name>.tsv)."
+        )
+
     local_path = os.path.join(cache_dir, filename)
     if jax.process_index() == 0 and not os.path.exists(local_path):
         log_for_0(f"Downloading MMBench TSV from {root} to {local_path}")
@@ -90,6 +104,13 @@ def _resolve_tsv_path(root, cache_dir, filename):
 
 
 def _read_tsv(path):
+    # pandas opens by name, and a /cns/ name means nothing to it. Route through
+    # the same helper every other eval uses to read Colossus, rather than
+    # letting this one path stay GCP-only -- MMBench is a FINAL eval, so a
+    # failure here surfaces after a full training run has already been paid for.
+    if is_cns_path(path):
+        with eval_open(path, "rb") as f:
+            return pd.read_csv(f, sep="\t", keep_default_na=False)
     return pd.read_csv(path, sep="\t", keep_default_na=False)
 
 

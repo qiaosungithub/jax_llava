@@ -174,6 +174,11 @@ _KNN_TFDS_DATA_DIRS: dict[str, str] = {
 }
 
 _LOCAL_TFDS_DATA_DIR = "/kmh-nfs-ssd-us-mount/data/tensorflow_datasets"
+
+# The eval bundle kept the bucket's own layout when it was copied, so TFDS sits
+# beside `data/` rather than under it -- see utils/data_util._rewrite_bucket_to_cns,
+# which handles the same two-layout split for every other eval root.
+_CNS_TFDS_RELPATH = "eval_bundle/tensorflow_datasets"
 _imagenet_data_dir_cache: Optional[str] = None
 
 
@@ -214,12 +219,35 @@ def _normalize_zone(zone: str) -> str:
     return zone
 
 
+def _cns_tfds_data_dir() -> Optional[str]:
+    """The co-located TFDS ImageNet replica on Colossus, or None.
+
+    Verified reachable by tools/g3_knn_tfds_probe: google3's TensorFlow reads
+    /cns/ through tf.io.gfile, the builder loads its metadata off Colossus, and
+    a real tfrecord shard decodes. Returns None rather than raising so the
+    caller can fall through to the historical zone table.
+    """
+    from utils import g3_env  # noqa: PLC0415 -- google3-only import
+
+    for root in g3_env.cns_data_roots():
+        candidate = f"{root.rstrip('/')}/{_CNS_TFDS_RELPATH}"
+        if g3_env.cns_dir_exists(f"{candidate}/imagenet2012"):
+            return candidate
+    return None
+
+
 def ensure_imagenet_available(zone: str, local_debug: bool = False) -> str:
     """Return the TFDS ImageNet data_dir for this run; never copy ImageNet.
 
     The historical implementation copied a torchvision-style ImageNet tree
     into ``/mnt/zhhm`` before KNN eval.  ImageNet is now prepared as TFDS in the
     zone-local GCS buckets, so KNN eval should read TFDS directly.
+
+    On Borg neither of those exists: the NFS mount is unreachable and a gs://
+    read needs credentials a prod identity does not have. The 143 GiB TFDS tree
+    was copied into every CNS replica with the rest of the eval bundle, so that
+    is the answer there -- resolved from the task's own cell, like every other
+    dataset root, so compute and storage cannot drift apart.
     """
     global _imagenet_data_dir_cache
 
@@ -236,12 +264,26 @@ def ensure_imagenet_available(zone: str, local_debug: bool = False) -> str:
     else:
         data_dir = os.environ.get("KNN_TFDS_DATA_DIR")
         if not data_dir:
-            zone_key = _normalize_zone(zone)
-            if zone_key not in _KNN_TFDS_DATA_DIRS:
-                raise ValueError(
-                    f"[KNN] Unknown zone '{zone}'. Supported: {list(_KNN_TFDS_DATA_DIRS.keys())}"
-                )
-            data_dir = _KNN_TFDS_DATA_DIRS[zone_key]
+            from utils import g3_env  # noqa: PLC0415
+            # Ordered so the environment can always override, then the
+            # co-located replica, then the historical buckets. A google3 task
+            # that finds no replica must NOT fall through to gs://, which is
+            # unreadable there and would fail later and less clearly.
+            if g3_env.in_google3():
+                data_dir = _cns_tfds_data_dir()
+                if not data_dir:
+                    raise ValueError(
+                        "[KNN] No TFDS ImageNet replica under any CNS data root "
+                        f"({list(g3_env.cns_data_roots())}); expected "
+                        f"<root>/{_CNS_TFDS_RELPATH}/imagenet2012."
+                    )
+            else:
+                zone_key = _normalize_zone(zone)
+                if zone_key not in _KNN_TFDS_DATA_DIRS:
+                    raise ValueError(
+                        f"[KNN] Unknown zone '{zone}'. Supported: {list(_KNN_TFDS_DATA_DIRS.keys())}"
+                    )
+                data_dir = _KNN_TFDS_DATA_DIRS[zone_key]
 
     # Metadata-only builder creation is a cheap early sanity check and gives a
     # clearer failure than discovering a missing TFDS dependency inside eval.
