@@ -34,7 +34,14 @@ import time
 # The shared NFS checkout the GCP path imports `big_vision` and `gemma` from.
 # Absent under Bazel, where those come from BUILD deps instead.
 SHARED_CODE_ROOT = "/kmh-nfs-ssd-us-mount/code/hanhong/shared"
-if os.path.isdir(SHARED_CODE_ROOT) and SHARED_CODE_ROOT not in sys.path:
+try:
+    # os.path.isdir does NOT simply answer False for a path the process may not
+    # touch -- on Borg this NFS mount raises PermissionError, which killed a
+    # run before main() ever started. Treat any failure as "not available".
+    _shared_code_available = os.path.isdir(SHARED_CODE_ROOT)
+except OSError:
+    _shared_code_available = False
+if _shared_code_available and SHARED_CODE_ROOT not in sys.path:
     sys.path.insert(0, SHARED_CODE_ROOT)
 
 # Under Bazel the package directory itself is not on sys.path when the binary
