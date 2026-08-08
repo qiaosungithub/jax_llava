@@ -20,6 +20,7 @@ from input_pipeline import get_transforms, prepare_batch_data
 from utils.logging_util import log_for_0, log_for_all
 from utils.eval_io_util import redirect_cache_dir, ensure_eval_result_base_dir, eval_result_prefix
 from evals.eval_dist_util import (
+    read_json,
     write_json,
     eval_glob,
     eval_open,
@@ -252,24 +253,37 @@ def load_pope_image_record_rows_once(config, pope_root, splits, max_samples_per_
         config, pope_root, splits, max_samples_per_split
     )
     rows = None
+    on_cns = str(cache_path).startswith(("/cns/", "/bigstore/"))
     if jax.process_index() == 0:
-        if os.path.exists(cache_path):
-            with open(cache_path, "r", encoding="utf-8") as f:
-                rows = json.load(f)
+        if _cache_exists(cache_path):
+            rows = read_json(cache_path)
             log_for_0(f"POPE image-record rows loaded from cache: {cache_path}")
         else:
             rows = load_pope_image_record_rows(
                 pope_root, splits, max_samples_per_split=max_samples_per_split
             )
-            tmp_path = f"{cache_path}.tmp.{os.getpid()}"
-            write_json(tmp_path, rows, indent=2)
-            os.replace(tmp_path, cache_path)
+            if on_cns:
+                # No tmp+rename on Colossus: os.replace is a stdlib call and
+                # cannot touch /cns/. Only rank 0 writes this path and every
+                # other rank waits on the barrier below, so the write does not
+                # need to be atomic against a concurrent reader.
+                write_json(cache_path, rows, indent=2)
+            else:
+                tmp_path = f"{cache_path}.tmp.{os.getpid()}"
+                write_json(tmp_path, rows, indent=2)
+                os.replace(tmp_path, cache_path)
             log_for_0(f"POPE image-record rows cache written: {cache_path}")
     mu.sync_global_devices("pope image-record rows cache ready")
     if rows is None:
-        with open(cache_path, "r", encoding="utf-8") as f:
-            rows = json.load(f)
+        rows = read_json(cache_path)
     return rows
+
+
+def _cache_exists(path):
+    if str(path).startswith(("/cns/", "/bigstore/")):
+        from google3.pyglib import gfile
+        return gfile.Exists(str(path))
+    return os.path.exists(path)
 
 
 def resolve_image_path(image_name: str, image_root: str) -> str:
