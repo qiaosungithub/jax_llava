@@ -722,10 +722,7 @@ def eval_pope(p_sample_step, run_p_sample_step, model, tokenizer, params, config
                 "num_samples": len(merged),
             }
 
-            with open(
-                f"{result_prefix}.results_final.json", "w", encoding="utf-8"
-            ) as f:
-                json.dump(merged, f, ensure_ascii=False, indent=2)
+            write_json(f"{result_prefix}.results_final.json", merged, indent=2)
 
             write_json(f"{result_prefix}.metrics.json", metrics_dict, indent=2)
 
