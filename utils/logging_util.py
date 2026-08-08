@@ -1,5 +1,6 @@
 import logging as _logging
 import re
+import io
 import os
 import sys
 import threading
@@ -177,6 +178,40 @@ class MetricsTracker:
 
         self._sum, self._n = None, 0
         return out
+
+def _viz_output_root(workdir):
+    """Where PNGs go: `$CHECKPOINT_BUCKET/viz` when Borg gives us one.
+
+    `workdir` on a Borg task is `/tmp/eqr_log/<name>` -- the worker's own tmpfs,
+    which dies with the task. Every image this Writer produced was therefore
+    discarded: wandb resolves to a mock in google3, tensorboard is refused in
+    __init__, and this fallback wrote to a directory nobody could read
+    afterwards. The checkpoint bucket is the one location that outlives the job.
+    """
+    bucket = os.environ.get("CHECKPOINT_BUCKET", "").strip()
+    if bucket:
+        return f"{bucket.rstrip('/')}/viz"
+    return os.path.join(workdir, "writed_images")
+
+
+def _save_image(img, step, key, workdir):
+    """Write one PIL image under the viz root, on CNS or locally."""
+    root = _viz_output_root(workdir)
+    name = f"step{step:07d}_{key}.png"
+    if root.startswith("/cns/") or root.startswith("/bigstore/"):
+        from google3.pyglib import gfile
+        # CNS is not an object store: writing into a directory that does not
+        # exist fails outright, so create it first.
+        if not gfile.Exists(root):
+            gfile.MakeDirs(root)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        with gfile.Open(f"{root}/{name}", "wb") as handle:
+            handle.write(buf.getvalue())
+        return
+    os.makedirs(root, exist_ok=True)
+    img.save(os.path.join(root, name))
+
 
 class Writer:
     def __init__(self, config, workdir, use_wandb=False, use_tb=False):
@@ -375,11 +410,15 @@ class Writer:
                 k: np.asarray(reduce_arr_func(v)) for k, v in image_dict.items()
             })
         if (not self.use_wandb or not wandb_ok) and not self.use_tb:
-            log_for_0(f"[NOTE] Saving images locally, at step {step}")
+            log_for_0(f"[NOTE] Saving images to {_viz_output_root(self.workdir)}, "
+                      f"at step {step}")
             for k, v in image_dict.items():
-                v = reduce_arr_func(v)
-                os.makedirs(os.path.join(self.workdir, 'writed_images'), exist_ok=True)
-                v.save(os.path.join(self.workdir, 'writed_images', f"step{step:07d}_{k}.png"))
+                try:
+                    _save_image(reduce_arr_func(v), step, k, self.workdir)
+                except Exception as e:  # noqa: BLE001
+                    # Telemetry must never kill a run.
+                    log_for_0(f"[NOTE] Could not save image {k!r}: "
+                              f"{type(e).__name__}: {e}")
 
     def write_texts(self, step, text_key, text_list):
         if jax.process_index() != 0:
