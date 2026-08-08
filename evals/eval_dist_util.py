@@ -75,8 +75,16 @@ def collate_fn(batch):
 def write_rank_json_results(result_prefix, results):
     """Write this rank's results to ``{result_prefix}.results_{process_index}.json``."""
     res_file = f"{result_prefix}.results_{jax.process_index()}.json"
-    with open(res_file, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
+    payload = json.dumps(results, ensure_ascii=False, indent=2)
+    if is_cns_path(res_file):
+        # The builtin open() cannot create a file on Colossus, and on Borg the
+        # results now live under $CHECKPOINT_BUCKET.
+        from google3.pyglib import gfile
+        with gfile.Open(res_file, "w") as f:
+            f.write(payload)
+    else:
+        with open(res_file, "w", encoding="utf-8") as f:
+            f.write(payload)
     return res_file
 
 
@@ -103,13 +111,14 @@ def gather_rank_json_results(
     all_results = []
     for r in range(process_count):
         pf = f"{result_prefix}.results_{r}.json"
-        if not os.path.exists(pf):
+        if not _path_exists(pf):
             if missing_file_msg is None:
                 continue
             if log_missing:
                 log_for_0(f"Process {r} results file not found: {pf}")
             raise FileNotFoundError(missing_file_msg.format(rank=r, path=pf))
-        with open(pf, encoding="utf-8") as f:
+        with (eval_open(pf, "r") if is_cns_path(pf)
+              else open(pf, encoding="utf-8")) as f:
             all_results.extend(json.load(f))
     return all_results
 

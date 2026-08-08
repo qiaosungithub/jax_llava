@@ -62,8 +62,28 @@ def _eval_run_id(config) -> str:
     return _safe_path_part(run_id)
 
 
+def _borg_eval_result_root():
+    """`$CHECKPOINT_BUCKET/eval_results` on Borg, else None.
+
+    Every eval defaults its cache dir to /kmh-nfs-ssd-us-mount/..., a GCP
+    cluster mount that a Borg task cannot read OR write -- and os.makedirs
+    raises PermissionError there rather than failing gracefully. Eighteen evals
+    share these two functions, so redirecting here covers all of them at once
+    instead of editing eighteen defaults.
+    """
+    bucket = os.environ.get("CHECKPOINT_BUCKET", "").strip()
+    if bucket and (bucket.startswith("/cns/") or bucket.startswith("/bigstore/")):
+        return f"{bucket.rstrip('/')}/eval_results"
+    return None
+
+
 def ensure_eval_result_base_dir(base_dir: str) -> None:
     """Ensure ranks can create new result files in the shared cache dir."""
+    if str(base_dir).startswith(("/cns/", "/bigstore/")):
+        from google3.pyglib import gfile
+        if not gfile.Exists(base_dir):
+            gfile.MakeDirs(base_dir)
+        return
     os.makedirs(base_dir, exist_ok=True)
     try:
         os.chmod(base_dir, 0o777)
@@ -99,10 +119,16 @@ def eval_result_prefix(
     """
     namespace_source = os.path.normpath(str(getattr(config.eval, cache_dir_attr, default_cache_dir)))
     namespace = _safe_path_part(os.path.basename(namespace_source) or task_name)
-    base = getattr(config.eval, "result_cache_dir", None)
-    if base is None:
-        base = os.path.dirname(namespace_source) or "."
-    base = os.path.normpath(str(base))
+    borg_root = _borg_eval_result_root()
+    if borg_root is not None:
+        # On Borg the configured cache dirs all point at an unreachable NFS
+        # mount; the checkpoint bucket is the only writable durable location.
+        base = borg_root
+    else:
+        base = getattr(config.eval, "result_cache_dir", None)
+        if base is None:
+            base = os.path.dirname(namespace_source) or "."
+        base = os.path.normpath(str(base))
     workdir_hash = _safe_path_part(getattr(config, "workdir_hash", "nohash"))
     step = int(getattr(config.eval, "current_eval_step", -1))
     run_id = _eval_run_id(config)
