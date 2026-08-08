@@ -35,6 +35,7 @@ from torch.utils.data import DataLoader, IterableDataset
 
 from evals.vqa_scoring import postprocess_vqav2_text, vqa_accuracy_one
 from evals.eval_dist_util import (
+    write_json,
     broadcast_merge_ok,
     collate_fn,
     gather_rank_json_results,
@@ -1081,11 +1082,9 @@ def _merge_and_score(
         }
 
     final_path = f"{result_prefix}.results_final.json"
-    with open(final_path, "w", encoding="utf-8") as f:
-        json.dump(all_results, f, ensure_ascii=False, indent=2)
+    write_json(final_path, all_results, indent=2)
     metrics_path = f"{result_prefix}.metrics.json"
-    with open(metrics_path, "w", encoding="utf-8") as f:
-        json.dump(metrics, f, ensure_ascii=False, indent=2)
+    write_json(metrics_path, metrics, indent=2)
     log_for_0(f"{result_name} results: {final_path} ({len(all_results)} predictions)")
     log_for_0(f"{result_name} metrics: {metrics_path}")
     log_for_0(

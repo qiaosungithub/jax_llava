@@ -21,6 +21,7 @@ from input_pipeline import get_transforms, prepare_batch_data
 from utils.logging_util import log_for_0, log_for_all
 from utils.eval_io_util import ensure_eval_result_base_dir, eval_result_prefix
 from evals.eval_dist_util import (
+    write_json,
     eval_glob,
     eval_open,
     DistributedEvalSampler,
@@ -419,12 +420,10 @@ def eval_mme(p_sample_step, run_p_sample_step, model, tokenizer, params, config)
                 missing_file_msg="During MME eval, process {rank} results file missing: {path}",
             )
 
-            with open(f"{result_prefix}.results_final.json", "w", encoding="utf-8") as f:
-                json.dump(merged, f, ensure_ascii=False, indent=2)
+            write_json(f"{result_prefix}.results_final.json", merged, indent=2)
 
             metric_dict = score_mme(merged)
-            with open(f"{result_prefix}.metrics.json", "w", encoding="utf-8") as f:
-                json.dump(metric_dict, f, ensure_ascii=False, indent=2)
+            write_json(f"{result_prefix}.metrics.json", metric_dict, indent=2)
 
             mme_p = float(metric_dict["MME-P"])
             mme_s = float(metric_dict["MME-S"])

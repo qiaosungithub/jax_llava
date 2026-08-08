@@ -31,6 +31,7 @@ from input_pipeline import get_transforms, prepare_batch_data
 from utils.logging_util import log_for_0, log_for_all
 from utils.eval_io_util import ensure_eval_result_base_dir, eval_result_prefix
 from evals.eval_dist_util import (
+    write_json,
     DistributedEvalSampler,
     broadcast_merge_ok,
     collate_fn,
@@ -496,8 +497,7 @@ def _run_mmbench_predictions(p_sample_step, run_p_sample_step, model, tokenizer,
             for item in merged:
                 dedup[int(item["index"])] = item
             merged = [dedup[idx] for idx in sorted(dedup)]
-            with open(f"{result_prefix}.results_final.json", "w", encoding="utf-8") as f:
-                json.dump(merged, f, ensure_ascii=False, indent=2)
+            write_json(f"{result_prefix}.results_final.json", merged, indent=2)
             log_for_0(f"MMBench {split_name} merged results saved with prefix: {result_prefix}")
         except Exception as exc:  # Keep every rank out of the final barrier on failure.
             logging.exception(f"MMBench {split_name} rank-0 merge failed")
@@ -581,10 +581,8 @@ def eval_mmbench(p_sample_step, run_p_sample_step, model, tokenizer, params, con
         overall, metric_dict, scored_rows = _score_mmbench(results)
         base_dir, result_prefix = _result_prefix(config, "MMBench_DEV_EN")
         ensure_eval_result_base_dir(base_dir)
-        with open(f"{result_prefix}.metrics.json", "w", encoding="utf-8") as f:
-            json.dump(metric_dict, f, ensure_ascii=False, indent=2)
-        with open(f"{result_prefix}.scored_rows.json", "w", encoding="utf-8") as f:
-            json.dump(scored_rows, f, ensure_ascii=False, indent=2)
+        write_json(f"{result_prefix}.metrics.json", metric_dict, indent=2)
+        write_json(f"{result_prefix}.scored_rows.json", scored_rows, indent=2)
         log_for_0(f"MMBench DEV EN accuracy: {overall:.2f}%")
         sample_outputs = [_vis_mmbench(item) for item in results[:16]]
     else:

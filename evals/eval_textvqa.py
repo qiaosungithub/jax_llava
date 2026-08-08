@@ -31,6 +31,7 @@ from utils.eval_io_util import ensure_eval_result_base_dir, eval_result_prefix
 from input_pipeline import get_transforms, prepare_batch_data
 from evals.vqa_scoring import vqa_accuracy_one as _shared_vqa_accuracy_one
 from evals.eval_dist_util import (
+    write_json,
     broadcast_merge_ok,
     collate_fn,
     gather_rank_json_results,
@@ -307,8 +308,7 @@ def eval_textvqa(p_sample_step, run_p_sample_step, model, tokenizer, params, con
             all_results = list(dedup_by_qid.values())
 
             out_path = f"{result_prefix}.results_final.json"
-            with open(out_path, "w", encoding="utf-8") as f:
-                json.dump([{"question_id": o["question_id"], "answer": o["answer"]} for o in all_results], f, ensure_ascii=False, indent=2)
+            write_json(out_path, [{"question_id": o["question_id"], "answer": o["answer"]} for o in all_results], indent=2)
 
             all_accs = []
             for o in all_results:

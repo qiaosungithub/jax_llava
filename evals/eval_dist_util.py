@@ -72,6 +72,34 @@ def collate_fn(batch):
     return collated
 
 
+def write_json(path, obj, indent=2):
+    """Write JSON to `path`, on CNS or locally.
+
+    Every eval writes its merged results and metrics with the builtin open(),
+    which cannot create a file on Colossus -- and on Borg these now live under
+    $CHECKPOINT_BUCKET. One helper so a new eval cannot reintroduce it.
+    """
+    payload = json.dumps(obj, ensure_ascii=False, indent=indent)
+    if is_cns_path(path):
+        from google3.pyglib import gfile
+        with gfile.Open(str(path), "w") as f:
+            f.write(payload)
+    else:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(payload)
+    return path
+
+
+def read_json(path):
+    """Read JSON from `path`, on CNS or locally."""
+    if is_cns_path(path):
+        from google3.pyglib import gfile
+        with gfile.Open(str(path), "r") as f:
+            return json.load(f)
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
 def write_rank_json_results(result_prefix, results):
     """Write this rank's results to ``{result_prefix}.results_{process_index}.json``."""
     res_file = f"{result_prefix}.results_{jax.process_index()}.json"

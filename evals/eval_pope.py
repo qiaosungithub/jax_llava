@@ -20,6 +20,7 @@ from input_pipeline import get_transforms, prepare_batch_data
 from utils.logging_util import log_for_0, log_for_all
 from utils.eval_io_util import ensure_eval_result_base_dir, eval_result_prefix
 from evals.eval_dist_util import (
+    write_json,
     eval_glob,
     eval_open,
     DistributedEvalSampler,
@@ -260,8 +261,7 @@ def load_pope_image_record_rows_once(config, pope_root, splits, max_samples_per_
                 pope_root, splits, max_samples_per_split=max_samples_per_split
             )
             tmp_path = f"{cache_path}.tmp.{os.getpid()}"
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(rows, f, ensure_ascii=False)
+            write_json(tmp_path, rows, indent=2)
             os.replace(tmp_path, cache_path)
             log_for_0(f"POPE image-record rows cache written: {cache_path}")
     mu.sync_global_devices("pope image-record rows cache ready")
@@ -712,8 +712,7 @@ def eval_pope(p_sample_step, run_p_sample_step, model, tokenizer, params, config
             ) as f:
                 json.dump(merged, f, ensure_ascii=False, indent=2)
 
-            with open(f"{result_prefix}.metrics.json", "w", encoding="utf-8") as f:
-                json.dump(metrics_dict, f, ensure_ascii=False, indent=2)
+            write_json(f"{result_prefix}.metrics.json", metrics_dict, indent=2)
 
             for split in splits:
                 m = split_metrics[split]

@@ -19,6 +19,7 @@ from utils.eval_io_util import ensure_eval_result_base_dir, eval_result_prefix
 from input_pipeline import get_transforms, prepare_batch_data
 from evals.vqa_scoring import postprocess_vqav2_text, stripspace_vqav2, vqa_accuracy_one
 from evals.eval_dist_util import (
+    write_json,
     eval_glob,
     broadcast_merge_ok,
     collate_fn,
@@ -387,13 +388,10 @@ def eval_vqav2(p_sample_step, run_p_sample_step, model, tokenizer, params, confi
 
             out_path = f"{result_prefix}.results_final.json"
             # Save merged (question_id, answer) for submission; full for debug
-            with open(out_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    [{"question_id": o["question_id"], "answer": o["answer"]} for o in all_results],
-                    f,
-                    ensure_ascii=False,
-                    indent=2,
-                )
+            write_json(
+                out_path,
+                [{"question_id": o["question_id"], "answer": o["answer"]} for o in all_results],
+            )
 
             # Recompute and round exactly like the official VQA-v2 evaluator.
             all_accs = []

@@ -29,6 +29,7 @@ from input_pipeline import get_transforms, prepare_batch_data
 from utils.logging_util import log_for_0, log_for_all
 from utils.eval_io_util import ensure_eval_result_base_dir, eval_result_prefix
 from evals.eval_dist_util import (
+    write_json,
     eval_glob,
     eval_open,
     DistributedEvalSampler,
@@ -586,12 +587,9 @@ def _run_one_benchmark(p_sample_step, run_p_sample_step, model, tokenizer, param
             metrics = _score_records(merged)
             scored = metrics.pop("scored")
 
-            with open(f"{result_prefix}.results_final.json", "w", encoding="utf-8") as f:
-                json.dump(merged, f, ensure_ascii=False, indent=2)
-            with open(f"{result_prefix}.scored_results.json", "w", encoding="utf-8") as f:
-                json.dump(scored, f, ensure_ascii=False, indent=2)
-            with open(f"{result_prefix}.metrics.json", "w", encoding="utf-8") as f:
-                json.dump(metrics, f, ensure_ascii=False, indent=2)
+            write_json(f"{result_prefix}.results_final.json", merged, indent=2)
+            write_json(f"{result_prefix}.scored_results.json", scored, indent=2)
+            write_json(f"{result_prefix}.metrics.json", metrics, indent=2)
 
             if bench == "mmvp":
                 log_for_0(

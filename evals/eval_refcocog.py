@@ -25,6 +25,7 @@ from utils.bbox_util import (
 from utils.logging_util import log_for_0, log_for_all
 from utils.eval_io_util import ensure_eval_result_base_dir, eval_result_prefix
 from evals.eval_dist_util import (
+    write_json,
     DistributedEvalSampler,
     _join_path,
     _path_exists,
@@ -818,8 +819,7 @@ def eval_refcocog(p_sample_step, run_p_sample_step, model, tokenizer, params, co
                     dedup[o["id"]] = o
             merged = list(dedup.values())
             out_path = f"{result_prefix}.results_final.json"
-            with open(out_path, "w", encoding="utf-8") as f:
-                json.dump(merged, f, ensure_ascii=False, indent=2)
+            write_json(out_path, merged, indent=2)
             ious = [o["iou"] for o in merged]
             hits = [o["hit"] for o in merged]
             miou = float(np.mean(ious)) if ious else 0.0
