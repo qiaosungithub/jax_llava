@@ -1101,6 +1101,13 @@ def _run_train_phase(
                 writer.write_images(step + 1, {f'{stage_key}_train_images': img_grid})
                 ids_src = raw_batch['input_ids'][:16]
                 ids_list = ids_src.numpy() if hasattr(ids_src, 'numpy') else np.asarray(ids_src)
+                # The grouped dataloader yields (B, G, T): each row is a group
+                # of sequences, not one sequence. `pixel_values` is flattened a
+                # few lines above for exactly this reason; the ids need the same
+                # treatment or `tokenizer.decode` gets a 2-D array and raises
+                # "Array must be 0 or 1 dimensional".
+                if ids_list.ndim > 2:
+                    ids_list = ids_list.reshape((-1,) + ids_list.shape[-1:])
                 writer.write_texts(
                     step + 1,
                     f'{stage_key}_train_captions',
