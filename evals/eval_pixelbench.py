@@ -16,6 +16,7 @@ import tarfile
 from collections import defaultdict
 
 import fsspec
+
 import jax
 import numpy as np
 import torch
@@ -28,6 +29,8 @@ from input_pipeline import get_transforms, prepare_batch_data
 from utils.logging_util import log_for_0, log_for_all
 from utils.eval_io_util import ensure_eval_result_base_dir, eval_result_prefix
 from evals.eval_dist_util import (
+    eval_glob,
+    eval_open,
     DistributedEvalSampler,
     broadcast_merge_ok,
     collate_fn,
@@ -100,7 +103,7 @@ def _bench_tar_path(root, bench, kind):
 
 
 def _open_binary(path):
-    return fsspec.open(path, "rb").open()
+    return eval_open(path, "rb")
 
 
 def _read_manifest(metadata_tar):

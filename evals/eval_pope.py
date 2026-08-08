@@ -20,6 +20,8 @@ from input_pipeline import get_transforms, prepare_batch_data
 from utils.logging_util import log_for_0, log_for_all
 from utils.eval_io_util import ensure_eval_result_base_dir, eval_result_prefix
 from evals.eval_dist_util import (
+    eval_glob,
+    eval_open,
     DistributedEvalSampler,
     _join_path,
     _path_exists,
@@ -44,15 +46,9 @@ def _glob_tar_shards(root: str):
     root = root.rstrip("/")
     if root.endswith(".tar"):
         return [root] if _path_exists(root) else []
-    if root.startswith("gs://"):
-        fs, fs_path = fsspec.core.url_to_fs(root)
-        matched = sorted(fs.glob(f"{fs_path}/shard-*.tar"))
-        if not matched:
-            matched = sorted(fs.glob(f"{fs_path}/*.tar"))
-        return [_maybe_add_gs_scheme(p) for p in matched]
-    matched = sorted(glob.glob(os.path.join(root, "shard-*.tar")))
+    matched = eval_glob(f"{str(root).rstrip('/')}/shard-*.tar")
     if not matched:
-        matched = sorted(glob.glob(os.path.join(root, "*.tar")))
+        matched = eval_glob(f"{str(root).rstrip('/')}/*.tar")
     return matched
 
 
@@ -84,16 +80,9 @@ def resolve_pope_split_file(pope_root: str, split: str, dataset: str) -> str:
         if _path_exists(path):
             return path
 
-    if root.startswith("gs://"):
-        fs = fsspec.filesystem("gs")
-        matched = sorted(fs.glob(f"{root}/*{split}*.json"))
-        if matched:
-            first = matched[0]
-            return first if first.startswith("gs://") else f"gs://{first}"
-    else:
-        matched = sorted(glob.glob(os.path.join(root, f"*{split}*.json")))
-        if matched:
-            return matched[0]
+    matched = eval_glob(f"{str(root).rstrip('/')}/*{split}*.json")
+    if matched:
+        return matched[0]
 
     raise FileNotFoundError(
         f"Cannot resolve POPE file for split='{split}' under pope_root='{pope_root}'."
@@ -101,7 +90,7 @@ def resolve_pope_split_file(pope_root: str, split: str, dataset: str) -> str:
 
 
 def load_pope_questions(path: str, split: str):
-    with fsspec.open(path, "rb").open() as f:
+    with eval_open(path, "rb") as f:
         content = f.read().decode("utf-8")
 
     stripped = content.strip()
@@ -159,7 +148,7 @@ def load_pope_image_record_rows(root: str, splits, max_samples_per_split: int = 
     rows_per_split = {split: 0 for split in wanted_splits}
     image_records = 0
     for tar_path in tar_paths:
-        with fsspec.open(tar_path, "rb").open() as f:
+        with eval_open(tar_path, "rb") as f:
             with tarfile.open(fileobj=f, mode="r:*") as tar:
                 members = {m.name: m for m in tar.getmembers() if m.isfile()}
                 json_names = sorted(n for n in members if n.endswith(".json"))
@@ -366,7 +355,7 @@ class POPEDataset(Dataset):
         tar_path = image_ref["tar_path"]
         stream = self._image_record_streams.get(tar_path)
         if stream is None:
-            stream = fsspec.open(tar_path, "rb").open()
+            stream = eval_open(tar_path, "rb")
             self._image_record_streams[tar_path] = stream
         stream.seek(int(image_ref["offset"]))
         payload = stream.read(int(image_ref["size"]))

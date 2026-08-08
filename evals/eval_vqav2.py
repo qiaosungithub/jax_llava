@@ -19,6 +19,7 @@ from utils.eval_io_util import ensure_eval_result_base_dir, eval_result_prefix
 from input_pipeline import get_transforms, prepare_batch_data
 from evals.vqa_scoring import postprocess_vqav2_text, stripspace_vqav2, vqa_accuracy_one
 from evals.eval_dist_util import (
+    eval_glob,
     broadcast_merge_ok,
     collate_fn,
     gather_rank_json_results,
@@ -122,16 +123,14 @@ class VQAv2IterableDataset(IterableDataset):
         self.shard_rank = shard_rank if shard_rank is not None else jax.process_index()
 
     def _list_urls(self):
-        """List all VQAv2 shard URLs under root_url, supporting gs:// and local paths."""
-        pattern = f"{self.root_url}/shard-*.tar"
-        if self.root_url.startswith("gs://"):
-            fs = fsspec.filesystem("gs")
-            matched = sorted(fs.glob(pattern))
-            # gcsfs.glob() typically returns paths without gs:// prefix.
-            return [u if u.startswith("gs://") else f"gs://{u}" for u in matched]
+        """List all VQAv2 shard URLs under root_url: /cns/, gs:// or local.
 
-        fs = fsspec.filesystem("file")
-        return sorted(fs.glob(pattern))
+        The /cns/ case has to go through gfile. fsspec's "file" backend cannot
+        see Colossus and reports no matches rather than failing, so a replica
+        holding 128 shards looked empty and the eval died with "No VQAv2 shards
+        found" naming the very directory they were in.
+        """
+        return eval_glob(f"{self.root_url}/shard-*.tar")
 
     def __iter__(self):
         all_urls = self._list_urls()

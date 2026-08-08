@@ -136,7 +136,42 @@ def broadcast_merge_ok(merge_exception, eval_name):
         )
 
 
+def is_cns_path(path) -> bool:
+    """True for a Colossus/bigstore path, which fsspec cannot see."""
+    return str(path).startswith(("/cns/", "/bigstore/"))
+
+
+def eval_glob(pattern: str):
+    """Sorted matches for `pattern`, on whichever filesystem names it.
+
+    fsspec's "file" backend silently reports NO MATCHES for a /cns/ path rather
+    than failing, so an eval pointed at a Colossus replica sees an empty
+    directory and raises "no shards found" naming the directory its shards are
+    actually in. Every eval that lists shards must come through here.
+    """
+    if is_cns_path(pattern):
+        from google3.pyglib import gfile
+        return sorted(str(u) for u in gfile.Glob(pattern))
+    if str(pattern).startswith("gs://"):
+        fs = fsspec.filesystem("gs")
+        return sorted(u if str(u).startswith("gs://") else f"gs://{u}"
+                      for u in fs.glob(pattern))
+    fs, fs_path = fsspec.core.url_to_fs(pattern)
+    return sorted(fs.glob(fs_path))
+
+
+def eval_open(path: str, mode: str = "rb"):
+    """Open a file on CNS, GCS or locally."""
+    if is_cns_path(path):
+        from google3.pyglib import gfile
+        return gfile.Open(path, mode)
+    return fsspec.open(path, mode).open()
+
+
 def _path_exists(path: str) -> bool:
+    if is_cns_path(path):
+        from google3.pyglib import gfile
+        return gfile.Exists(path)
     fs, fs_path = fsspec.core.url_to_fs(path)
     return fs.exists(fs_path)
 

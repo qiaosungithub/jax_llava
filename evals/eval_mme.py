@@ -7,6 +7,7 @@ from functools import partial
 from glob import glob
 
 import fsspec
+
 import jax
 import numpy as np
 import pandas as pd
@@ -20,6 +21,8 @@ from input_pipeline import get_transforms, prepare_batch_data
 from utils.logging_util import log_for_0, log_for_all
 from utils.eval_io_util import ensure_eval_result_base_dir, eval_result_prefix
 from evals.eval_dist_util import (
+    eval_glob,
+    eval_open,
     DistributedEvalSampler,
     broadcast_merge_ok,
     collate_fn,
@@ -53,12 +56,7 @@ _mme_load_count = 0
 
 
 def _list_parquet_files(root: str):
-    if root.startswith("gs://"):
-        fs, fs_path = fsspec.core.url_to_fs(root)
-        proto = fs.protocol[0] if isinstance(fs.protocol, (tuple, list)) else fs.protocol
-        files = sorted(fs.glob(fs_path.rstrip("/") + "/*.parquet"))
-        return [f"{proto}://{p}" for p in files]
-    return sorted(glob(os.path.join(root, "*.parquet")))
+    return eval_glob(f"{str(root).rstrip('/')}/*.parquet")
 
 
 def _load_mme_rows(root: str):
