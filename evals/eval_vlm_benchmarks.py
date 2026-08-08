@@ -38,7 +38,9 @@ from evals.eval_dist_util import (
     write_json,
     broadcast_merge_ok,
     collate_fn,
+    eval_glob,
     gather_rank_json_results,
+    is_cns_path,
     write_rank_json_results,
 )
 from input_pipeline import get_transforms, prepare_batch_data
@@ -331,12 +333,11 @@ def _list_tar_urls(root: str | Sequence[str]) -> List[str]:
         return [root]
 
     pattern = root if "*" in root else root.rstrip("/") + "/shard-*.tar"
-    if pattern.startswith("gs://"):
-        fs, fs_path = fsspec.core.url_to_fs(pattern)
-        protocol = fs.protocol[0] if isinstance(fs.protocol, (tuple, list)) else fs.protocol
-        matches = sorted(fs.glob(fs_path))
-        return [p if str(p).startswith("gs://") else f"{protocol}://{p}" for p in matches]
-    return sorted(glob(pattern))
+    # eval_glob knows CNS; the stdlib `glob` does not and returns [] for a
+    # /cns/ pattern, which reads as "benchmark has no shards" rather than as an
+    # error. Six benchmarks in this file list their shards here, and all six
+    # were missed when the other four evals were routed through the helper.
+    return eval_glob(pattern)
 
 
 def _require_success_marker(root: str, benchmark: str) -> None:
@@ -350,6 +351,11 @@ def _require_success_marker(root: str, benchmark: str) -> None:
     if marker.startswith("gs://"):
         fs, fs_path = fsspec.core.url_to_fs(marker)
         exists = fs.exists(fs_path)
+    elif is_cns_path(marker):
+        # os.path.isfile is POSIX and cannot see Colossus, so it would report a
+        # committed replica as uncommitted and abort the eval.
+        from google3.pyglib import gfile
+        exists = gfile.Exists(marker)
     else:
         exists = os.path.isfile(marker)
     if not exists:

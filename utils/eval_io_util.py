@@ -92,6 +92,32 @@ def redirect_cache_dir(base_dir: str) -> str:
     return f"{borg_root}/{leaf}"
 
 
+def assert_result_dir_writable(base_dir: str, who: str = "eval") -> None:
+    """Raise unless ranks can create result files in `base_dir`.
+
+    `os.access` is a POSIX syscall and Colossus is not a POSIX filesystem, so
+    it answers False for a /cns/ directory that gfile writes to perfectly well.
+    A caller that asks it directly therefore refuses to run on Borg for a
+    permission problem that does not exist -- which is exactly how MMBench,
+    the LAST task of a final eval, killed a run whose every other eval had
+    already passed. Ask each filesystem the question in its own terms.
+    """
+    base_dir = redirect_cache_dir(base_dir)
+    if str(base_dir).startswith(("/cns/", "/bigstore/")):
+        from google3.pyglib import gfile
+        if not gfile.IsDirectory(base_dir):
+            raise PermissionError(
+                f"{who} result dir is not a directory on CNS: {base_dir}."
+            )
+        return
+    if not os.access(base_dir, os.W_OK | os.X_OK):
+        raise PermissionError(
+            f"{who} result cache dir is not writable/searchable: {base_dir}. "
+            "The eval writer creates new uniquely named result files here; "
+            "the directory itself must allow file creation."
+        )
+
+
 def ensure_eval_result_base_dir(base_dir: str) -> None:
     """Ensure ranks can create new result files in the shared cache dir."""
     base_dir = redirect_cache_dir(base_dir)

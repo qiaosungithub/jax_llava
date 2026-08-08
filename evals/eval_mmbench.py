@@ -29,7 +29,11 @@ from torch.utils.data import DataLoader, Dataset
 
 from input_pipeline import get_transforms, prepare_batch_data
 from utils.logging_util import log_for_0, log_for_all
-from utils.eval_io_util import ensure_eval_result_base_dir, eval_result_prefix
+from utils.eval_io_util import (
+    assert_result_dir_writable,
+    ensure_eval_result_base_dir,
+    eval_result_prefix,
+)
 from evals.eval_dist_util import (
     write_json,
     DistributedEvalSampler,
@@ -496,10 +500,7 @@ def _run_mmbench_predictions(p_sample_step, run_p_sample_step, model, tokenizer,
     base_dir, result_prefix = _result_prefix(config, split_name)
     ensure_eval_result_base_dir(base_dir)
 
-    if not os.access(base_dir, os.W_OK | os.X_OK):
-        raise PermissionError(
-            f"MMBench result cache dir is not writable on process {jax.process_index()}: {base_dir}."
-        )
+    assert_result_dir_writable(base_dir, who=f"MMBench (process {jax.process_index()})")
 
     write_rank_json_results(result_prefix, all_outs)
 
