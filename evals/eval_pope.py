@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from input_pipeline import get_transforms, prepare_batch_data
 from utils.logging_util import log_for_0, log_for_all
-from utils.eval_io_util import ensure_eval_result_base_dir, eval_result_prefix
+from utils.eval_io_util import redirect_cache_dir, ensure_eval_result_base_dir, eval_result_prefix
 from evals.eval_dist_util import (
     write_json,
     eval_glob,
@@ -232,6 +232,7 @@ def _pope_image_record_rows_cache_path(config, pope_root, splits, max_samples_pe
         "pope_cache_dir",
         "/kmh-nfs-ssd-us-mount/data/cached/zhh/pope_eval",
     )
+    base_dir = redirect_cache_dir(base_dir)
     ensure_eval_result_base_dir(base_dir)
     payload = json.dumps(
         {

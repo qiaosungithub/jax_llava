@@ -77,8 +77,24 @@ def _borg_eval_result_root():
     return None
 
 
+def redirect_cache_dir(base_dir: str) -> str:
+    """Send an unreachable NFS cache dir to the checkpoint bucket on Borg.
+
+    Callers pass their own default, which is always under
+    /kmh-nfs-ssd-us-mount -- readable only on the GCP cluster. Rewriting here
+    covers every caller, including the ones that build a cache path directly
+    instead of going through eval_result_prefix.
+    """
+    borg_root = _borg_eval_result_root()
+    if borg_root is None or not str(base_dir).startswith("/kmh-nfs"):
+        return base_dir
+    leaf = os.path.basename(os.path.normpath(str(base_dir))) or "cache"
+    return f"{borg_root}/{leaf}"
+
+
 def ensure_eval_result_base_dir(base_dir: str) -> None:
     """Ensure ranks can create new result files in the shared cache dir."""
+    base_dir = redirect_cache_dir(base_dir)
     if str(base_dir).startswith(("/cns/", "/bigstore/")):
         from google3.pyglib import gfile
         if not gfile.Exists(base_dir):
