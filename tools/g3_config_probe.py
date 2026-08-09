@@ -203,6 +203,23 @@ def main(argv):
                     f"dataloader replica regex rejects {_r}: a checkpoint "
                     "written here could not be resumed under strict mode.")
 
+    # The fixed COCO visualisation batch. `_vis_batch_is_needed` gates it on
+    # sampling/vis/eval being enabled, and the production config enables all
+    # three -- so a missing replica is a hard startup failure, which is how it
+    # cost a launch: COCO_val2014 existed only in cbf.
+    print("\n--- coco vis batch ---")
+    needed = train._vis_batch_is_needed(resolved_stage)
+    print(f"  needed by config   : {needed}")
+    if needed:
+        coco_root = train._coco_vis_root()
+        ok = coco_root.startswith('/cns/') and _exists(coco_root)
+        print(f"  {'OK' if ok else 'MISSING':<18} {coco_root}")
+        if not ok:
+            raise SystemExit(
+                f"COCO vis root unusable here: {coco_root}. The run enables "
+                "sampling/vis/eval, so this is a startup failure, not a "
+                "degradation.")
+
     print("\n--- weights ---")
     from models import clip_vit
     print(f"  CLIP source  : {clip_vit.resolve_clip_source()}")
