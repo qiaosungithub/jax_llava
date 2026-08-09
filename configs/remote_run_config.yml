@@ -217,7 +217,18 @@ sharding: hsdp_legacy_data
 
 # Run this queue entry from scratch. Keep these empty so the run cannot restore
 # an old checkpoint/dataloader state after monitor requeues it.
-load_from: ''
+# Stage-2 starts from the reproduced stage-1 endpoint (loss ~1.444, acc ~0.630),
+# copied CNS-to-CNS into the tul replica so it is co-located with the compute:
+# 708 files / 2,741,653,458 bytes, verified per object against the is-d source.
+#
+# The step is read from the basename, and 2180 == training.stage1_steps, so the
+# curriculum skips stage 1 and enters stage 2 with restore_mode='params_only'
+# (fresh optimizer) -- the boundary the full smoke exercises.
+#
+# NOTE for a RESUME: drop this back to '' and use --resume_xid. Carrying
+# load_from on every restart makes each attempt begin at 2180 again and then
+# collide with the checkpoint the previous attempt already wrote.
+load_from: '/cns/nm-d/home/qiaos/eqr_data/stage1_ckpt/checkpoint_2180'
 wandb_resume_id: ''
 
 logging:
