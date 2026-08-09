@@ -377,9 +377,24 @@ def resolve_borg_autoresume(config):
     (main.py) applies the answer to the config, so the decision and its effect
     are separately testable.
 
-    An explicit `load_from` ALWAYS wins and disables the probe. That is the
-    user asking for a specific checkpoint -- an eval target, or a warm start
-    from someone else's run -- and a restart must not silently redirect it.
+    An explicit `load_from` wins ONLY while this run has no progress of its
+    own. That distinction is the whole point:
+
+      * a warm start (`load_from` = another run's checkpoint, e.g. the stage-1
+        endpoint) is what attempt 1 should honour -- but once THIS run has
+        written checkpoint_N into its own bucket, attempt 2 must continue from
+        N, not start over from the warm-start path;
+      * an eval target or a checkpoint inside our own workdir still wins,
+        because there is no self-written progress to prefer.
+
+    Getting this wrong is not a slow start, it is an UNBREAKABLE LOOP: every
+    Borg task restart re-reads the config, begins again at the warm-start step,
+    and then dies with `Destination checkpoint_N already exists` when it
+    reaches the first checkpoint it already wrote. That killed a production
+    run after 11 attempts, and Borg restarts a task for reasons no operator
+    chose -- preemption, machine drain -- so it cannot be avoided by not
+    typing --load_from.
+
     The launcher relies on this: `~/work/tpu_cmd/xm_launcher.py` deliberately
     does NOT set $LOAD_FROM for `--resume_xid`, because doing so would both
     supply a path it cannot know and disable the mechanism below.
@@ -389,8 +404,6 @@ def resolve_borg_autoresume(config):
         return None, 'no $CHECKPOINT_BUCKET'
 
     existing = str(config.get('load_from', '') or '').strip()
-    if existing:
-        return None, f'load_from already set to {existing!r} (explicit request wins)'
     if config.get('eval_only', False):
         return None, 'eval_only run has no progress of its own to resume'
 
@@ -400,7 +413,19 @@ def resolve_borg_autoresume(config):
     except Exception as exc:  # noqa: BLE001 - never block a cold start
         return None, f'probe of {checkpoint_root} failed ({exc!r})'
     if not resume_from:
+        # No progress of our own: honour whatever the user asked for.
+        if existing:
+            return None, f'load_from set to {existing!r} and no self-written checkpoint yet'
         return None, f'no complete checkpoint under {checkpoint_root}'
+
+    # We have progress. It supersedes a warm start from ANOTHER run, but a
+    # load_from already inside our own checkpoint root is not a warm start --
+    # leave that alone rather than second-guessing an explicit choice.
+    if existing and not existing.rstrip('/').startswith(checkpoint_root):
+        return resume_from, (f'superseding warm start {existing!r}: this run '
+                             f'has its own progress at {resume_from}')
+    if existing:
+        return None, f'load_from already inside our own checkpoint root ({existing!r})'
     return resume_from, ''
 
 

@@ -12,6 +12,7 @@
 
 load("//third_party/bazel_rules/rules_python/python:py_binary.bzl", "py_binary")
 load("//third_party/bazel_rules/rules_python/python:py_library.bzl", "py_library")
+load("//third_party/bazel_rules/rules_python/python:py_test.bzl", "py_test")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -285,4 +286,33 @@ py_binary(
         "//third_party/py/tensorflow",
         "//third_party/py/tensorflow_datasets",
     ],
+)
+
+# The auto-resume decision, tested off Borg.
+#
+# It is a PURE function over a directory listing, which is why it can be tested
+# here at all -- and why it must be: the precedence bug it now covers (a warm
+# start being re-applied on every Borg task restart, colliding with the
+# checkpoint the previous attempt wrote) killed a production run after 11
+# restarts, and cost ~3 h of v6p-64 to observe. The test runs in seconds.
+# A py_binary, not a py_test: `:main` is itself a py_binary and strict deps
+# forbid depending on one from a test (go/py-strict-deps). Every other probe
+# target here has the same shape, and the file runs its own cases and exits
+# non-zero on failure, so `blaze run` is a complete verdict.
+py_binary(
+    name = "test_autoresume",
+    srcs = ["tests/test_autoresume.py"],
+    data = glob(
+        [
+            "**/*.py",
+            "**/*.yml",
+            "**/*.yaml",
+            "**/*.json",
+        ],
+        exclude = ["tests/test_autoresume.py"],
+    ),
+    main = "tests/test_autoresume.py",
+    strict_deps = False,
+    tags = ["nostrictdeps"],
+    deps = [":main"],
 )

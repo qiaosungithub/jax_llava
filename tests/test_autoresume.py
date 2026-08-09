@@ -15,7 +15,13 @@ import os
 import sys
 import types
 
-import pytest
+try:
+    import pytest  # noqa: F401 -- present outside google3
+except ImportError:  # google3: pytest is visibility-controlled (go/pytest-in-google3)
+    import types as _types
+    pytest = _types.ModuleType('pytest')
+    pytest.fixture = lambda *a, **k: (lambda f: f)
+    sys.modules['pytest'] = pytest
 
 # `ckpt_util` picks its filesystem at import time: google3's gfile inside a
 # Blaze binary, `gcsfs` otherwise. This workstation env has neither, and the
@@ -27,6 +33,10 @@ import pytest
 sys.modules.setdefault('gcsfs', types.ModuleType('gcsfs'))
 if not hasattr(sys.modules['gcsfs'], 'GCSFileSystem'):
     sys.modules['gcsfs'].GCSFileSystem = lambda *a, **k: None
+
+# The project is imported BY PATH (`from utils import ...`), same as every
+# tool/ target here: in a Blaze binary the package dir is not on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils import ckpt_util
 
@@ -172,14 +182,43 @@ def test_resolve_finds_the_newest_checkpoint(tmp_path, monkeypatch):
     assert why_not == ''
 
 
-def test_explicit_load_from_wins_and_disables_the_probe(tmp_path, monkeypatch):
-    """The launcher depends on this: LOAD_FROM is an explicit user request."""
+def test_warm_start_is_honoured_before_this_run_has_progress(tmp_path, monkeypatch):
+    """Attempt 1 of a warm-started run must use the checkpoint it was given."""
+    bucket = str(tmp_path)
+    os.makedirs(os.path.join(bucket, ckpt_util.CNS_CKPT_SUBDIR), exist_ok=True)
+    monkeypatch.setenv('CHECKPOINT_BUCKET', bucket)
+    resume_from, why_not = ckpt_util.resolve_borg_autoresume(
+        _Config(load_from='/cns/elsewhere/checkpoints/checkpoint_2180'))
+    assert resume_from is None
+    assert 'no self-written checkpoint yet' in why_not
+
+
+def test_self_progress_supersedes_a_warm_start(tmp_path, monkeypatch):
+    """The bug that killed a production run after 11 Borg task restarts.
+
+    A warm start from another run must NOT be re-applied once this run has
+    written its own checkpoint: every restart would begin again at the
+    warm-start step and then die with `Destination checkpoint_N already
+    exists`. Borg restarts a task for reasons nobody chose, so this cannot be
+    avoided by not passing --load_from.
+    """
     bucket = _bucket_with_checkpoints(tmp_path)
     monkeypatch.setenv('CHECKPOINT_BUCKET', bucket)
     resume_from, why_not = ckpt_util.resolve_borg_autoresume(
-        _Config(load_from='/cns/elsewhere/checkpoints/checkpoint_3'))
+        _Config(load_from='/cns/elsewhere/checkpoints/checkpoint_2180'))
+    assert resume_from.endswith('checkpoints/checkpoint_12'), resume_from
+    assert 'superseding warm start' in why_not
+
+
+def test_load_from_inside_our_own_root_is_left_alone(tmp_path, monkeypatch):
+    """Not a warm start: an explicit pick within our own run still wins."""
+    bucket = _bucket_with_checkpoints(tmp_path)
+    monkeypatch.setenv('CHECKPOINT_BUCKET', bucket)
+    own = os.path.join(bucket, ckpt_util.CNS_CKPT_SUBDIR, 'checkpoint_5')
+    resume_from, why_not = ckpt_util.resolve_borg_autoresume(
+        _Config(load_from=own))
     assert resume_from is None
-    assert 'explicit request wins' in why_not
+    assert 'inside our own checkpoint root' in why_not
 
 
 def test_eval_only_does_not_resume(tmp_path, monkeypatch):
@@ -236,3 +275,57 @@ def test_probe_failure_degrades_to_cold_start(tmp_path, monkeypatch):
     resume_from, why_not = ckpt_util.resolve_borg_autoresume(_Config())
     assert resume_from is None
     assert why_not
+
+
+# --------------------------------------------------------------------------
+# google3 entry point.
+#
+# pytest is visibility-controlled here (go/pytest-in-google3) and this package
+# is not in its allowlist, so the file doubles as an absltest: it applies the
+# two fixtures by hand and runs every test_* with a temp dir. Outside google3
+# `pytest tests/test_autoresume.py` still works unchanged.
+# --------------------------------------------------------------------------
+
+def _run_all():
+    import tempfile, pathlib, inspect, traceback
+    failures = []
+    for name, fn in sorted(globals().items()):
+        if not name.startswith('test_') or not callable(fn):
+            continue
+        saved_fs = ckpt_util.FS
+        saved_g3 = ckpt_util.g3_env.in_google3
+        saved_env = os.environ.get('CHECKPOINT_BUCKET')
+
+        class _MP:
+            def setattr(self, obj, n, v): setattr(obj, n, v)
+            def setenv(self, k, v): os.environ[k] = v
+            def delenv(self, k, raising=True): os.environ.pop(k, None)
+
+        ckpt_util.FS = _LocalFS()
+        ckpt_util.g3_env.in_google3 = lambda: False
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                kwargs = {}
+                params = inspect.signature(fn).parameters
+                if 'tmp_path' in params:
+                    kwargs['tmp_path'] = pathlib.Path(td)
+                if 'monkeypatch' in params:
+                    kwargs['monkeypatch'] = _MP()
+                fn(**kwargs)
+            print(f'PASS {name}')
+        except Exception:  # noqa: BLE001 - report every failure, not the first
+            failures.append(name)
+            print(f'FAIL {name}\n{traceback.format_exc()}')
+        finally:
+            ckpt_util.FS = saved_fs
+            ckpt_util.g3_env.in_google3 = saved_g3
+            if saved_env is None:
+                os.environ.pop('CHECKPOINT_BUCKET', None)
+            else:
+                os.environ['CHECKPOINT_BUCKET'] = saved_env
+    print(f'\n{"FAILED: " + ", ".join(failures) if failures else "ALL TESTS PASSED"}')
+    return 1 if failures else 0
+
+
+if __name__ == '__main__':
+    sys.exit(_run_all())
