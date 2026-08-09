@@ -1052,7 +1052,7 @@ def _run_train_phase(
     )
     log_for_0(f'[{stage_name}] The initial training step may take a while....')
 
-    _data_secs = _step_secs = 0.0
+    _data_secs = _step_secs = _gb_secs = _mt_secs = _iter_secs = 0.0
     for step in range(int(current_step), int(stage_end_step)):
         # SPLIT THE STEP INTO DATA vs COMPUTE.
         #
@@ -1063,13 +1063,16 @@ def _run_train_phase(
         # arrays is the step itself. Cost is one perf_counter per step plus,
         # once per log interval, a block_until_ready that the very next line
         # would have forced anyway.
+        _t_iter0 = time.perf_counter()
         _t_data0 = time.perf_counter()
         raw_batch = next(train_iter)
         batch = _prepare_host_batch(raw_batch)
         _t_data = time.perf_counter() - _t_data0
         if step == int(current_step):
             log_for_0(f'[{stage_name}] first batch ready')
+        _t_gb0 = time.perf_counter()
         global_batch = _make_global_batch(batch, batch_spec, mesh)
+        _t_gb = time.perf_counter() - _t_gb0
         _t_step0 = time.perf_counter()
         state, metrics, all_debug = p_train_step(state, global_batch)
         _is_log_step = (step + 1) % int(config.training.log_per_step) == 0
@@ -1083,7 +1086,12 @@ def _run_train_phase(
         if step == int(current_step):
             log_for_0(f'[{stage_name}] Train step compiled in {timer}.')
 
+        _t_mt0 = time.perf_counter()
         metrics_tracker.update(metrics)
+        _t_mt = time.perf_counter() - _t_mt0
+        _gb_secs += _t_gb
+        _mt_secs += _t_mt
+        _iter_secs += time.perf_counter() - _t_iter0
         local_step = step - int(stage_start_step)
         if (step + 1) % int(config.training.log_per_step) == 0:
             summary = metrics_tracker.finalize()
@@ -1093,7 +1101,12 @@ def _run_train_phase(
             _n = int(config.training.log_per_step)
             summary['sec_per_step_data'] = _data_secs / _n
             summary['sec_per_step_compute'] = _step_secs / _n
-            _data_secs = _step_secs = 0.0
+            summary['sec_per_step_toglobal'] = _gb_secs / _n
+            summary['sec_per_step_metrics'] = _mt_secs / _n
+            # The whole iteration, so the parts can be checked against the sum:
+            # anything unaccounted for shows up as the difference.
+            summary['sec_per_step_total'] = _iter_secs / _n
+            _data_secs = _step_secs = _gb_secs = _mt_secs = _iter_secs = 0.0
             summary['normal_lr'] = normal_lr_fn(local_step + 1)
             summary['vision_encoder_lr'] = vision_lr_fn(local_step + 1)
             summary['connector_lr'] = connector_lr_fn(local_step + 1)

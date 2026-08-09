@@ -316,3 +316,25 @@ py_binary(
     tags = ["nostrictdeps"],
     deps = [":main"],
 )
+
+# The metrics tracker's device-side accumulation, checked for VALUE equality
+# against the old host-side version. A performance fix that moves a number is
+# worse than the slowness it cures, and this one touches every logged metric.
+py_binary(
+    name = "g3_metrics_tracker_probe",
+    srcs = ["tools/g3_metrics_tracker_probe.py"],
+    data = glob(["utils/*.py"]),
+    main = "tools/g3_metrics_tracker_probe.py",
+    strict_deps = False,
+    tags = ["nostrictdeps"],
+    deps = [
+        # logging_util imports PIL and the wandb mock at module scope.
+        "//third_party/py/PIL:pil",
+        "//third_party/py/absl/logging",
+        "//third_party/py/etils/epath",
+        "//third_party/py/jax",
+        "//third_party/py/numpy",
+        "//third_party/py/scamper:wandb_mock",
+        "//pyglib:gfile",
+    ],
+)
