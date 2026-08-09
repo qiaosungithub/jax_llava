@@ -217,9 +217,13 @@ sharding: hsdp_legacy_data
 
 # Run this queue entry from scratch. Keep these empty so the run cannot restore
 # an old checkpoint/dataloader state after monitor requeues it.
-# Stage-2 starts from the reproduced stage-1 endpoint (loss ~1.444, acc ~0.630),
-# copied CNS-to-CNS into the tul replica so it is co-located with the compute:
-# 708 files / 2,741,653,458 bytes, verified per object against the is-d source.
+# Stage-2 starts from the reproduced stage-1 endpoint (loss ~1.444, acc ~0.630).
+# This is the ORIGINAL in is-d (cbf), co-located with v7 compute in that metro.
+# A tul copy also exists (nm-d/eqr_data/stage1_ckpt) for a v6p run there, but
+# v6p is fleet-capped: the dynamic root pool reports a `ghostfish:46` deficit,
+# which is a power/bonus-capacity ceiling above our alloc and does not clear by
+# waiting -- 13 gang teardowns in 6.5 h. v7-32 in cbf has 3891 obtainable chips
+# against v6p-64's 232 in tul.
 #
 # The step is read from the basename, and 2180 == training.stage1_steps, so the
 # curriculum skips stage 1 and enters stage 2 with restore_mode='params_only'
@@ -228,7 +232,7 @@ sharding: hsdp_legacy_data
 # NOTE for a RESUME: drop this back to '' and use --resume_xid. Carrying
 # load_from on every restart makes each attempt begin at 2180 again and then
 # collide with the checkpoint the previous attempt already wrote.
-load_from: '/cns/nm-d/home/qiaos/eqr_data/stage1_ckpt/checkpoint_2180'
+load_from: '/cns/is-d/home/qiaos/eqr_data/logs/jax_llava/xid_277917081_20260807_195157_llava15-stage2-v13/pretrained-ckpts/checkpoint_2180'
 wandb_resume_id: ''
 
 logging:
