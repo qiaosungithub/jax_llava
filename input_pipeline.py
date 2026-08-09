@@ -779,6 +779,23 @@ def _assert_same_zone_roots(roots, zone, local_debug=False):
             continue
         for expanded in (root.split("::") if "::" in root else [root]):
             bucket = _gcs_bucket(expanded)
+            if bucket is not None and g3_env.in_google3():
+                # On Borg a gs:// root is never read as GCS: the webdataset
+                # opener rewrites it to the co-located CNS replica at the last
+                # hop, because OV1.5 shard roots are assembled in modules that
+                # do not all pass through data_util's resolution. So judge the
+                # root the runtime will actually open -- checking the gs://
+                # spelling against a zone bucket table asks the wrong question
+                # and refuses a read that would have been local.
+                from utils.data_util import _rewrite_bucket_to_cns
+                cns = _rewrite_bucket_to_cns(expanded)
+                if cns is None:
+                    raise ValueError(
+                        f"Refusing dataset read: root={expanded} has no CNS "
+                        f"replica under any data root local to zone {zone}. "
+                        "Copy it to the replica or fix its resolution."
+                    )
+                expanded, bucket = cns, None
             if bucket is not None:
                 if expected is None:
                     raise ValueError(

@@ -370,8 +370,18 @@ def _rewrite_bucket_to_cns(path: str):
     # data/vqav2 has train2014 while eval_bundle/data/vqav2 has val2014 -- so
     # matching on the top-level directory picks the first tree that merely has
     # the right name and then resolves to a split that is not there.
-    prefix = rel.split('*', 1)[0].split('{', 1)[0].rstrip('/')
-    probe = prefix if '.' not in prefix.rsplit('/', 1)[-1] else prefix.rsplit('/', 1)[0]
+    head = rel.split('*', 1)[0].split('{', 1)[0]
+    prefix = head.rstrip('/')
+    # Two ways the prefix can name something that does not exist, both of which
+    # made this return None for data that is present:
+    #   'a/b/shard-{000000..000108}.tar' -> 'a/b/shard-'   (cut MID-SEGMENT)
+    #   'a/b/00000.tar'                  -> a file, not a directory
+    # In both cases the thing to probe is the parent directory. The mid-segment
+    # case is the one that bit: a brace range leaves a partial basename with no
+    # '.' in it, so the old test kept it and probed '.../shard-'.
+    cut_mid_segment = len(head) < len(rel) and not head.endswith('/')
+    last = prefix.rsplit('/', 1)[-1]
+    probe = prefix.rsplit('/', 1)[0] if (cut_mid_segment or '.' in last) else prefix
     for root in g3_env.cns_data_roots():
         for base_root in (root.rstrip('/'), f"{root.rstrip('/')}/eval_bundle/data"):
             try:
