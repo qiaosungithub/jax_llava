@@ -2,6 +2,7 @@ from absl import logging as absl_logging
 from functools import partial
 import os
 import copy
+import time
 import warnings
 from hashlib import md5
 
@@ -1051,13 +1052,34 @@ def _run_train_phase(
     )
     log_for_0(f'[{stage_name}] The initial training step may take a while....')
 
+    _data_secs = _step_secs = 0.0
     for step in range(int(current_step), int(stage_end_step)):
+        # SPLIT THE STEP INTO DATA vs COMPUTE.
+        #
+        # Without this the log reports one steps_per_second and cannot say
+        # which half owns it -- which is exactly the question when a run is 7x
+        # slower than its reference on comparable hardware. The wait on
+        # next(train_iter) is host-side input pipeline; the wait on the device
+        # arrays is the step itself. Cost is one perf_counter per step plus,
+        # once per log interval, a block_until_ready that the very next line
+        # would have forced anyway.
+        _t_data0 = time.perf_counter()
         raw_batch = next(train_iter)
         batch = _prepare_host_batch(raw_batch)
+        _t_data = time.perf_counter() - _t_data0
         if step == int(current_step):
             log_for_0(f'[{stage_name}] first batch ready')
         global_batch = _make_global_batch(batch, batch_spec, mesh)
+        _t_step0 = time.perf_counter()
         state, metrics, all_debug = p_train_step(state, global_batch)
+        _is_log_step = (step + 1) % int(config.training.log_per_step) == 0
+        if _is_log_step:
+            # jax dispatch is async, so timing the call alone measures nothing.
+            # Block ONLY on log steps: every other step stays pipelined.
+            jax.block_until_ready(state.params)
+        _t_step = time.perf_counter() - _t_step0
+        _data_secs += _t_data
+        _step_secs += _t_step
         if step == int(current_step):
             log_for_0(f'[{stage_name}] Train step compiled in {timer}.')
 
@@ -1066,6 +1088,12 @@ def _run_train_phase(
         if (step + 1) % int(config.training.log_per_step) == 0:
             summary = metrics_tracker.finalize()
             summary['steps_per_second'] = config.training.log_per_step / timer.elapse_with_reset()
+            # Which half of the step is the wall? A run bound by its input
+            # pipeline and one bound by compute need opposite fixes.
+            _n = int(config.training.log_per_step)
+            summary['sec_per_step_data'] = _data_secs / _n
+            summary['sec_per_step_compute'] = _step_secs / _n
+            _data_secs = _step_secs = 0.0
             summary['normal_lr'] = normal_lr_fn(local_step + 1)
             summary['vision_encoder_lr'] = vision_lr_fn(local_step + 1)
             summary['connector_lr'] = connector_lr_fn(local_step + 1)
