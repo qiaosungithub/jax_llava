@@ -218,11 +218,15 @@ eval:
     # A smoke wants the code path, not the number: cap every population.
     #
     # `max_eval_steps` used to be the only thing here and NOTHING READS IT --
-    # so this block asked for a cap and got full benchmarks. Each key below was
-    # checked against its reader; the shared one is `debug_max_samples`, which
-    # eval_vqav2/textvqa/pixelbench/mme/pope/refcocog/mmbench and the whole
-    # eval_vlm_benchmarks family (gqa, seed_bench, cvbench, vlms-are-blind,
-    # docvqa, realworldqa) all consult.
+    # so this block asked for a cap and got full benchmarks.
+    #
+    # There are TWO cap mechanisms, and assuming one covers everything is how
+    # the first widened smoke still ran six benchmarks at full size (45 min
+    # instead of 15). `debug_max_samples` is read by eval_vqav2, textvqa,
+    # pixelbench, mme, pope, refcocog and mmbench. The eval_vlm_benchmarks
+    # family does NOT read it -- it takes `<benchmark>_num_samples`, whose
+    # default is the full benchmark. Each key below was checked against its
+    # reader.
     debug_max_samples: 64
     # Not covered by debug_max_samples: these have their own knobs.
     pixelbench_num_samples_per_benchmark: 32
@@ -233,6 +237,14 @@ eval:
     # KNN reads TFDS ImageNet, whose full pass is 1.28M train + 50k val. The
     # smoke proves the data_dir resolves and the pipeline runs; 2 images per
     # class over 1000 classes plus 512 val images does that in minutes.
+    # eval_vlm_benchmarks' own knob, one per benchmark; defaults are the full
+    # sets (12578 / 14233 / 2638 / 8016 / 5349 / 765).
+    gqa_num_samples: 64
+    seed_bench_num_samples: 64
+    cambrian_cvbench_num_samples: 64
+    vlms_are_blind_num_samples: 64
+    docvqa_num_samples: 64
+    realworldqa_num_samples: 64
     knn_full_images_per_class: 2
     knn_val_examples: 512
     knn_batch_size: 64
