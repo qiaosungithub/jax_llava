@@ -171,6 +171,38 @@ def main(argv):
             raise SystemExit(f"{n_bad} unusable dataset root(s) in {stage_key}")
         resolved_stage = stage
 
+    # The startup gate itself. `_init_run` asserted a hardcoded zone allowlist
+    # that predated the CNS replicas and rejected tul outright -- 4 minutes of
+    # packaging and scheduling to discover a one-line check the probe could
+    # have run locally. Anything that can refuse to start belongs here.
+    print("\n--- startup gate (train._init_run preconditions) ---")
+    from utils import ckpt_util
+    inferred = ckpt_util.infer_zone_card(config, '/tmp/wd')
+    print(f"  infer_zone_card    : {inferred}")
+    if g3_env.in_google3():
+        print(f"  cns_data_roots     : {list(g3_env.cns_data_roots())}")
+    else:
+        assert inferred in ['us-central1', 'us-east5', 'asia-northeast1-b']
+    # The dataloader replica regex only bites at the FIRST CHECKPOINT, ~40 min
+    # into a run, so it is worth asserting here rather than discovering later.
+    from utils.dataloader_state_util import _REPLICA_DATA_BUCKET_RE as _RX
+    # Check the path the loader will REALLY hand the state tracker: a gs://
+    # root is rewritten to CNS at the opener, so testing the raw string tests
+    # nothing. Every distinct CNS prefix in the mix gets checked.
+    _prefixes = set()
+    for _root in list(resolved_stage.dataset.root):
+        _t = _runtime_target(str(_root)) or str(_root)
+        if _t.startswith('/cns/'):
+            _prefixes.add('/'.join(_t.split('/')[:6]))
+    for _r in sorted(_prefixes):
+        if True:
+            ok = bool(_RX.match(_r))
+            print(f"  replica regex      : {'OK' if ok else 'REJECT'}  {_r}")
+            if not ok:
+                raise SystemExit(
+                    f"dataloader replica regex rejects {_r}: a checkpoint "
+                    "written here could not be resumed under strict mode.")
+
     print("\n--- weights ---")
     from models import clip_vit
     print(f"  CLIP source  : {clip_vit.resolve_clip_source()}")

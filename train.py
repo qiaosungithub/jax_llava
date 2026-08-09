@@ -1224,9 +1224,19 @@ def _run_train_phase(
 def _init_run(config, workdir):
     config.workdir_hash = md5(workdir.encode()).hexdigest()[:8]
     zone = infer_zone_card(config, workdir)
-    assert zone in ['us-central1', 'us-east5', 'asia-northeast1-b'], (
-        'We only support us-central1, us-east5 and asia-northeast1-b for now.'
-    )
+    # The zone allowlist predates the CNS replicas: it names the three GCP
+    # regions that own a kmh bucket. On Borg the run reads Colossus, so the
+    # question is not "is there a bucket for this zone" but "is there a data
+    # replica local to it" -- g3_env owns that answer, and hardcoding regions
+    # here silently excluded tul (us-central2) and lpp (europe-north1), both
+    # of which hold a complete, byte-identical replica.
+    if g3_env.in_google3():
+        roots = g3_env.cns_data_roots()   # raises, fail-closed, if unresolvable
+        log_for_0(f'[zone] {zone}: CNS data roots {list(roots)}')
+    else:
+        assert zone in ['us-central1', 'us-east5', 'asia-northeast1-b'], (
+            'We only support us-central1, us-east5 and asia-northeast1-b for now.'
+        )
     config.zone = zone
     log_for_0(config)
     mesh_bundle = prepare_pjit_funcs(getattr(config, 'sharding', 'hsdp'))

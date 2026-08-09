@@ -89,9 +89,16 @@ STATE_VERSION = 1
 # manifest), so a resume that moves between them is the SAME corpus and must
 # not be rejected. Adding go-d here is what lets a run checkpointed before the
 # storage move resume after it.
+# is-d / nm-d / li-d (cbf / tul / lpp) were added once all three carried the
+# SAME us-east5 crawl, verified per object against go-d: 1097 tars, zero
+# missing, zero size mismatch. That is the condition this regex encodes --
+# "these prefixes hold interchangeable corpora" -- so a run may checkpoint in
+# one metro and resume in another without the strict check rejecting a
+# dataloader state that is genuinely compatible. A metro whose replica is a
+# DIFFERENT crawl must never be listed here.
 _REPLICA_DATA_BUCKET_RE = re.compile(
-    r"^(gs://kmh-gcp-(?:us-central1|us-east5|asia-northeast1-b)/data"
-    r"|/cns/(?:yucmhcg-d|go-d)/home/qiaos/data)(/.*)?$"
+    r"^(gs://kmh-gcp-(?:us-central1|us-east5|us-central2|asia-northeast1-b)/data"
+    r"|/cns/(?:yucmhcg-d|go-d|is-d|nm-d|li-d)/home/qiaos/data)(/.*)?$"
 )
 _LOGICAL_DATA_BUCKET_PREFIX = "gs://kmh-gcp-<replica>/data"
 
