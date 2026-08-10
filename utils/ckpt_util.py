@@ -540,6 +540,35 @@ def save_checkpoint(state, workdir, *, log_completion=True):
     return step, gs_path
 
 
+# Replica-parallel saving splits each array across the replicas that hold it, and
+# every such slice costs an eager `jax.lax.slice_in_dim` dispatch in
+# `ReplicaSlice.data()`. Anchoring on production -- 1274 arrays x 8 addressable
+# devices = 10192 dispatches per host, measured at 79 s -- puts one dispatch at
+# ~7.8 ms, which is pure overhead next to a copy.
+#
+# The dial has to be a SIZE, not a replica count, because the two failure modes
+# pull in opposite directions. Turning replica-parallel off entirely leaves only
+# replica 0, and for this mesh (every array is P(AXIS_2); the four shard owners
+# are devices 0-3) that is all on host 0: one host would write 12.33 GiB and
+# seven would write nothing. Leaving it fully on pays the dispatch for all 1274
+# arrays, including the ~1000 tiny ones where splitting a few KiB across 16
+# hosts buys nothing at all.
+#
+# Applying the threshold to the per-replica-slice sizes in a real checkpoint's
+# `_METADATA` (modelled below, per host):
+#
+#     threshold   rp arrays   dispatches   D2H est   GiB on host 0   imbalance
+#     off (0)          1274        10192      79 s          1.54          1.00x
+#     64 KiB            465         3720      29 s          1.70          1.10x
+#     256 KiB           207         1656      13 s          2.65          1.72x
+#     rp fully off        0            0       0 s         12.33          8.01x
+#
+# 64 KiB takes the big win (2.7x fewer dispatches) for 10% more bytes on the
+# busiest host. 256 KiB is tempting but concentrates 1.7x, and the write side is
+# the half we are already fixing; do not spend that headroom without measuring.
+_MIN_SLICE_BYTES_FOR_REPLICA_PARALLEL = 64 * 1024
+
+
 def _fast_pytree_handler():
     """`PyTreeCheckpointHandler` with the two per-array costs that dominate here.
 
@@ -566,14 +595,29 @@ def _fast_pytree_handler():
        express this -- `_concurrent_bytes(None)` substitutes the 96 GB default --
        so the bytes-level argument must go through `handler_impl`.
 
-    2. D2H SIDE -- `use_replica_parallel`. `ReplicaSlice.data()` builds a `Mesh`
-       and dispatches a `jax.lax.slice_in_dim` PER REPLICA SLICE, one slice per
-       addressable device. Measured on a forced (4,4,4) 64-device mesh:
-       46.4 ms/array with it versus 3.6 ms/array without, while copying every
-       shard whole costs 3.6 ms/array -- the cost is the slicing, not the copy.
-       This is also why v7 hurt more than v5p at identical bytes: v7 exposes two
-       cores per chip, so the same 8 hosts have 8 addressable devices each
-       instead of 4, and the number of slices per array doubled.
+    2. D2H SIDE -- replica-parallel slicing. `ReplicaSlice.data()` builds a
+       `Mesh` and dispatches a `jax.lax.slice_in_dim` PER REPLICA SLICE, one
+       slice per addressable device, eagerly. Measured on a forced (4,4,4)
+       64-device mesh: 46.4 ms/array with 16 replicas versus 3.6 ms/array with
+       none, while copying every shard whole costs 3.6 ms/array -- so the cost
+       is the slicing, not the copy. That is also why v7 hurt more than v5p at
+       identical bytes: v7 exposes two cores per chip, so the same 8 hosts have
+       8 addressable devices each instead of 4, and the slices per array
+       doubled.
+
+       We gate on slice SIZE rather than switching the feature off, and the
+       distinction is load-bearing. EVERY array in this model is sharded on a
+       single mesh axis -- read out of a real checkpoint's `_sharding`, all
+       1274 are P(AXIS_2) modulo leading Nones -- so each is replicated across
+       the other 16 (AXIS_0 x AXIS_1) positions. With
+       `use_replica_parallel=False` orbax keeps only replica 0, and on the
+       (4,4,4) mesh those four shard owners are devices 0-3, all on HOST 0:
+       one host would write 12.33 GiB and seven would write nothing. The
+       size threshold instead skips the split only for arrays too small to
+       benefit, which is most of them by count and almost none by bytes.
+       (The per-host model behind the table above reproduces the observed
+       ~1.41 GiB per `ocdbt.process_N` directory once the logged 0.90 write
+       ratio is applied, so it is calibrated, not hypothetical.)
 
     Deliberately NOT changed, each for a measured reason:
 
@@ -603,7 +647,12 @@ def _fast_pytree_handler():
         if ty is jax.Array:
             handler = _jah.ArrayHandler(
                 array_metadata_store=_ams.Store(),
-                use_replica_parallel=False,
+                # NOT use_replica_parallel=False: that keeps only replica 0,
+                # and for this mesh every shard owner sits on host 0. Gate on
+                # slice SIZE instead, so all 8 hosts keep writing the arrays
+                # that are big enough to be worth splitting.
+                min_slice_bytes_for_replica_parallel=(
+                    _MIN_SLICE_BYTES_FOR_REPLICA_PARALLEL),
             )
         handlers.append((ty, handler))
 
