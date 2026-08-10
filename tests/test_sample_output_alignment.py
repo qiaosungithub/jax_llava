@@ -295,7 +295,18 @@ def test_multiple_rows_per_shard():
         assert np.array_equal(got, want), f'process {process}: {got.tolist()}'
 
 
-if __name__ == '__main__':
+def _run_all(_argv=None):
+    """Run every test_* in this module; exit non-zero on any failure.
+
+    MUST BE CALLED FROM INSIDE `absl.app.run()` UNDER BLAZE. In google3 JAX
+    refuses any call made before `InitGoogle()`, which `app.run()` triggers:
+    touching a Mesh at import time (or from a bare `__main__` block) dies with
+    "Attempted call to JAX before absl.app.run() is called" -- all 7 tests
+    failed that way before this wrapper existed, which would have read as the
+    fix being broken rather than the harness being unportable.
+
+    Outside google3 there is no such rule, so the fallback below just calls it.
+    """
     failures = 0
     for name, fn in sorted(globals().items()):
         if name.startswith('test_') and callable(fn):
@@ -306,3 +317,12 @@ if __name__ == '__main__':
                 failures += 1
                 print(f'FAIL {name}: {type(exc).__name__}: {exc}')
     raise SystemExit(1 if failures else 0)
+
+
+if __name__ == '__main__':
+    try:
+        from absl import app
+    except ImportError:      # plain interpreter, no absl: nothing to defer to.
+        _run_all()
+    else:
+        app.run(_run_all)
