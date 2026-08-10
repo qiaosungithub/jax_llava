@@ -338,3 +338,21 @@ py_binary(
         "//pyglib:gfile",
     ],
 )
+
+# Which mesh does a real slice get? get_mesh() falls back to a flat 1-D debug
+# mesh for an unknown TPU kind, silently, and a 1-D mesh under HSDP shards
+# every parameter across all devices -- slow, never wrong, so nothing fails.
+py_binary(
+    name = "g3_mesh_probe",
+    srcs = ["tools/g3_mesh_probe.py"],
+    data = glob(["utils/*.py"]),
+    main = "tools/g3_mesh_probe.py",
+    strict_deps = False,
+    tags = ["nostrictdeps"],
+    deps = [
+        "//learning/brain/research/jax:tpu_support",
+        "//third_party/py/absl:app",
+        "//third_party/py/jax",
+        "//third_party/py/numpy",
+    ],
+)

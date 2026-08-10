@@ -26,7 +26,32 @@ class MeshMode(enum.Enum):
     MODEL = enum.auto()
 
 
+# DEVICE COUNTS, NOT CHIP COUNTS. v6p and v7 expose TWO CORES PER CHIP, so a
+# v7-32 is 64 devices and a v6p-64 is 128 (wiki tpu_reference.md). The key is
+# matched against `device_kind`, so a generation missing here does not fail --
+# `get_mesh` silently falls back to a flat 1-D mesh, which under HSDP shards
+# every parameter across ALL devices and makes each matmul pay a full-mesh
+# collective. That cost 5.8x throughput on a v7-32 before it was noticed, and
+# nothing errored: a 1-D mesh trains, just slowly.
 TOPOLOGIES = {
+    # v7 (ghostfishlite) has the SAME slice geometry as v6p -- 3-D torus, 4
+    # chips/host -- per platforms/accelerator_metadata; only the locus name
+    # differs. Registered slice sizes are 4/8/16/32 CHIPS, i.e. 8/16/32/64
+    # devices. Shapes mirror the v5 3-D entries, which is what the reference
+    # run used on a 64-device slice.
+    # NOTE THE KEY. v7 reports device_kind "TPU7x" -- no space, no "v" -- while
+    # every earlier generation is "TPU v5p"/"TPU v6e"/... JAX itself special-
+    # cases this (third_party/py/jax/.../megablox/common.py: "TPU v7 has a
+    # different pattern (i.e. TPU7x)"). A "v7" key would never match, and the
+    # match failure is SILENT, so it would have looked fixed and changed
+    # nothing. Matching is done on a lowercased kind, hence "tpu7".
+    "tpu7": {
+        8: (2, 4),
+        16: (4, 4),
+        32: (2, 4, 4),
+        64: (4, 4, 4),
+        128: (8, 4, 4),
+    },
     "v6": {
         4: (1, 4),
         16: (4, 4),
@@ -334,7 +359,21 @@ def get_mesh() -> Mesh:
             mesh_shape = topo_shapes[global_device_count]
             break
     if mesh_shape is None:
-        # Local CPU/GPU debug path.
+        # Local CPU/GPU debug path -- and, before v7 was added to TOPOLOGIES,
+        # the path a real TPU slice silently took when its kind was unknown.
+        # A 1-D mesh is a correctness-preserving disaster: under hsdp the model
+        # axis is axis_names[-1], which on one axis means every parameter is
+        # sharded across every device and each matmul pays a full-mesh
+        # collective. Training still converges, so only throughput complains.
+        # Say it loudly here; the caller decides whether to tolerate it.
+        if str(device_kind).strip() and "tpu" in device_kind:
+            log_for_0(
+                "WARNING: TPU kind %r is not in TOPOLOGIES %s, so the mesh falls "
+                "back to a FLAT 1-D (%d,) shape. Under HSDP this shards every "
+                "parameter across all devices and costs several-fold "
+                "throughput. Add this kind to TOPOLOGIES.",
+                device_kind, sorted(TOPOLOGIES), global_device_count,
+            )
         mesh_shape = (global_device_count,)
 
     devices = _process_major_model_axis_mesh(mesh_shape, devices)
