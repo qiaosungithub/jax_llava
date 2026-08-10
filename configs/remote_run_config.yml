@@ -217,7 +217,19 @@ sharding: hsdp_legacy_data
 
 # Run this queue entry from scratch. Keep these empty so the run cannot restore
 # an old checkpoint/dataloader state after monitor requeues it.
-# Stage-2 starts from the reproduced stage-1 endpoint (loss ~1.444, acc ~0.630).
+# Continuing XID 278366344 from step 12800, NOT restarting from stage 1.
+#
+# That run trained 10620 stage-2 steps on a mesh that get_mesh() had silently
+# built as a flat (64,) -- v7's device_kind was missing from TOPOLOGIES, so
+# every parameter was sharded across all 64 devices and each step cost 3.2 s
+# instead of 0.88 s. The mesh fix takes v7 to (4,4,4) and 1.136 steps/s,
+# measured. Resuming rather than restarting saves 41.6 h.
+#
+# The dataloader's strict topology hash covers jax_process_count and
+# process_batch_size, NOT the mesh shape -- both are unchanged (8 processes x
+# 32) -- so the state written under the old mesh is still valid here.
+# checkpoint_12800 verified complete: commit_timestamp_nsecs present, 8
+# dataloader_state files.
 # This is the ORIGINAL in is-d (cbf), co-located with v7 compute in that metro.
 # A tul copy also exists (nm-d/eqr_data/stage1_ckpt) for a v6p run there, but
 # v6p is fleet-capped: the dynamic root pool reports a `ghostfish:46` deficit,
@@ -232,7 +244,7 @@ sharding: hsdp_legacy_data
 # NOTE for a RESUME: drop this back to '' and use --resume_xid. Carrying
 # load_from on every restart makes each attempt begin at 2180 again and then
 # collide with the checkpoint the previous attempt already wrote.
-load_from: '/cns/is-d/home/qiaos/eqr_data/logs/jax_llava/xid_277917081_20260807_195157_llava15-stage2-v13/pretrained-ckpts/checkpoint_2180'
+load_from: '/cns/is-d/home/qiaos/eqr_data/logs/jax_llava/xid_278366344_20260809_144705_llava15-stage2-prod-e/checkpoints/checkpoint_12800'
 wandb_resume_id: ''
 
 logging:
