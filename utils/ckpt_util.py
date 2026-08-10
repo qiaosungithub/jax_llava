@@ -540,6 +540,84 @@ def save_checkpoint(state, workdir, *, log_completion=True):
     return step, gs_path
 
 
+def _fast_pytree_handler():
+    """`PyTreeCheckpointHandler` with the two per-array costs that dominate here.
+
+    A stock `ocp.PyTreeCheckpointHandler()` spent 236 s per save (12.3 GiB, 1274
+    arrays, 8 hosts) against 24 s for the SAME code and the SAME payload on
+    GCS/v5p. None of it was bandwidth: the same directory absorbed 11.02 GiB at
+    1881 MiB/s inside the slow phase. It was two per-ARRAY costs.
+
+    1. WRITE SIDE -- `save_concurrent_bytes`, which is a booby trap. Leaving it
+       at the default installs a `LimitInFlightBytes` of 96 GB. It never limits
+       anything (we write 1.5 GiB/host); its only effect is that orbax then
+       refuses to open an OCDBT atomic transaction:
+
+           use_transaction = (infos[0].is_ocdbt_checkpoint
+                              and (infos[0].byte_limiter is None
+                                   or isinstance(infos[0].byte_limiter,
+                                                 UnlimitedInFlightBytes)))
+
+       (`_src/serialization/jax_array_handlers.py`). Without that transaction
+       every array commits its own OCDBT B-tree generation. Decoded from a real
+       checkpoint's manifest (`ocdbt dump`): generation_number reached 1022,
+       num_keys grew by exactly +1 per generation, and 1022 commits x ~149 ms
+       accounts for the whole 152 s commit phase. `save_concurrent_gb` CANNOT
+       express this -- `_concurrent_bytes(None)` substitutes the 96 GB default --
+       so the bytes-level argument must go through `handler_impl`.
+
+    2. D2H SIDE -- `use_replica_parallel`. `ReplicaSlice.data()` builds a `Mesh`
+       and dispatches a `jax.lax.slice_in_dim` PER REPLICA SLICE, one slice per
+       addressable device. Measured on a forced (4,4,4) 64-device mesh:
+       46.4 ms/array with it versus 3.6 ms/array without, while copying every
+       shard whole costs 3.6 ms/array -- the cost is the slicing, not the copy.
+       This is also why v7 hurt more than v5p at identical bytes: v7 exposes two
+       cores per chip, so the same 8 hosts have 8 addressable devices each
+       instead of 4, and the number of slices per array doubled.
+
+    Deliberately NOT changed, each for a measured reason:
+
+    * `enable_write_sharding_file` stays True. It looked like a third win, and
+      it is not: the `_sharding` file's mtime lands one second BEFORE the commit
+      window opens, and a C++ probe against the real gfile driver measured
+      `kvstore::Open` at p50 0.01 ms warm, so the per-array opens cost ~0 s.
+      Turning it off would buy nothing and would make restore depend on the
+      caller always supplying sharding.
+    * `enable_pinned_host_transfer` stays at its default False. Orbax disabled it
+      for poor performance, it needs a `pinned_host` memory kind to do anything,
+      and the fast reference run had it False too.
+    * `use_ocdbt` stays True. The bulk write is already fast; OCDBT is not the
+      problem, the missing transaction was.
+    """
+    from orbax.checkpoint._src.handlers import base_pytree_checkpoint_handler as _base
+    from orbax.checkpoint._src.metadata import array_metadata_store as _ams
+    from orbax.checkpoint._src.serialization import jax_array_handlers as _jah
+    from orbax.checkpoint._src.serialization import type_handler_registry as _thr
+
+    # Copy the default registry and swap ONLY the jax.Array entry. Building a
+    # registry from that one pair drops the int/float/str/ndarray handlers and
+    # the save dies on `state.step` with "TypeHandler lookup failed for:
+    # type=<class 'int'>".
+    handlers = []
+    for ty, handler in _thr._DEFAULT_TYPE_HANDLERS:  # pylint: disable=protected-access
+        if ty is jax.Array:
+            handler = _jah.ArrayHandler(
+                array_metadata_store=_ams.Store(),
+                use_replica_parallel=False,
+            )
+        handlers.append((ty, handler))
+
+    return ocp.PyTreeCheckpointHandler(
+        handler_impl=_base.BasePyTreeCheckpointHandler(
+            # None, NOT a large number: only None yields UnlimitedInFlightBytes
+            # and therefore the OCDBT atomic transaction.
+            save_concurrent_bytes=None,
+            restore_concurrent_bytes=None,
+            type_handler_registry=_thr.create_type_handler_registry(*handlers),
+        )
+    )
+
+
 def _save_sharded_checkpoint_all_processes(gs_path, state, step, keep):
     """Writes a sharded Orbax checkpoint without all-gathering the TrainState."""
     gs_path = gs_path.rstrip('/')
@@ -554,7 +632,7 @@ def _save_sharded_checkpoint_all_processes(gs_path, state, step, keep):
             True,
         )
     mu.sync_global_devices(f'checkpoint_prune_{step}')
-    checkpointer = ocp.Checkpointer(ocp.PyTreeCheckpointHandler())
+    checkpointer = ocp.Checkpointer(_fast_pytree_handler())
     checkpointer.save(ckpt_path, state)
 
 
