@@ -433,6 +433,45 @@ def _local_array_to_global(local_arr, mesh, spec):
     return jax.make_array_from_process_local_data(sharding, local_np, global_shape)
 
 
+def _process_local_rows(global_np, mesh, spec, local_rows):
+    """Inverse of `_local_array_to_global`: this process's rows, in its order.
+
+    `_local_array_to_global` hands `make_array_from_process_local_data` a
+    host-local array and it lays those rows onto the global rows this process's
+    devices address, block by block in ASCENDING order of shard start
+    (`_array_from_process_local_data.local_slice` in jax/_src/array.py). So the
+    inverse is: ask the sharding which global row ranges we own, sort them, and
+    concatenate -- which reproduces the host-local order exactly, for ANY mesh
+    layout, not just a process-major one.
+
+    Needed because `mu.process_allgather(..., tiled=True)` returns the whole
+    global batch on every host while every caller of `run_p_sample_step`
+    consumes the result host-locally through `zip`, which truncates in silence.
+    """
+    global_rows = int(global_np.shape[0])
+    if local_rows == global_rows:
+        return global_np  # single process, or a replicated (unsharded) batch.
+
+    indices = jax.sharding.NamedSharding(mesh, spec).addressable_devices_indices_map(
+        (global_rows,) + tuple(global_np.shape[1:])
+    )
+    spans = sorted({
+        ((idx[0].start or 0), (global_rows if idx[0].stop is None else idx[0].stop))
+        for idx in indices.values()
+    })
+    owned = sum(stop - start for start, stop in spans)
+    if owned != local_rows:
+        # Never guess here. A wrong slice is invisible downstream -- it just
+        # scores at chance -- so refuse instead, and say what did not add up.
+        raise ValueError(
+            f'sample output gather: process {PRI} addresses {owned} of '
+            f'{global_rows} global rows under spec {spec}, but fed '
+            f'{local_rows} host-local rows. Cannot align sampled text with '
+            f'its prompts; refusing to return misaligned output.'
+        )
+    return np.concatenate([global_np[start:stop] for start, stop in spans], axis=0)
+
+
 def _make_global_batch(batch, partition_specs, mesh):
     return jax.tree_util.tree_map(
         lambda local_arr, spec: _local_array_to_global(local_arr, mesh, spec),
@@ -610,11 +649,35 @@ def run_p_sample_step(p_sample_step, model, tokenizer, params, images, prompt_id
     # host's devices to form a contiguous subcube of the mesh, which a v7-32
     # (8 hosts x 4 chips over a 2x4x4 torus) does not, and it raises rather
     # than falling back. `device_get` is not an alternative -- it refuses an
-    # array spanning non-addressable devices. These are a few token ids bound
-    # for a log line, so gathering them on every host costs nothing.
-    output = np.asarray(
-        mu.process_allgather(output, tiled=True)
-    ).reshape(-1, output.shape[-1])
+    # array spanning non-addressable devices. These are a few token ids, so
+    # gathering them on every host costs nothing.
+    #
+    # ...but the gather returns the GLOBAL batch, `PRC` times longer than the
+    # host-local batch that was fed in, and EVERY caller consumes the result as
+    # host-local:
+    #
+    #     for aux, out_str, is_pad in zip(batch['aux'], out_strs, batch['is_pad'])
+    #
+    # `zip` stops at the shortest, so returning the global array made all eight
+    # eval files silently pair their own questions with the FIRST local_batch
+    # answers -- process 0's. Rank 0 scored 66.6 on VQAv2 and ranks 1-7 scored
+    # ~9.7 (chance), for a reported 16.84 against a reference 67.63. Nothing
+    # raised: the training curve was perfect, because teacher forcing never
+    # goes through here.
+    #
+    # So slice this process's own rows back out. Do NOT assume the mesh is
+    # process-major (`out[PRI*B : (PRI+1)*B]` happens to be right for the
+    # current layout and is wrong the moment the layout changes); ask the
+    # sharding where THIS process's rows actually landed, which is the exact
+    # inverse of the placement `make_array_from_process_local_data` performed
+    # on the way in.
+    local_rows = int(prompt_ids.shape[0])
+    output = _process_local_rows(
+        np.asarray(mu.process_allgather(output, tiled=True)).reshape(-1, output.shape[-1]),
+        mesh,
+        batch_spec['input_ids'],
+        local_rows,
+    )
 
     def post_process(token_ids):
         indices = np.where(token_ids == tokenizer.special_tokens.EOS)[0]
