@@ -1,0 +1,147 @@
+# Eval-only pass over a finished stage-2 checkpoint.
+#
+# WHY A SEPARATE CONFIG, and not `remote_run` with `eval_only: True`:
+#
+# `main.py` routes eval_only to `train.just_evaluate` -> `_run_eval_from_checkpoint`,
+# which reads the TOP-LEVEL `training.final_eval_tasks`. In `remote_run` that key
+# is `[]` -- the 17 benchmarks live under `training.stage2`, and only
+# `_build_curriculum_stage_config` lifts a stage's keys up. Nothing lifts them on
+# the eval-only path. So `remote_run` + `eval_only: True` restores the checkpoint,
+# evaluates NOTHING, logs 'Eval Over.' and exits 0: a green run with no metrics,
+# which looks exactly like a harvest bug. `tests/test_eval_only_config.py` pins
+# this.
+#
+# Everything an eval reads is therefore stated at the TOP level here, copied from
+# `remote_run`'s stage2 block rather than from its top level. The test asserts
+# they agree, so a drift in either file fails there instead of silently changing
+# a benchmark number.
+#
+# No training keys: curriculum is off and num_steps is 0, so even without
+# eval_only this cannot train.
+
+model:
+    arch: llava
+    lm_backbone_str: "gemma3_1B"
+    lm_checkpoint_variant: "it"
+
+    vision_tower_str: "openai/clip-vit-large-patch14-336"
+    vision_feature_layer: -2
+    vision_select_feature: "patch"
+    clip_input_format: "minus_one_to_one"
+
+    projector_type: "mlp2x_gelu"
+    projector_use_ln: False
+
+    attn_logits_soft_cap: 0.0
+    final_logit_softcap: 0.0
+    txt_feature_layer: 0
+    image_post_connector_scale: 1.0
+    image_post_connector_transform: "fixed_scale"
+    image_text_stat_source: "prompt"
+    image_text_stat_axes: "scalar"
+    prompt_causal: True
+    # stage2's model block (vlm_loss_weight etc.) only affects the loss, which
+    # an eval never computes. The architecture keys above are what the
+    # checkpoint's parameter tree must match.
+    recon_loss_weight: 0.0
+    vlm_loss_weight: 1.0
+    text_only_loss_weight: 0.0
+    cfg_loss_weight: 0.0
+    alpha: 0.0
+
+dataset:
+    image_size: 336
+    # 512, from remote_run's stage2.dataset -- NOT the 2048 at its top level.
+    # Eight eval files read this to truncate prompts, so the top-level value
+    # would evaluate the model on differently-shaped inputs than it saw.
+    max_txt_len: 512
+    resize_mode: stretch
+    # No train stream is built: `_run_eval_from_checkpoint` never touches the
+    # dataloader. `resolve_dataset_roots` still resolves every eval root.
+    items: []
+    stateful_dataloader: False
+
+training:
+    # Empty curriculum + 0 steps: `train_and_evaluate` would fall through to the
+    # single-stage path and `_run_train_phase` would be a no-op range. Neither
+    # runs while eval_only is True; this is the second line of defence.
+    curriculum: ""
+    num_steps: 0
+    stage1_steps: 0
+    stage2_steps: 0
+    # Read by `_run_eval_from_checkpoint`. THE point of this file.
+    final_eval_tasks: [vqav2, mme, textvqa, pope, mmbench, knn_full, refcocog, mmvp, vstar, ocrbench, countbenchqa, gqa, seed_bench, cambrian_cvbench, vlms_are_blind, docvqa, realworldqa]
+    online_eval_tasks: []
+    online_eval_per_step: -1
+    sample_per_step: -1
+    log_vis_per_step: -1
+    checkpoint_per_step: -1
+    # An eval builds a TrainState (params + optimizer shapes) before restoring,
+    # so the optimizer must still be constructible. These match stage2 so the
+    # restore sees the tree it was saved from.
+    batch_size: 256
+    optimizer: adam
+    adam:
+        learning_rate: 0.000028
+        adam_b2: 0.95
+        weight_decay: 0.0
+    vision_encoder_learning_rate: 0.000028
+    connector_learning_rate: 0.0007
+    freeze_lm: False
+    freeze_lm_embed: False
+    freeze_lm_late: False
+    freeze_image_encoder: True
+    warmup_steps: 1
+    lr_schedule: cos
+    grad_clip_norm: 1.0
+    seed: 42
+    # Nothing new was trained, so there is no final checkpoint to publish. The
+    # copy would duplicate 12 GiB and, worse, run against config.load_from.
+    copy_final_checkpoint_to_pretrained: False
+    copy_stage1_checkpoint_to_pretrained: False
+
+sampling:
+    max_new_tokens: 64
+    beam_size: 1
+
+eval:
+    eval_recon_tokens: []
+    device_batch_size: 32
+    eval_tokens_default: 64
+    # 8 tokens for shortqa is DELIBERATE and is the protocol the reference used.
+    # MME truncation under this budget is a model-behaviour finding to report,
+    # not a knob to raise here (FINAL_EVAL_RUNBOOK.md).
+    eval_tokens_shortqa: 8
+    eval_tokens_mid: 16
+    eval_tokens_ocr: 32
+    eval_tokens_refcoco: 32
+    eval_tokens_pixelbench: 32
+    eval_tokens_cambrian_cvbench: 8
+    eval_tokens_vlms_are_blind: 32
+    eval_tokens_docvqa: 32
+    eval_tokens_realworldqa: 16
+    eval_tokens_mmbench: 8
+    # The FULL VQAv2 val set, as in the training run's final eval. The 0.1
+    # fraction below applies only to the ONLINE eval, which does not run here.
+    online_vqav2_sample_fraction: 0.1
+    vqav2_num_samples: 214354
+
+finetune: False
+# Must equal the training run's sharding or the checkpoint will not restore.
+sharding: hsdp_legacy_data
+
+eval_only: True
+
+# EMPTY ON PURPOSE. The checkpoint arrives as the LOAD_FROM env var, which
+# `tpu queue --load_from=<path>` sets. `main._apply_env_config_overrides` RAISES
+# on a conflict between the two, so a value here kills every task at startup.
+load_from: ''
+load_from_pretrained: ''
+wandb_resume_id: ''
+
+logging:
+    use_wandb: True
+    wandb_project: "jax-llava"
+    wandb_entity: "sqa24-massachusetts-institute-of-technology"
+    wandb_tags: ["llava1.5", "eval-only", "final-eval"]
+    wandb_notes: "Eval-only pass over the stage-2 final checkpoint of XID 278496995, on code carrying the sample-output alignment fix. The training run's own _stage2_final numbers were produced by the buggy sampler and are not usable."
