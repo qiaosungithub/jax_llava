@@ -356,3 +356,27 @@ py_binary(
         "//third_party/py/numpy",
     ],
 )
+
+# Does configs/remote_run_eval_config.yml resolve, and carry the 17 benchmarks,
+# INSIDE a Blaze binary? A plain-interpreter run cannot answer that:
+# `configs/load_config.py::_find_config_yml` takes a DIFFERENT branch under
+# runfiles ($GOOGLEBASE / sys.path entries), and that helper exists precisely
+# because the Borg lookup differs from the workstation one. Verified 6/6 under
+# `blaze run` before the eval-only launch.
+py_binary(
+    name = "test_eval_only_config",
+    srcs = ["tests/test_eval_only_config.py"],
+    data = glob(
+        [
+            "**/*.py",
+            "**/*.yml",
+            "**/*.yaml",
+            "**/*.json",
+        ],
+        exclude = ["tests/test_eval_only_config.py"],
+    ),
+    main = "tests/test_eval_only_config.py",
+    strict_deps = False,
+    tags = ["nostrictdeps"],
+    deps = [":main"],
+)
