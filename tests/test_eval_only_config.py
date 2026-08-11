@@ -47,7 +47,37 @@ def test_eval_only_config_evaluates_the_17_benchmarks():
         'place just_evaluate looks. The eval-only run would evaluate nothing '
         'and still exit 0.'
     )
-    assert tasks == EXPECTED_TASKS, f'expected the 17 benchmarks, got {tasks}'
+    # SET equality, not list equality: the order is deliberately different from
+    # the training config (see the next test) and is its own contract.
+    missing = [t for t in EXPECTED_TASKS if t not in tasks]
+    extra = [t for t in tasks if t not in EXPECTED_TASKS]
+    assert not missing and not extra, f'missing={missing} extra={extra}'
+    assert len(tasks) == len(set(tasks)) == 17, f'duplicate or short list: {tasks}'
+
+
+def test_knn_full_runs_last_so_a_preemption_costs_only_knn():
+    """Task order is the eval's only checkpointing mechanism.
+
+    `evals/eval.py::run_eval_tasks` iterates the list in order and writes each
+    task's scalars as soon as it finishes; the harvest reads those out of the
+    rank logs. So whatever completed before a preemption is kept.
+
+    knn_full at production settings (images_per_class None => all 1,281,167
+    train images) costs ~80+ min against ~17 min for the other sixteen
+    COMBINED. Anywhere but last, a preemption inside it also forfeits every
+    task queued behind it.
+    """
+    tasks = _tasks(get_config('remote_run_eval'))
+    assert tasks[-1] == 'knn_full', (
+        f'knn_full must run last; the list ends with {tasks[-3:]}'
+    )
+    # vqav2 (7.1 min, the second most expensive) directly before it, so the
+    # cheap sixteen are banked as early as possible.
+    assert tasks[-2] == 'vqav2', f'expected vqav2 second-to-last, got {tasks[-2]}'
+    cheap = tasks[:8]
+    assert 'knn_full' not in cheap and 'vqav2' not in cheap and 'docvqa' not in cheap, (
+        f'the three expensive tasks must not be in the first eight: {cheap}'
+    )
 
 
 def test_eval_only_flag_routes_to_just_evaluate():

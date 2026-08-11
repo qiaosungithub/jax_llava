@@ -70,7 +70,26 @@ training:
     stage1_steps: 0
     stage2_steps: 0
     # Read by `_run_eval_from_checkpoint`. THE point of this file.
-    final_eval_tasks: [vqav2, mme, textvqa, pope, mmbench, knn_full, refcocog, mmvp, vstar, ocrbench, countbenchqa, gqa, seed_bench, cambrian_cvbench, vlms_are_blind, docvqa, realworldqa]
+    #
+    # SAME 17 BENCHMARKS AS THE TRAINING CONFIG, DELIBERATELY REORDERED:
+    # cheapest first, `knn_full` LAST. `evals/eval.py::run_eval_tasks` iterates
+    # this list in order and calls `writer.write_scalars` after EACH task, and
+    # the harvest reads those scalars out of the rank logs -- so a preempted
+    # eval keeps every benchmark that finished before the kill.
+    #
+    # The ordering matters because the costs are wildly unequal. Measured on
+    # the same v7-32 topology (smoke XID 278211441, full final eval):
+    # the 16 non-KNN tasks total ~17 min, of which vqav2 is 7.1 and docvqa 3.4.
+    # `knn_full` at production settings (images_per_class: None => the whole
+    # 1,281,167-image train split, val_examples: None => all 50,000) is ~80+
+    # min on its own -- the smoke's 39 s does NOT measure it, that run capped
+    # ImageNet to 2 images per class.
+    #
+    # With knn_full last, a 20-minute preemption window still delivers all 16
+    # cheap benchmarks and only the KNN needs to be retried. With knn_full 6th
+    # (its position in the training config) a preemption there costs the ten
+    # tasks behind it as well.
+    final_eval_tasks: [mme, pope, mmbench, mmvp, vstar, ocrbench, countbenchqa, cambrian_cvbench, gqa, textvqa, refcocog, realworldqa, seed_bench, vlms_are_blind, docvqa, vqav2, knn_full]
     online_eval_tasks: []
     online_eval_per_step: -1
     sample_per_step: -1
