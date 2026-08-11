@@ -380,3 +380,34 @@ py_binary(
     tags = ["nostrictdeps"],
     deps = [":main"],
 )
+
+# The LAST untested link before an eval-only launch: does
+# `--config=<path>/configs/load_config.py:remote_run_eval` resolve inside a real
+# binary, through ml_collections config_flags, the way Borg invokes it?
+#
+# tests/test_eval_only_config.py calls get_config() directly, which is not how
+# the job gets its config. config_flags loads the module BY THE COMMAND-LINE
+# PATH and wraps any failure in a deferred error that raises only at the first
+# attribute access -- far from the cause, and the documented reason
+# `_find_config_yml` has four fallbacks (XID 277033539). Writing this probe
+# reproduced that exact failure locally (`No module named 'configs'` surfacing
+# as `_ReportError` inside config_flags) in seconds, which is a Borg round trip
+# saved even though the cause turned out to be the probe's own missing
+# sys.path line rather than the config.
+py_binary(
+    name = "probe_eval_cfg_via_flags",
+    srcs = ["tests/probe_eval_cfg_via_flags.py"],
+    data = glob(
+        [
+            "**/*.py",
+            "**/*.yml",
+            "**/*.yaml",
+            "**/*.json",
+        ],
+        exclude = ["tests/probe_eval_cfg_via_flags.py"],
+    ),
+    main = "tests/probe_eval_cfg_via_flags.py",
+    strict_deps = False,
+    tags = ["nostrictdeps"],
+    deps = [":main"],
+)
