@@ -189,7 +189,7 @@ training:
         # `pixelbench` bundle is spelled out per benchmark (mmvp/vstar/ocrbench/
         # countbenchqa) so each gets its own sampler token budget.
         online_eval_tasks: [vqav2, mme, textvqa, pope, refcocog, mmvp, vstar, ocrbench, countbenchqa]
-        final_eval_tasks: [vqav2, mme, textvqa, pope, mmbench, knn_full, refcocog, mmvp, vstar, ocrbench, countbenchqa, gqa, seed_bench, cambrian_cvbench, vlms_are_blind, docvqa, realworldqa]
+        final_eval_tasks: [vqav2, mme, textvqa, pope, mmbench, mmstar, knn_full, refcocog, mmvp, vstar, ocrbench, countbenchqa, gqa, seed_bench, cambrian_cvbench, vlms_are_blind, docvqa, realworldqa]
 
 sampling:
     max_new_tokens: 64
@@ -208,6 +208,7 @@ eval:
     eval_tokens_vlms_are_blind: 32
     eval_tokens_docvqa: 32
     eval_tokens_realworldqa: 16
+    eval_tokens_mmstar: 8
     eval_tokens_mmbench: 8
     online_vqav2_sample_fraction: 0.1
     vqav2_num_samples: 214354

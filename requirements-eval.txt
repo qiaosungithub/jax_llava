@@ -1,0 +1,3 @@
+# Exact benchmark/data-plane revisions required by the MMStar eval contract.
+one-dataset-suite @ git+https://github.com/hevision/one-dataset-suite.git@d09aae6de23df600e8c1cf4615aea15c1f080af7
+one-benchmark-suite @ git+https://github.com/hevision/one-benchmark-suite.git@7c8eb0d37d11b0b4563830f77d809941ce3fbaf7

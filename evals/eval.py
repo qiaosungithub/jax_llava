@@ -1,3 +1,4 @@
+import re
 import time
 import uuid
 
@@ -10,6 +11,7 @@ from evals.eval_textvqa import eval_textvqa
 from evals.eval_mme import eval_mme
 from evals.eval_pope import eval_pope
 from evals.eval_mmbench import eval_mmbench
+from evals.eval_mmstar import MMSTAR_TASK_NAMES, eval_mmstar
 from evals.eval_imagenet_knn import eval_imagenet_knn
 from evals.eval_refcocog import eval_refcocog
 from evals.eval_pixelbench import eval_pixelbench
@@ -29,6 +31,11 @@ from utils import vis_util
 
 
 _RUN_ID_BUF_SIZE = 128
+
+
+def _metric_component(value):
+    """Return a stable writer-safe component for benchmark breakdown names."""
+    return re.sub(r"[^a-z0-9]+", "_", str(value).lower()).strip("_")
 
 
 def _knn_scalars(metric_name, result, suffix):
@@ -324,6 +331,39 @@ def run_eval_tasks(
                     sample_outputs,
                 )
             log_for_0(f"RealWorldQA accuracy: {acc:.2f}%")
+            continue
+
+        if t in MMSTAR_TASK_NAMES:
+            log_for_0(f"Evaluating MMStar at step {step}...")
+            acc, sample_outputs, metric_dict = eval_mmstar(
+                _select_sample_fn(p_sample_fn, "mmstar"),
+                run_p_sample_step,
+                model,
+                tokenizer,
+                params,
+                config,
+            )
+            scalar_dict = {
+                f"mmstar_acc{suffix}": acc,
+                f"mmstar_num_samples{suffix}": float(
+                    metric_dict.get("num_samples", 0)
+                ),
+                "step": step,
+            }
+            for category, values in metric_dict.get("by_category", {}).items():
+                safe = _metric_component(category)
+                scalar_dict[f"mmstar_{safe}_acc{suffix}"] = float(
+                    values["accuracy"]
+                )
+            for axis, values in metric_dict.get("by_l2_category", {}).items():
+                safe = _metric_component(axis)
+                scalar_dict[f"mmstar_axis_{safe}_acc{suffix}"] = float(
+                    values["accuracy"]
+                )
+            writer.write_scalars(step, scalar_dict)
+            if sample_outputs:
+                writer.write_texts(step, f"mmstar_samples{suffix}", sample_outputs)
+            log_for_0(f"MMStar official accuracy: {acc:.2f}%")
             continue
 
         if t in {"cambrian_cvbench", "cambrian-cvbench", "cvbench", "cv_bench"}:

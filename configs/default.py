@@ -300,6 +300,15 @@ def get_config():
     eval.realworldqa_device_batch_size = 4
     eval.realworldqa_num_workers = 0
     eval.realworldqa_max_txt_len = 512
+    # MMStar is evaluated through one-benchmark-suite.  Its committed WDS
+    # artifact is mirrored under the same zone-local eval prefix as the other
+    # visual-understanding benchmarks.
+    eval.mmstar_root = 'gs://kmh-gcp-💣/data/vlm_eval_benchmarks/mmstar'
+    eval.mmstar_num_samples = 1500
+    eval.mmstar_cache_dir = "/kmh-nfs-ssd-us-mount/data/cached/zhh/mmstar_eval"
+    eval.mmstar_device_batch_size = 4
+    eval.mmstar_num_workers = 0
+    eval.mmstar_max_txt_len = 512
     eval.pope_root = "gs://kmh-gcp-💣/data/pope/coco_image_records_wds/val2014"
     eval.pope_dataset = "coco"
     eval.pope_image_root = "unused_for_image_records_wds"
@@ -340,6 +349,7 @@ def get_config():
     eval.eval_tokens_vlms_are_blind = 32
     eval.eval_tokens_docvqa = 32
     eval.eval_tokens_realworldqa = 16
+    eval.eval_tokens_mmstar = 8
     eval.eval_tokens_mmbench = 8
     # Backward-compatible aliases.
     eval.short_answer_max_new_tokens = eval.eval_tokens_shortqa

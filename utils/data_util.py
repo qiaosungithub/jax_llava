@@ -436,6 +436,7 @@ def resolve_dataset_roots(config, zone):
         'vizwiz_root',
         'scienceqa_img_root',
         'seed_bench_root',
+        'mmstar_root',
     ]:
         if config.eval.get(_eval_root_key, False) and '💣' in config.eval[_eval_root_key]:
             config.eval[_eval_root_key] = config.eval[_eval_root_key].replace('💣', zone)

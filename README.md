@@ -23,3 +23,23 @@ Guardrail metrics logged every log step:
 | `vocab_mean_logit` | drifts freely | pathological only if \|·\| reaches the softcap |
 
 Full investigation record: `DEBUG_LOG_negative_vlm_loss.md` in the parent work directory.
+
+# Evaluation dependencies
+
+Install the exact evaluation dependencies before running the production final
+evaluation:
+
+```bash
+python -m pip install --force-reinstall --no-deps -r requirements-eval.txt
+```
+
+The force reinstall matters because the internal packages keep a stable
+package version across Git commits; `--no-deps` preserves this repo's pinned
+JAX/NumPy environment.
+
+MMStar is dispatched through the pinned `one-benchmark-suite` evaluator, which
+owns its committed-artifact validation, prompt contract, and official scoring;
+`one-dataset-suite` is pinned alongside it for the artifact contract. The
+production config resolves `mmstar_root` to the current zone's
+`gs://kmh-gcp-${ZONE}/data/vlm_eval_benchmarks/mmstar` mirror and includes
+`mmstar` in `stage2.final_eval_tasks`.

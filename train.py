@@ -18,6 +18,7 @@ import input_pipeline
 from evals.eval import run_eval_tasks
 from evals.eval_imagenet_knn import ensure_imagenet_available
 from evals.eval_mmbench import export_mmbench_test_xlsx
+from evals.eval_mmstar import preflight_mmstar_eval
 from evals.eval_mme import collate_fn
 from models.clip_vit import load_clip_vision_params
 from models.llava import LlavaGemma
@@ -453,6 +454,13 @@ def _build_pjit_fns(config, model, state, mesh_bundle):
         _fake_batch(config, fake_bs, max_txt_len=mmbench_max_txt_len),
         MeshMode.DATA,
     )
+    mmstar_max_txt_len = int(
+        getattr(config.eval, 'mmstar_max_txt_len', config.dataset.max_txt_len)
+    )
+    mmstar_batch_spec = get_partition_spec(
+        _fake_batch(config, fake_bs, max_txt_len=mmstar_max_txt_len),
+        MeshMode.DATA,
+    )
 
     p_train_step = pjit_compile(
         partial(train_step, rng_init=random.PRNGKey(config.training.seed), config=config),
@@ -496,6 +504,11 @@ def _build_pjit_fns(config, model, state, mesh_bundle):
         config,
         'eval_tokens_realworldqa',
         16,
+    )
+    mmstar_tokens = _eval_token_budget(
+        config,
+        'eval_tokens_mmstar',
+        8,
     )
     mmbench_tokens = _eval_token_budget(
         config,
@@ -551,6 +564,14 @@ def _build_pjit_fns(config, model, state, mesh_bundle):
         'blindtest': compile_sample_step(blindtest_tokens, default_beam),
         'docvqa': compile_sample_step(docvqa_tokens, default_beam),
         'realworldqa': compile_sample_step(realworldqa_tokens, default_beam),
+        # MMStar prompts carry all choices inline and use an eval-only 512-token
+        # input budget, so keep its sharding metadata separate from training.
+        'mmstar': compile_sample_step(
+            mmstar_tokens,
+            default_beam,
+            sampler_batch_spec=mmstar_batch_spec,
+            spec_name='mmstar',
+        ),
         # MMBench can need a longer prompt length than training/VQA prompts, so
         # it gets its own input spec instead of reusing batch_spec['input_ids'].
         'mmbench': compile_sample_step(
@@ -1300,6 +1321,7 @@ def _train_llava_curriculum(config: ml_collections.ConfigDict, workdir: str):
 
 
 def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
+    preflight_mmstar_eval(config)
     if str(config.training.get('curriculum', '')).lower() == 'llava15_two_stage':
         return _train_llava_curriculum(config, workdir)
     assert not config.finetune, 'train_and_evaluate expects finetune=False'
@@ -1307,6 +1329,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str):
 
 
 def just_evaluate(config: ml_collections.ConfigDict, workdir: str):
+    preflight_mmstar_eval(config)
     rng = random.PRNGKey(config.training.seed)
     zone, mesh_bundle, writer = _init_run(config, workdir)
     _run_eval_from_checkpoint(
@@ -1323,6 +1346,7 @@ def just_evaluate(config: ml_collections.ConfigDict, workdir: str):
 
 
 def finetune(config: ml_collections.ConfigDict, workdir: str):
+    preflight_mmstar_eval(config)
     assert getattr(config, 'finetune', False), 'Expected finetune=True in config'
     assert config.model.recon_loss_weight == 0.0, 'Expected recon_loss_weight == 0.0 in config'
     assert config.load_from_pretrained or config.load_from
