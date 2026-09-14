@@ -261,7 +261,9 @@ logging:
     # google3's wandb is a mock that stores nothing. Metrics go to Datatables
     # via utils/g3_metrics.py instead (http://flatboard/xid/<XID>).
     use_wandb: False
-    wandb_project: "jax-llava"
-    wandb_entity: ""
-    wandb_tags: ["g3-smoke"]
-    wandb_notes: "google3/Borg port smoke: 10 stage-1 steps + 2 stage-2 steps on cc12m from CNS."
+
+wandb:
+    project: "jax-llava"
+    entity: ""
+    tags: ["google", "g3-smoke"]
+    notes: "google3/Borg port smoke: 10 stage-1 steps + 2 stage-2 steps on cc12m from CNS."

@@ -123,9 +123,12 @@ load_from_pretrained: /kmh-nfs-ssd-us-mount/logs/sqa/paligemma-baseline/20260516
 
 logging:
     use_wandb: True
-    wandb_project: 'paligemma-baseline'
-    wandb_entity: 'sqa24-massachusetts-institute-of-technology'
-    wandb_tags:
+
+wandb:
+    project: 'paligemma-baseline'
+    entity: 'sqa24-massachusetts-institute-of-technology'
+    tags:
+        - google
         - sqa
         - finetune
-    wandb_notes: "[finetune llava-ov1.5 + vqav2 + okvqa + aokvqa + ocrvqa + gqa + textcaps + vg qa + vg det + refcoco] 15+3 freeze embed, encoder lr 5x baseline. muon 1e-4 wd0.02 cos decay 90000 steps"
+    notes: "[finetune llava-ov1.5 + vqav2 + okvqa + aokvqa + ocrvqa + gqa + textcaps + vg qa + vg det + refcoco] 15+3 freeze embed, encoder lr 5x baseline. muon 1e-4 wd0.02 cos decay 90000 steps"

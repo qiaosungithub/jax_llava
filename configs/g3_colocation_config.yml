@@ -187,7 +187,9 @@ logging:
     # google3's wandb is a mock that stores nothing. Metrics go to Datatables
     # via utils/g3_metrics.py instead (http://flatboard/xid/<XID>).
     use_wandb: False
-    wandb_project: "jax-llava"
-    wandb_entity: ""
-    wandb_tags: ["g3-colocation"]
-    wandb_notes: "Co-location probe: 3 steps on go-d data, checkpointing to go-d, compute in cell go."
+
+wandb:
+    project: "jax-llava"
+    entity: ""
+    tags: ["google", "g3-colocation"]
+    notes: "Co-location probe: 3 steps on go-d data, checkpointing to go-d, compute in cell go."

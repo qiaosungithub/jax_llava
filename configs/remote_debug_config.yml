@@ -79,7 +79,9 @@ local_debug: False
 logging:
     use_wandb: False
     use_tensorboard: False
-    wandb_project: "jax-llava"
-    wandb_entity: "sqa24-massachusetts-institute-of-technology"
-    wandb_tags: ["remote-debug", "llava", "blip3o-short"]
-    wandb_notes: "remote_debug: one-step small-model BLIP3o-short dataloader smoke test."
+
+wandb:
+    project: "jax-llava"
+    entity: "sqa24-massachusetts-institute-of-technology"
+    tags: ["google", "remote-debug", "llava", "blip3o-short"]
+    notes: "remote_debug: one-step small-model BLIP3o-short dataloader smoke test."

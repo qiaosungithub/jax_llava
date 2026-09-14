@@ -239,6 +239,22 @@ def _save_image(img, step, key, workdir):
     img.save(os.path.join(root, name))
 
 
+def _wandb_param(config, key, default=None):
+    """Read a wandb identity param, preferring the unified config.wandb.<key>.
+
+    The canonical source is now config.wandb.*; fall back to the legacy flat
+    config.logging.wandb_<key> so an older config without a wandb block still
+    loads.
+    """
+    wandb_cfg = getattr(config, 'wandb', None)
+    if wandb_cfg is not None and key in wandb_cfg:
+        return wandb_cfg[key]
+    logging_cfg = getattr(config, 'logging', None)
+    legacy_key = 'wandb_' + key
+    if logging_cfg is not None and legacy_key in logging_cfg:
+        return logging_cfg[legacy_key]
+    return default
+
 class Writer:
     def __init__(self, config, workdir, use_wandb=False, use_tb=False):
         if jax.process_index() != 0:
@@ -256,12 +272,21 @@ class Writer:
             if wandb_resume_id:
                 kwargs['id'] = wandb_resume_id
                 kwargs['resume'] = 'must'
+            # Canonical source is config.wandb.*; _wandb_param falls back to the
+            # legacy flat config.logging.wandb_* for older configs.
+            wandb_project = _wandb_param(config, 'project', '') or ''
+            wandb_entity = _wandb_param(config, 'entity', '')
+            wandb_notes = _wandb_param(config, 'notes', '')
+            wandb_tags = _wandb_param(config, 'tags', None)
+            wandb_mode = _wandb_param(config, 'mode', '')
+            if wandb_mode:
+                kwargs['mode'] = wandb_mode
             try:
                 wandb.init(
-                    project=config.logging.wandb_project + '_eval' * config.eval_only,
-                    entity=config.logging.wandb_entity if config.logging.wandb_entity else None,
-                    notes=config.logging.wandb_notes if config.logging.wandb_notes else None,
-                    tags=config.logging.wandb_tags if config.logging.wandb_tags else None,
+                    project=wandb_project + '_eval' * config.eval_only,
+                    entity=wandb_entity if wandb_entity else None,
+                    notes=wandb_notes if wandb_notes else None,
+                    tags=wandb_tags if wandb_tags else None,
                     dir='/tmp', # avoid writing to workdir
                     settings=wandb.Settings(_service_wait=60),
                     **kwargs

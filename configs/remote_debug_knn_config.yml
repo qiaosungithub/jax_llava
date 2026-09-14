@@ -63,7 +63,9 @@ local_debug: False
 logging:
     use_wandb: False
     use_tensorboard: False
-    wandb_project: "jax-llava"
-    wandb_entity: "sqa24-massachusetts-institute-of-technology"
-    wandb_tags: ["remote-debug", "knn", "tfds-imagenet"]
-    wandb_notes: "[remote debug] eval-only KNN TFDS ImageNet smoke test; no ImageNet copy."
+
+wandb:
+    project: "jax-llava"
+    entity: "sqa24-massachusetts-institute-of-technology"
+    tags: ["google", "remote-debug", "knn", "tfds-imagenet"]
+    notes: "[remote debug] eval-only KNN TFDS ImageNet smoke test; no ImageNet copy."

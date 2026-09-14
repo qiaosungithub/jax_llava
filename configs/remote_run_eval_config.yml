@@ -160,7 +160,9 @@ wandb_resume_id: ''
 
 logging:
     use_wandb: True
-    wandb_project: "jax-llava"
-    wandb_entity: "sqa24-massachusetts-institute-of-technology"
-    wandb_tags: ["llava1.5", "eval-only", "final-eval"]
-    wandb_notes: "Eval-only pass over the stage-2 final checkpoint of XID 278496995, on code carrying the sample-output alignment fix. The training run's own _stage2_final numbers were produced by the buggy sampler and are not usable."
+
+wandb:
+    project: "jax-llava"
+    entity: "sqa24-massachusetts-institute-of-technology"
+    tags: ["google", "llava1.5", "eval-only", "final-eval"]
+    notes: "Eval-only pass over the stage-2 final checkpoint of XID 278496995, on code carrying the sample-output alignment fix. The training run's own _stage2_final numbers were produced by the buggy sampler and are not usable."

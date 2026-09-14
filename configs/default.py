@@ -398,11 +398,19 @@ def get_config():
     # ------------------------------------------------------------
     # Logging
     config.logging = logging = ml_collections.ConfigDict()
-    logging.wandb_project = ""
     logging.use_wandb = False
-    logging.wandb_entity = ""
-    logging.wandb_notes = ""
-    logging.wandb_tags = []
+
+    # ------------------------------------------------------------
+    # WandB (unified config interface). The canonical source for the wandb
+    # identity is now config.wandb.* (was flat config.logging.wandb_*).
+    config.wandb = wandb = ml_collections.ConfigDict()
+    wandb.project = "jax-llava"  # KEEP this name -- existing runs use it.
+    wandb.entity = "sqa24-massachusetts-institute-of-technology"
+    # CHANGE wandb.notes BEFORE EVERY LAUNCH. It is ALSO the XManager job name
+    # (the shared launcher derives exp_name from cfg.wandb.notes). One line/run.
+    wandb.notes = ""
+    wandb.tags = ["google"]  # "google" marks a Borg/XManager run.
+    wandb.mode = "online"
 
     # others
     config.load_from = ''

@@ -156,7 +156,9 @@ local_debug: False
 logging:
     use_wandb: False
     use_tensorboard: False
-    wandb_project: "jax-llava"
-    wandb_entity: "sqa24-massachusetts-institute-of-technology"
-    wandb_tags: ["remote-debug", "llava", "full-pipeline"]
-    wandb_notes: "Full pipeline smoke test: stage1 train, stage2 train, representative online eval, final eval, checkpoint, and dataloader resume."
+
+wandb:
+    project: "jax-llava"
+    entity: "sqa24-massachusetts-institute-of-technology"
+    tags: ["google", "remote-debug", "llava", "full-pipeline"]
+    notes: "Full pipeline smoke test: stage1 train, stage2 train, representative online eval, final eval, checkpoint, and dataloader resume."

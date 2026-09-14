@@ -249,7 +249,9 @@ wandb_resume_id: ''
 
 logging:
     use_wandb: True
-    wandb_project: "jax-llava"
-    wandb_entity: "sqa24-massachusetts-institute-of-technology"
-    wandb_tags: ["llava1.5", "curriculum", "hsdp"]
-    wandb_notes: "[new dataset + dataloader] [stage 2 bs256 75000 steps, llava-fusion] llava-1.5 reproduction. Stage-1 trains connector only with CFG disabled; stage-2 trains connector + LM with VLM CE loss only (text-only/CFG off, alpha=0), image encoder frozen (original LLaVA-1.5 recipe). Adam LR: stage1 connector 1e-3, stage2 LM 2.8e-5, connector 7e-4 (sqrt-scaled to bs 256 from the bs128 2e-5/5e-4 and bs512 4e-5/1e-3 anchors), warmup 7500 (10%), cos. Stage-2 data aligned to beifen-Paligemma stage3 SFT mix: LLaVA-OV1.5-Instruct(grouped) + VQAv2/OKVQA/A-OKVQA/OCRVQA/GQA/VG-det/RefCOCO/RefCOCOg/PixMo-cap-qa/PixMo-count/OpenImages-relationship (12 sources, same as beifen stage3), dataset_mix_weight_power 0.5."
+
+wandb:
+    project: "jax-llava"
+    entity: "sqa24-massachusetts-institute-of-technology"
+    tags: ["google", "llava1.5", "curriculum", "hsdp"]
+    notes: "[new dataset + dataloader] [stage 2 bs256 75000 steps, llava-fusion] llava-1.5 reproduction. Stage-1 trains connector only with CFG disabled; stage-2 trains connector + LM with VLM CE loss only (text-only/CFG off, alpha=0), image encoder frozen (original LLaVA-1.5 recipe). Adam LR: stage1 connector 1e-3, stage2 LM 2.8e-5, connector 7e-4 (sqrt-scaled to bs 256 from the bs128 2e-5/5e-4 and bs512 4e-5/1e-3 anchors), warmup 7500 (10%), cos. Stage-2 data aligned to beifen-Paligemma stage3 SFT mix: LLaVA-OV1.5-Instruct(grouped) + VQAv2/OKVQA/A-OKVQA/OCRVQA/GQA/VG-det/RefCOCO/RefCOCOg/PixMo-cap-qa/PixMo-count/OpenImages-relationship (12 sources, same as beifen stage3), dataset_mix_weight_power 0.5."

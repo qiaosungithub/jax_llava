@@ -54,11 +54,14 @@ load_from: ''
 logging:
     use_wandb: False
     use_tensorboard: False
-    wandb_project: 'paligemma-baseline' # change to your wandb project
-    wandb_entity: 'sqa24-massachusetts-institute-of-technology' # paste your wandb entity here
-    wandb_tags: # use your own tags
+
+wandb:
+    project: 'paligemma-baseline' # change to your wandb project
+    entity: 'sqa24-massachusetts-institute-of-technology' # paste your wandb entity here
+    tags: # use your own tags
+        - google
         - hsdp
-    wandb_notes:
+    notes:
 
 # load_from: gs://kmh-gcp-asia-northeast1-b/qiao_zhicheng_hanhong_files/jit_wxb/launch_20251216_015624_gita1a2898_eb41ba91/logs/log1_20251216_015656_VMkmh-tpuvm-v6e-32-kangyang-2e0310_Zasia-northeast1-b_a41f9999/1
 # load_from: /kmh-nfs-ssd-us-mount/staging/siri/jit_wxb/launch_20251209_141232_git_434f3487/logs/log1_20251209_141256_VMkmh-tpuvm-v6e-64-kangyang-a81093_Zus-central1-b_c24e227a

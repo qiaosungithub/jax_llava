@@ -156,7 +156,9 @@ local_debug: False
 logging:
     use_wandb: False
     use_tensorboard: False
-    wandb_project: "jax-llava"
-    wandb_entity: "sqa24-massachusetts-institute-of-technology"
-    wandb_tags: ["remote-debug", "llava", "full-pipeline", "resume"]
-    wandb_notes: "Resume half of full pipeline smoke: exact stateful dataloader restore, one more SFT step, and representative final eval."
+
+wandb:
+    project: "jax-llava"
+    entity: "sqa24-massachusetts-institute-of-technology"
+    tags: ["google", "remote-debug", "llava", "full-pipeline", "resume"]
+    notes: "Resume half of full pipeline smoke: exact stateful dataloader restore, one more SFT step, and representative final eval."
