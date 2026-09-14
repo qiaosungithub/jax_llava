@@ -56,7 +56,7 @@ logging:
     use_tensorboard: False
 
 wandb:
-    project: 'paligemma-baseline' # change to your wandb project
+    project: 'jax-llava' # change to your wandb project
     entity: 'sqa24-massachusetts-institute-of-technology' # paste your wandb entity here
     tags: # use your own tags
         - google

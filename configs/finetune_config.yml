@@ -125,7 +125,7 @@ logging:
     use_wandb: True
 
 wandb:
-    project: 'paligemma-baseline'
+    project: 'jax-llava'
     entity: 'sqa24-massachusetts-institute-of-technology'
     tags:
         - google
