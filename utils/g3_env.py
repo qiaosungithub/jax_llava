@@ -46,46 +46,275 @@ def in_google3() -> bool:
 _IN_GOOGLE3 = None
 
 
-# ---------------------------------------------------------------------------
-# cell -> metro -> region
-# ---------------------------------------------------------------------------
-# Only cells we can actually name are listed. An unlisted cell is an ERROR,
-# not a default: silently guessing a region is exactly how a job ends up
-# streaming 200 GiB across a continent.
-# Verified with `mach_locality -k metro <cell>`, not from memory.
+# cell -> metro, MEASURED with `mach_locality -k metro <cell>` and regenerated
+# by ~/work/tpu_cmd/google3_tpu_utils/sync_g3env_locality.py from the shared
+# snapshot in google3_tpu_utils/cell_locality.py. Do not hand-edit rows: a cell
+# missing here is a startup crash for any job the router pins there (XID
+# 284266707 crash-looped 815 times on `yutulrf`, a real tul cell this table did
+# not list), and a cell guessed here is a silent cross-region read.
+#
+# AN UNLISTED CELL IS STILL AN ERROR, NOT A DEFAULT -- that part was always
+# right. What changed is that the list is now as wide as the fleet the
+# scheduler can actually place into, so "unlisted" means "genuinely new",
+# not "nobody got round to adding it".
+#
+# Being in this table says only WHERE a cell is. Whether this project may RUN
+# there is decided downstream by _METRO_TO_REGION (a verified GCP region) and
+# _METRO_TO_CNS_CELLS (group storage), both of which stay hand-curated.
 _CELL_TO_METRO = {
-    # --- cmh: where the data lives, and where compute now goes -------------
-    # `go` is the compute cell this project pins (`tpu queue --cell=go`), and
-    # `go-d` is the Colossus cell it reads and checkpoints to. Same metro, and
-    # `mach_locality -k campus` says nby vs clb for go-d and yucmhcg-d -- two
-    # campuses of one metro, which storage.md's boundary treats as neighbours.
-    "go": "cmh",
-    "yucmhcg": "cmh",
-    "yucmhfq": "cmh",
-    "yucmhqa": "cmh",
-    "yucmhps": "cmh",
-    "yucmhty": "cmh",
-    # --- other metros where the GROUP has Colossus headroom ----------------
-    # Registered so a job that lands in one gets a legible "no dataset replica
-    # in this metro" failure naming the metro, instead of the far vaguer
-    # "Cannot determine where this task is running".
-    "oe": "tul",
-    "nz": "cbf",
-    # v7 compute cells in the three metros the placement survey settled on.
-    # Without these a v7 task cannot resolve its own metro and refuses to run.
-    "yutulpz": "tul",
-    "yucbfiv": "cbf", "yucbful": "cbf", "yucbfwv": "cbf", "je": "cbf",
-    "yulpptr": "lpp",
-    "rs": "dfw",
-    "ej": "grq",
-    "yuphxrp": "phx",
-    # NOT a data metro, and not a quota metro either: `yuskedq-d` has no group
-    # registration, so it is capped at the personal 500 GiB per-cell ceiling.
-    # It has TPU capacity our allocation can obtain, which is why the smoke
-    # runs landed here and read cc12m across the Atlantic. `ske` is therefore
-    # absent from `_METRO_TO_CNS_CELLS` on purpose, and a long run must not
-    # come back here.
-    "yuskedq": "ske",
+    # atl (na)
+    'ym': 'atl',
+    'yo': 'atl',
+    'yq': 'atl',
+    'ys': 'atl',
+    # aus (na)
+    'lcausi': 'aus',
+    'lcausr': 'aus',
+    # bll (eu)
+    'rc': 'bll',
+    'rd': 'bll',
+    # bom (ap)
+    'lcbomp': 'bom',
+    'ly': 'bom',
+    # bru (eu)
+    'wb': 'bru',
+    'wd': 'bru',
+    'we': 'bru',
+    'wf': 'bru',
+    'wg': 'bru',
+    'wh': 'bru',
+    'wi': 'bru',
+    'wq': 'bru',
+    # cbf (na)
+    'ib': 'cbf',
+    'if': 'cbf',
+    'ig': 'cbf',
+    'iq': 'cbf',
+    'is': 'cbf',
+    'it': 'cbf',
+    'ix': 'cbf',
+    'iy': 'cbf',
+    'iz': 'cbf',
+    'jb': 'cbf',
+    'je': 'cbf',
+    'jg': 'cbf',
+    'ji': 'cbf',
+    'jj': 'cbf',
+    'jn': 'cbf',
+    'jo': 'cbf',
+    'jp': 'cbf',
+    'jq': 'cbf',
+    'js': 'cbf',
+    'jt': 'cbf',
+    'jz': 'cbf',
+    'ny': 'cbf',
+    'nz': 'cbf',
+    'yucbfaa': 'cbf',
+    'yucbfab': 'cbf',
+    'yucbfac': 'cbf',
+    'yucbfad': 'cbf',
+    'yucbfcd': 'cbf',
+    'yucbfiv': 'cbf',
+    'yucbflq': 'cbf',
+    'yucbfpv': 'cbf',
+    'yucbfrl': 'cbf',
+    'yucbfsl': 'cbf',
+    'yucbfsr': 'cbf',
+    'yucbful': 'cbf',
+    'yucbfwv': 'cbf',
+    # chs (na)
+    'ue': 'chs',
+    'uj': 'chs',
+    'ux': 'chs',
+    'uy': 'chs',
+    'vj': 'chs',
+    'vk': 'chs',
+    'vl': 'chs',
+    'vz': 'chs',
+    'yuchspe': 'chs',
+    'yuchstz': 'chs',
+    # ckv (na)
+    'ma': 'ckv',
+    'mb': 'ckv',
+    'md': 'ckv',
+    'me': 'ckv',
+    'mf': 'ckv',
+    'mg': 'ckv',
+    'mh': 'ckv',
+    'mj': 'ckv',
+    'yuckvax': 'ckv',
+    # cmh (na)
+    'ga': 'cmh',
+    'gb': 'cmh',
+    'gh': 'cmh',
+    'gl': 'cmh',
+    'gm': 'cmh',
+    'go': 'cmh',
+    'rg': 'cmh',
+    'yucmhaa': 'cmh',
+    'yucmhab': 'cmh',
+    'yucmhcg': 'cmh',
+    'yucmhfq': 'cmh',
+    'yucmhgs': 'cmh',
+    'yucmhnb': 'cmh',
+    'yucmhps': 'cmh',
+    'yucmhqa': 'cmh',
+    'yucmhsu': 'cmh',
+    'yucmhty': 'cmh',
+    'yucmhwf': 'cmh',
+    # dfw (na)
+    'rq': 'dfw',
+    'rr': 'dfw',
+    'rs': 'dfw',
+    'rt': 'dfw',
+    'rw': 'dfw',
+    'yudfwra': 'dfw',
+    # dhr (eu)
+    'ra': 'dhr',
+    'rb': 'dhr',
+    # dls (na)
+    'pw': 'dls',
+    'px': 'dls',
+    'py': 'dls',
+    'pz': 'dls',
+    'ts': 'dls',
+    'tt': 'dls',
+    # dub (eu)
+    'dg': 'dub',
+    'di': 'dub',
+    'dj': 'dub',
+    # fra (eu)
+    'lcfrai': 'fra',
+    # fwa (na)
+    'yufwahd': 'fwa',
+    'yufwakf': 'fwa',
+    # grq (eu)
+    'ea': 'grq',
+    'eb': 'grq',
+    'ec': 'grq',
+    'ed': 'grq',
+    'ef': 'grq',
+    'ei': 'grq',
+    'ej': 'grq',
+    'el': 'grq',
+    'en': 'grq',
+    'eq': 'grq',
+    # iad (na)
+    'bh': 'iad',
+    'bi': 'iad',
+    'bk': 'iad',
+    'pd': 'iad',
+    'wv': 'iad',
+    'ww': 'iad',
+    'yuiadrs': 'iad',
+    'yuiadtq': 'iad',
+    # icn (ap)
+    'wu': 'icn',
+    # kul (ap)
+    'yukulwh': 'kul',
+    # las (na)
+    'dd': 'las',
+    'dl': 'las',
+    'dy': 'las',
+    'dz': 'las',
+    # lhr (eu)
+    'lclhrb': 'lhr',
+    'sv': 'lhr',
+    'yulhrp': 'lhr',
+    'yulhrs': 'lhr',
+    # lpp (eu)
+    'la': 'lpp',
+    'lb': 'lpp',
+    'le': 'lpp',
+    'lg': 'lpp',
+    'lh': 'lpp',
+    'li': 'lpp',
+    'lj': 'lpp',
+    'lk': 'lpp',
+    'lo': 'lpp',
+    'lq': 'lpp',
+    'lt': 'lpp',
+    'lu': 'lpp',
+    'yulpptr': 'lpp',
+    # mrn (na)
+    'qc': 'mrn',
+    'qn': 'mrn',
+    'qo': 'mrn',
+    'qr': 'mrn',
+    'yumrnel': 'mrn',
+    # nrt (ap)
+    'rx': 'nrt',
+    # phx (na)
+    'yuphxej': 'phx',
+    'yuphxer': 'phx',
+    'yuphxrp': 'phx',
+    # rno (na)
+    'ro': 'rno',
+    'yurnoaa': 'rno',
+    'yurnolb': 'rno',
+    'yurnoyc': 'rno',
+    # scl (sa)
+    'ce': 'scl',
+    'cf': 'scl',
+    'cg': 'scl',
+    'cj': 'scl',
+    'lcscld': 'scl',
+    # sin (ap)
+    'sd': 'sin',
+    'se': 'sin',
+    'sf': 'sin',
+    'sg': 'sin',
+    'sh': 'sin',
+    'si': 'sin',
+    'sj': 'sin',
+    'sk': 'sin',
+    'sl': 'sin',
+    'sm': 'sin',
+    'sn': 'sin',
+    'so': 'sin',
+    # ske (eu)
+    'yuskedq': 'ske',
+    # syd (ap)
+    'lcsydv': 'syd',
+    # tpe (ap)
+    'ta': 'tpe',
+    'tb': 'tpe',
+    'tc': 'tpe',
+    'td': 'tpe',
+    'tg': 'tpe',
+    'th': 'tpe',
+    'tl': 'tpe',
+    'tm': 'tpe',
+    'tp': 'tpe',
+    # tul (na)
+    'na': 'tul',
+    'nf': 'tul',
+    'nk': 'tul',
+    'nl': 'tul',
+    'nm': 'tul',
+    'nn': 'tul',
+    'oa': 'tul',
+    'od': 'tul',
+    'oe': 'tul',
+    'oi': 'tul',
+    'oj': 'tul',
+    'ok': 'tul',
+    'oq': 'tul',
+    'ot': 'tul',
+    'ow': 'tul',
+    'oz': 'tul',
+    'pa': 'tul',
+    'pb': 'tul',
+    'yutulis': 'tul',
+    'yutulpz': 'tul',
+    'yutulrf': 'tul',
+    # uos (na)
+    'gc': 'uos',
+    'gd': 'uos',
+    'ge': 'uos',
+    'gg': 'uos',
+    # yul (na)
+    'lcyulk': 'yul',
 }
 
 # //production/borg/cloud_iam/slicer_regions/slicer_metros.pi, read from the
